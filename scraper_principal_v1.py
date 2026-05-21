@@ -12,6 +12,7 @@ Uso:
     python scraper_principal.py --modo incremental
 """
 
+import os
 import sqlite3
 import logging
 import argparse
@@ -24,12 +25,12 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 # ─────────────────────────────────────────────
 
 CONFIG = {
-    "url_login":      "https://your-admin-system.com/login",
-    "url_post_login": "https://your-admin-system.com/platform",
-    "url_pedidos":    "https://your-admin-system.com/country/CO/orders/parent-orders",
-    "url_detalle":    "https://your-admin-system.com/country/CO/orders/parent-orders/detail/",
-    "usuario":        "fallback_user",       
-    "clave":          "fallback_pass",         
+    "url_login":      os.environ.get("SCRAPER_URL_LOGIN", ""),
+    "url_post_login": os.environ.get("SCRAPER_URL_POST_LOGIN", ""),
+    "url_pedidos":    os.environ.get("SCRAPER_URL_PEDIDOS", ""),
+    "url_detalle":    os.environ.get("SCRAPER_URL_DETALLE", ""),
+    "usuario":        os.environ.get("SCRAPER_USUARIO", ""),
+    "clave":          os.environ.get("SCRAPER_PASSWORD", ""),
     "db_path":        "pedidos.db",
     "log_path":       "scraper.log",
     "pausa":          2,                  # segundos entre pedidos

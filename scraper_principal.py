@@ -63,15 +63,15 @@ class ConfigDict(TypedDict):
 
 
 CONFIG: ConfigDict = {
-    # URLs confirmadas en producción
-    "url_login":      "https://your-admin-system.com/login",
-    "url_post_login": "https://your-admin-system.com/platform",
-    "url_pedidos":    "https://your-admin-system.com/country/CO/orders/parent-orders",
-    "url_detalle":    "https://your-admin-system.com/country/CO/orders/parent-orders/detail/",
+    # URLs (configuradas via variables de entorno)
+    "url_login":      os.environ.get("SCRAPER_URL_LOGIN", ""),
+    "url_post_login": os.environ.get("SCRAPER_URL_POST_LOGIN", ""),
+    "url_pedidos":    os.environ.get("SCRAPER_URL_PEDIDOS", ""),
+    "url_detalle":    os.environ.get("SCRAPER_URL_DETALLE", ""),
 
-    # Credenciales fallback (se sobreescriben con variables de entorno)
-    "usuario": "fallback_user",
-    "clave":   "fallback_pass",
+    # Credenciales (configuradas via variables de entorno)
+    "usuario": os.environ.get("SCRAPER_USUARIO", ""),
+    "clave":   os.environ.get("SCRAPER_PASSWORD", ""),
 
     # Timeouts (ms)
     "NAV_TIMEOUT_MS":  30_000,
