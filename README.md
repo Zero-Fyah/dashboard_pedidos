@@ -73,7 +73,7 @@ cd dashboard_pedidos
 
 # 2. Crear entorno virtual e instalar dependencias
 python -m venv .venv
-.venv\Scriptsctivate
+.venv\Scripts\activate
 pip install -r requirements.txt
 
 # 3. Instalar el navegador que usa Playwright
