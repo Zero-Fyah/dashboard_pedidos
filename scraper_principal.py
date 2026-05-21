@@ -1,15 +1,18 @@
 """
 scraper_principal.py
 ====================
-Scraper asíncrono de pedidos para your-admin-system.com (SPA Vue.js + Element Plus).
+Scraper asíncrono de pedidos para sistema administrativo interno (SPA Vue.js + Element Plus).
 
-Estimación de tiempo:
-    Base:  2.414 ÷ 4 workers × 17,5 s ≈ 2,5 h
-    Real con retries, re-logins y circuit breakers: ≈ 3,5–4 h
+Estimación de tiempo (modo incremental con 5 workers):
+    Activos + errores: ~2-3 horas dependiendo del volumen
+    Pedidos nuevos del día: ~2-5 minutos
 
 Uso:
-    py scraper_principal.py --desde 2026-05-01 --hasta 2026-05-20
-    py scraper_principal.py --desde 2026-05-01 --hasta 2026-05-20 --modo incremental
+    # Carga histórica completa (primera vez)
+    py scraper_principal.py --desde 2026-05-01 --hasta 2026-05-21 --modo completo
+
+    # Actualización incremental (uso normal, cada 2 horas)
+    py scraper_principal.py --modo incremental
 """
 
 from playwright.async_api import (
@@ -98,7 +101,7 @@ CONFIG: ConfigDict = {
     "RATE_LIMIT_WAIT_S": 30,
 
     # Paralelismo
-    "NUM_WORKERS":   4,
+    "NUM_WORKERS":   5,
     "QUEUE_MAXSIZE": 100,
 
     # Observabilidad
@@ -114,6 +117,19 @@ LOGIN_LOCK:      asyncio.Lock = asyncio.Lock()
 SCREENSHOT_LOCK: asyncio.Lock = asyncio.Lock()
 
 ESTADOS_CERRADOS: frozenset[str] = frozenset({
+    "completado",
+    "cancelado",
+    "comentado",
+})
+
+ESTADOS_FIJAN_CANTIDADES: frozenset[str] = frozenset({
+    "pendiente de confirmación",
+    "pendiente de envío (pago inmediato)",
+    "pendiente de envío (crédito)",
+    "pendiente de envío (contra entrega)",
+    "pendiente de entrega",
+    "enviado",
+    "período contable",
     "completado",
     "cancelado",
     "comentado",
@@ -265,8 +281,8 @@ async def init_db(db_path: str) -> None:
     """Crea las tablas si no existen, aplica PRAGMAs y ejecuta migraciones.
 
     Las tablas base se crean con CREATE TABLE IF NOT EXISTS. Las columnas
-    nuevas (numero_caja, tipo) se agregan via ALTER TABLE con try/except
-    individual por columna para compatibilidad con bases de datos existentes.
+    nuevas se agregan via ALTER TABLE con try/except individual por columna
+    para compatibilidad con bases de datos existentes.
 
     Args:
         db_path: Ruta al archivo SQLite (se crea si no existe).
@@ -365,6 +381,15 @@ async def init_db(db_path: str) -> None:
         try:
             await db.execute(
                 "ALTER TABLE pedidos ADD COLUMN hora TEXT DEFAULT NULL"
+            )
+            await db.commit()
+        except Exception:
+            pass
+
+        try:
+            await db.execute(
+                "ALTER TABLE subpedidos ADD COLUMN "
+                "cantidades_definitivas INTEGER DEFAULT 0"
             )
             await db.commit()
         except Exception:
@@ -758,31 +783,67 @@ async def procesar_pedido(
     page: Page,
     id_pedido: str,
     resultados_queue: asyncio.Queue,
+    db_path: str,
 ) -> bool:
-    """Navega al detalle de un pedido, extrae sus datos y los publica en la cola.
+    """Determina el modo de extracción, navega al detalle y publica en la cola.
 
-    Si la sesión expiró (redirección al login) realiza re-login serializado con
-    LOGIN_LOCK antes de reintentar la navegación. Reintenta hasta
-    CONFIG["MAX_REINTENTOS"] veces con backoff exponencial y jitter. Toma
-    screenshot en cada fallo. Si agota reintentos publica un registro de error
-    en resultados_queue para que persistencia_worker lo guarde en tabla errores.
+    Consulta la DB antes de navegar para elegir uno de tres modos:
+      - completo:       pedido nuevo; extrae todo (info general, subpedidos, timeline).
+      - con_cantidades: algún subpedido fija cantidades; actualiza estado y
+                        cantidad_entregada + reemplaza timeline.
+      - solo_estado:    solo actualiza estado de cada subpedido y timeline;
+                        sin expansión, el más rápido.
+
+    Reintenta hasta CONFIG["MAX_REINTENTOS"] veces con backoff exponencial y
+    jitter. Toma screenshot en cada fallo.
 
     Args:
         worker_id: ID del worker que invoca esta función.
         page: Página Playwright activa del worker.
         id_pedido: ID del pedido a procesar.
         resultados_queue: Cola donde publicar el resultado o el registro de error.
+        db_path: Ruta al archivo SQLite para consultar el estado previo.
 
     Returns:
         True si el pedido fue extraído y publicado con éxito, False si no.
     """
     t_inicio = time.monotonic()
 
+    # ── Determinar modo antes del loop de reintentos ──────────────────────
+    async with aiosqlite.connect(db_path) as db_r:
+        row = await (await db_r.execute(
+            "SELECT scraping_completo FROM pedidos WHERE id_pedido = ?",
+            (id_pedido,)
+        )).fetchone()
+        es_nuevo = row is None
+
+        if not es_nuevo:
+            subs_db = await (await db_r.execute(
+                "SELECT estado, cantidades_definitivas "
+                "FROM subpedidos WHERE id_pedido = ?",
+                (id_pedido,)
+            )).fetchall()
+        else:
+            subs_db = []
+
+    if es_nuevo:
+        modo = "completo"
+    elif any(
+        cd == 0 and estado.lower() in ESTADOS_FIJAN_CANTIDADES
+        for estado, cd in subs_db
+    ):
+        modo = "con_cantidades"
+    else:
+        modo = "solo_estado"
+
+    nav_kwargs: dict = {} if modo == "completo" else {"wait_until": "domcontentloaded"}
+
     for intento in range(1, CONFIG["MAX_REINTENTOS"] + 1):
         try:
             await page.goto(
                 CONFIG["url_detalle"] + id_pedido,
                 timeout=CONFIG["NAV_TIMEOUT_MS"],
+                **nav_kwargs,
             )
 
             if "/login" in page.url:
@@ -797,30 +858,74 @@ async def procesar_pedido(
                 await page.goto(
                     CONFIG["url_detalle"] + id_pedido,
                     timeout=CONFIG["NAV_TIMEOUT_MS"],
+                    **nav_kwargs,
                 )
 
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_selector("div.info-item", timeout=CONFIG["ELEM_TIMEOUT_MS"])
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(1)
+            if modo == "completo":
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_selector("div.info-item", timeout=CONFIG["ELEM_TIMEOUT_MS"])
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(1)
 
-            info_general = await extraer_info_general(page)
-            subpedidos   = await extraer_subpedidos(page)
-            timeline     = await extraer_timeline(page, id_pedido)
+                info_general = await extraer_info_general(page)
+                subpedidos   = await extraer_subpedidos(page)
+                timeline     = await extraer_timeline(page, id_pedido)
+                resultado = {
+                    "tipo":         "completo",
+                    "id_pedido":    id_pedido,
+                    "info_general": info_general,
+                    "subpedidos":   subpedidos,
+                    "timeline":     timeline,
+                }
+                n_subs = len(subpedidos)
+
+            elif modo == "con_cantidades":
+                subpedidos = await extraer_subpedidos(page)
+                timeline   = await extraer_timeline(page, id_pedido)
+                resultado = {
+                    "tipo":       "con_cantidades",
+                    "id_pedido":  id_pedido,
+                    "subpedidos": subpedidos,
+                    "timeline":   timeline,
+                }
+                n_subs = len(subpedidos)
+
+            else:  # solo_estado
+                filas = await page.query_selector_all(
+                    "div.el-scrollbar__wrap--hidden-default table tbody tr"
+                )
+                subs_estado: list[dict] = []
+                for fila in filas:
+                    if not await fila.query_selector("td.el-table__expand-column"):
+                        continue
+                    raw_el  = await fila.query_selector("span.child-order-id")
+                    raw     = (await raw_el.inner_text()).strip() if raw_el else ""
+                    num_sub = raw.split(" + ", 1)[1].strip() if " + " in raw else raw
+                    celdas  = await fila.query_selector_all("td")
+                    if len(celdas) > 3:
+                        estado_el = await celdas[3].query_selector(".el-tag__content")
+                        estado    = (await estado_el.inner_text()).strip() if estado_el else ""
+                    else:
+                        estado = ""
+                    subs_estado.append({"numero_subpedido": num_sub, "estado": estado})
+
+                timeline = await extraer_timeline(page, id_pedido)
+                resultado = {
+                    "tipo":       "solo_estado",
+                    "id_pedido":  id_pedido,
+                    "subpedidos": subs_estado,
+                    "timeline":   timeline,
+                }
+                n_subs = len(subs_estado)
 
             duracion_ms = int((time.monotonic() - t_inicio) * 1000)
-            await resultados_queue.put({
-                "id_pedido":    id_pedido,
-                "info_general": info_general,
-                "subpedidos":   subpedidos,
-                "timeline":     timeline,
-            })
+            await resultados_queue.put(resultado)
             log_event(
                 "pedido_ok",
                 worker_id=worker_id,
                 id_pedido=id_pedido,
                 duracion_ms=duracion_ms,
-                msg=f"{len(subpedidos)} subpedidos | intento {intento}",
+                msg=f"modo={modo} | {n_subs} subpedidos | intento {intento}",
             )
             await asyncio.sleep(CONFIG["PAUSA_ENTRE_PEDIDOS_S"])
             return True
@@ -872,10 +977,14 @@ async def persistencia_worker(
 ) -> None:
     """Task única que escribe en SQLite. Termina al recibir el sentinel None.
 
-    Procesa dos tipos de registros desde resultados_queue:
-      - Éxito: dict con 'info_general' y 'subpedidos' → upsert en pedidos,
-               DELETE + INSERT en subpedidos y lineas_pedido, scraping_completo=1.
-      - Error: dict con '_error=True' → INSERT en errores.
+    Procesa cuatro tipos de registros desde resultados_queue:
+      - completo:       upsert en pedidos, DELETE + INSERT en subpedidos y
+                        lineas_pedido, scraping_completo=1.
+      - con_cantidades: UPDATE cantidad_entregada + estado + cantidades_definitivas=1
+                        en subpedidos; reemplaza timeline.
+      - solo_estado:    UPDATE estado en subpedidos; reemplaza timeline; marca
+                        scraping_completo=1 si todos los subpedidos están cerrados.
+      - error (_error=True): INSERT en errores.
     Cada pedido se persiste en una sola transacción atómica (BEGIN/COMMIT).
 
     Args:
@@ -916,163 +1025,262 @@ async def persistencia_worker(
                     )
                 continue
 
-            # — Pedido exitoso —
-            info   = resultado["info_general"]
-            subped = resultado["subpedidos"]
+            tipo = resultado.get("tipo", "completo")
 
-            lineas_rows: list[dict] = []
-            for sp in subped:
-                for linea in sp["lineas"]:
-                    lineas_rows.append({
-                        "id_pedido":         id_pedido,
-                        "numero_subpedido":  sp["numero_subpedido"],
-                        "tipo_subpedido":    sp["tipo_subpedido"],
-                        "nombre_producto":   linea["nombre_producto"],
-                        "referencia":        linea["referencia"],
-                        "codigo_barras":     linea["codigo_barras"],
-                        "presentacion":      linea["presentacion"],
-                        "almacen":           linea["almacen"],
-                        "cantidad_comprada": linea["cantidad_comprada"],
-                        "cantidad_entregada":linea["cantidad_entregada"],
-                        "precio_unitario":   linea["precio_unitario"],
-                        "descuento":         linea["descuento"],
-                        "precio_descuento":  linea["precio_descuento"],
-                        "monto_pagar":       linea["monto_pagar"],
-                        "monto_final":       linea["monto_final"],
-                        "iva":               linea["iva"],
-                        "peso_total":        linea["peso_total"],
-                        "observaciones":     linea["observaciones"],
-                        "numero_caja":       linea["numero_caja"],
-                        "tipo":              linea["tipo"],
-                    })
+            # ── Modo completo ──────────────────────────────────────────────
+            if tipo == "completo":
+                info   = resultado["info_general"]
+                subped = resultado["subpedidos"]
 
-            fecha_completa = info.get("fecha", "")
-            partes_fecha   = fecha_completa.split(" ")
-            fecha_val      = partes_fecha[0] if partes_fecha else ""
-            hora_val       = partes_fecha[1] if len(partes_fecha) > 1 else ""
+                lineas_rows: list[dict] = []
+                for sp in subped:
+                    for linea in sp["lineas"]:
+                        lineas_rows.append({
+                            "id_pedido":         id_pedido,
+                            "numero_subpedido":  sp["numero_subpedido"],
+                            "tipo_subpedido":    sp["tipo_subpedido"],
+                            "nombre_producto":   linea["nombre_producto"],
+                            "referencia":        linea["referencia"],
+                            "codigo_barras":     linea["codigo_barras"],
+                            "presentacion":      linea["presentacion"],
+                            "almacen":           linea["almacen"],
+                            "cantidad_comprada": linea["cantidad_comprada"],
+                            "cantidad_entregada":linea["cantidad_entregada"],
+                            "precio_unitario":   linea["precio_unitario"],
+                            "descuento":         linea["descuento"],
+                            "precio_descuento":  linea["precio_descuento"],
+                            "monto_pagar":       linea["monto_pagar"],
+                            "monto_final":       linea["monto_final"],
+                            "iva":               linea["iva"],
+                            "peso_total":        linea["peso_total"],
+                            "observaciones":     linea["observaciones"],
+                            "numero_caja":       linea["numero_caja"],
+                            "tipo":              linea["tipo"],
+                        })
 
-            try:
-                await db.execute("BEGIN")
+                fecha_completa = info.get("fecha", "")
+                partes_fecha   = fecha_completa.split(" ")
+                fecha_val      = partes_fecha[0] if partes_fecha else ""
+                hora_val       = partes_fecha[1] if len(partes_fecha) > 1 else ""
 
-                await db.execute(
-                    """
-                    INSERT INTO pedidos (
-                        id_pedido, fecha, hora, servicio_cliente, vendedor, forma_pago,
-                        comprobante, nombre_empresa, nit, metodo_entrega,
-                        destinatario, telefono, direccion_envio, observaciones,
-                        scraping_completo, actualizado_en
-                    ) VALUES (
-                        :id_pedido, :fecha, :hora, :servicio_cliente, :vendedor, :forma_pago,
-                        :comprobante, :nombre_empresa, :nit, :metodo_entrega,
-                        :destinatario, :telefono, :direccion_envio, :observaciones,
-                        0, :actualizado_en
-                    )
-                    ON CONFLICT(id_pedido) DO UPDATE SET
-                        fecha               = excluded.fecha,
-                        hora                = excluded.hora,
-                        servicio_cliente    = excluded.servicio_cliente,
-                        vendedor            = excluded.vendedor,
-                        forma_pago          = excluded.forma_pago,
-                        comprobante         = excluded.comprobante,
-                        nombre_empresa      = excluded.nombre_empresa,
-                        nit                 = excluded.nit,
-                        metodo_entrega      = excluded.metodo_entrega,
-                        destinatario        = excluded.destinatario,
-                        telefono            = excluded.telefono,
-                        direccion_envio     = excluded.direccion_envio,
-                        observaciones       = excluded.observaciones,
-                        actualizado_en      = excluded.actualizado_en
-                    """,
-                    {
-                        **info,
-                        "fecha":          fecha_val,
-                        "hora":           hora_val,
-                        "actualizado_en": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
+                try:
+                    await db.execute("BEGIN")
 
-                await db.execute("DELETE FROM subpedidos     WHERE id_pedido = ?", (id_pedido,))
-                await db.execute("DELETE FROM lineas_pedido  WHERE id_pedido = ?", (id_pedido,))
-                await db.execute("DELETE FROM timeline_pedido WHERE id_pedido = ?", (id_pedido,))
-
-                await db.executemany(
-                    """
-                    INSERT INTO subpedidos (
-                        id_pedido, numero_subpedido, tipo_subpedido, estado,
-                        inicio_alistamiento, alistamiento_completado, alistador,
-                        inicio_inspeccion, inspeccion_completada, inspector
-                    ) VALUES (
-                        :id_pedido, :numero_subpedido, :tipo_subpedido, :estado,
-                        :inicio_alistamiento, :alistamiento_completado, :alistador,
-                        :inicio_inspeccion, :inspeccion_completada, :inspector
-                    )
-                    """,
-                    [
+                    await db.execute(
+                        """
+                        INSERT INTO pedidos (
+                            id_pedido, fecha, hora, servicio_cliente, vendedor, forma_pago,
+                            comprobante, nombre_empresa, nit, metodo_entrega,
+                            destinatario, telefono, direccion_envio, observaciones,
+                            scraping_completo, actualizado_en
+                        ) VALUES (
+                            :id_pedido, :fecha, :hora, :servicio_cliente, :vendedor, :forma_pago,
+                            :comprobante, :nombre_empresa, :nit, :metodo_entrega,
+                            :destinatario, :telefono, :direccion_envio, :observaciones,
+                            0, :actualizado_en
+                        )
+                        ON CONFLICT(id_pedido) DO UPDATE SET
+                            fecha               = excluded.fecha,
+                            hora                = excluded.hora,
+                            servicio_cliente    = excluded.servicio_cliente,
+                            vendedor            = excluded.vendedor,
+                            forma_pago          = excluded.forma_pago,
+                            comprobante         = excluded.comprobante,
+                            nombre_empresa      = excluded.nombre_empresa,
+                            nit                 = excluded.nit,
+                            metodo_entrega      = excluded.metodo_entrega,
+                            destinatario        = excluded.destinatario,
+                            telefono            = excluded.telefono,
+                            direccion_envio     = excluded.direccion_envio,
+                            observaciones       = excluded.observaciones,
+                            actualizado_en      = excluded.actualizado_en
+                        """,
                         {
-                            "id_pedido":               id_pedido,
-                            "numero_subpedido":        sp["numero_subpedido"],
-                            "tipo_subpedido":          sp["tipo_subpedido"],
-                            "estado":                  sp["estado"],
-                            "inicio_alistamiento":     sp["inicio_alistamiento"],
-                            "alistamiento_completado": sp["alistamiento_completado"],
-                            "alistador":               sp["alistador"],
-                            "inicio_inspeccion":       sp["inicio_inspeccion"],
-                            "inspeccion_completada":   sp["inspeccion_completada"],
-                            "inspector":               sp["inspector"],
-                        }
-                        for sp in subped
-                    ],
-                )
+                            **info,
+                            "fecha":          fecha_val,
+                            "hora":           hora_val,
+                            "actualizado_en": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
 
-                if lineas_rows:
+                    await db.execute("DELETE FROM subpedidos     WHERE id_pedido = ?", (id_pedido,))
+                    await db.execute("DELETE FROM lineas_pedido  WHERE id_pedido = ?", (id_pedido,))
+                    await db.execute("DELETE FROM timeline_pedido WHERE id_pedido = ?", (id_pedido,))
+
                     await db.executemany(
                         """
-                        INSERT INTO lineas_pedido (
-                            id_pedido, numero_subpedido, tipo_subpedido,
-                            nombre_producto, referencia, codigo_barras, presentacion,
-                            almacen, cantidad_comprada, cantidad_entregada,
-                            precio_unitario, descuento, precio_descuento,
-                            monto_pagar, monto_final, iva, peso_total, observaciones,
-                            numero_caja, tipo
+                        INSERT INTO subpedidos (
+                            id_pedido, numero_subpedido, tipo_subpedido, estado,
+                            inicio_alistamiento, alistamiento_completado, alistador,
+                            inicio_inspeccion, inspeccion_completada, inspector
                         ) VALUES (
-                            :id_pedido, :numero_subpedido, :tipo_subpedido,
-                            :nombre_producto, :referencia, :codigo_barras, :presentacion,
-                            :almacen, :cantidad_comprada, :cantidad_entregada,
-                            :precio_unitario, :descuento, :precio_descuento,
-                            :monto_pagar, :monto_final, :iva, :peso_total, :observaciones,
-                            :numero_caja, :tipo
+                            :id_pedido, :numero_subpedido, :tipo_subpedido, :estado,
+                            :inicio_alistamiento, :alistamiento_completado, :alistador,
+                            :inicio_inspeccion, :inspeccion_completada, :inspector
                         )
                         """,
-                        lineas_rows,
+                        [
+                            {
+                                "id_pedido":               id_pedido,
+                                "numero_subpedido":        sp["numero_subpedido"],
+                                "tipo_subpedido":          sp["tipo_subpedido"],
+                                "estado":                  sp["estado"],
+                                "inicio_alistamiento":     sp["inicio_alistamiento"],
+                                "alistamiento_completado": sp["alistamiento_completado"],
+                                "alistador":               sp["alistador"],
+                                "inicio_inspeccion":       sp["inicio_inspeccion"],
+                                "inspeccion_completada":   sp["inspeccion_completada"],
+                                "inspector":               sp["inspector"],
+                            }
+                            for sp in subped
+                        ],
                     )
 
-                timeline = resultado.get("timeline", [])
-                if timeline:
-                    await db.executemany(
-                        """
-                        INSERT INTO timeline_pedido
-                            (id_pedido, paso, titulo, fecha_hora, completado)
-                        VALUES
-                            (:id_pedido, :paso, :titulo, :fecha_hora, :completado)
-                        """,
-                        timeline,
+                    if lineas_rows:
+                        await db.executemany(
+                            """
+                            INSERT INTO lineas_pedido (
+                                id_pedido, numero_subpedido, tipo_subpedido,
+                                nombre_producto, referencia, codigo_barras, presentacion,
+                                almacen, cantidad_comprada, cantidad_entregada,
+                                precio_unitario, descuento, precio_descuento,
+                                monto_pagar, monto_final, iva, peso_total, observaciones,
+                                numero_caja, tipo
+                            ) VALUES (
+                                :id_pedido, :numero_subpedido, :tipo_subpedido,
+                                :nombre_producto, :referencia, :codigo_barras, :presentacion,
+                                :almacen, :cantidad_comprada, :cantidad_entregada,
+                                :precio_unitario, :descuento, :precio_descuento,
+                                :monto_pagar, :monto_final, :iva, :peso_total, :observaciones,
+                                :numero_caja, :tipo
+                            )
+                            """,
+                            lineas_rows,
+                        )
+
+                    timeline = resultado.get("timeline", [])
+                    if timeline:
+                        await db.executemany(
+                            """
+                            INSERT INTO timeline_pedido
+                                (id_pedido, paso, titulo, fecha_hora, completado)
+                            VALUES
+                                (:id_pedido, :paso, :titulo, :fecha_hora, :completado)
+                            """,
+                            timeline,
+                        )
+
+                    await db.execute(
+                        "UPDATE pedidos SET scraping_completo = 1, actualizado_en = ? WHERE id_pedido = ?",
+                        (datetime.now(timezone.utc).isoformat(), id_pedido),
+                    )
+                    await db.execute("COMMIT")
+                    log_event("db_guardado", id_pedido=id_pedido, msg="Pedido persistido")
+
+                except Exception as exc:
+                    await db.execute("ROLLBACK")
+                    log_event(
+                        "db_error",
+                        level="ERROR",
+                        id_pedido=id_pedido,
+                        msg=f"Error persistiendo pedido: {exc}",
                     )
 
-                await db.execute(
-                    "UPDATE pedidos SET scraping_completo = 1, actualizado_en = ? WHERE id_pedido = ?",
-                    (datetime.now(timezone.utc).isoformat(), id_pedido),
-                )
-                await db.execute("COMMIT")
-                log_event("db_guardado", id_pedido=id_pedido, msg="Pedido persistido")
+            # ── Modo con_cantidades ────────────────────────────────────────
+            elif tipo == "con_cantidades":
+                try:
+                    await db.execute("BEGIN")
 
-            except Exception as exc:
-                await db.execute("ROLLBACK")
-                log_event(
-                    "db_error",
-                    level="ERROR",
-                    id_pedido=id_pedido,
-                    msg=f"Error persistiendo pedido: {exc}",
-                )
+                    for sp in resultado["subpedidos"]:
+                        num_sub = sp["numero_subpedido"]
+                        for linea in sp["lineas"]:
+                            await db.execute(
+                                "UPDATE lineas_pedido SET cantidad_entregada = ? "
+                                "WHERE id_pedido = ? AND numero_subpedido = ? "
+                                "AND codigo_barras = ?",
+                                (linea["cantidad_entregada"], id_pedido, num_sub, linea["codigo_barras"]),
+                            )
+                        await db.execute(
+                            "UPDATE subpedidos SET estado = ?, cantidades_definitivas = 1 "
+                            "WHERE id_pedido = ? AND numero_subpedido = ?",
+                            (sp["estado"], id_pedido, num_sub),
+                        )
+
+                    await db.execute("DELETE FROM timeline_pedido WHERE id_pedido = ?", (id_pedido,))
+                    timeline = resultado.get("timeline", [])
+                    if timeline:
+                        await db.executemany(
+                            """
+                            INSERT INTO timeline_pedido
+                                (id_pedido, paso, titulo, fecha_hora, completado)
+                            VALUES
+                                (:id_pedido, :paso, :titulo, :fecha_hora, :completado)
+                            """,
+                            timeline,
+                        )
+
+                    await db.execute("COMMIT")
+                    log_event("db_guardado", id_pedido=id_pedido, msg="Cantidades actualizadas")
+
+                except Exception as exc:
+                    await db.execute("ROLLBACK")
+                    log_event(
+                        "db_error",
+                        level="ERROR",
+                        id_pedido=id_pedido,
+                        msg=f"Error persistiendo con_cantidades: {exc}",
+                    )
+
+            # ── Modo solo_estado ───────────────────────────────────────────
+            elif tipo == "solo_estado":
+                try:
+                    await db.execute("BEGIN")
+
+                    for sp in resultado["subpedidos"]:
+                        await db.execute(
+                            "UPDATE subpedidos SET estado = ? "
+                            "WHERE id_pedido = ? AND numero_subpedido = ?",
+                            (sp["estado"], id_pedido, sp["numero_subpedido"]),
+                        )
+
+                    await db.execute("DELETE FROM timeline_pedido WHERE id_pedido = ?", (id_pedido,))
+                    timeline = resultado.get("timeline", [])
+                    if timeline:
+                        await db.executemany(
+                            """
+                            INSERT INTO timeline_pedido
+                                (id_pedido, paso, titulo, fecha_hora, completado)
+                            VALUES
+                                (:id_pedido, :paso, :titulo, :fecha_hora, :completado)
+                            """,
+                            timeline,
+                        )
+
+                    _closed_ph = ",".join("?" * len(ESTADOS_CERRADOS))
+                    open_count_row = await (await db.execute(
+                        f"SELECT COUNT(*) FROM subpedidos "
+                        f"WHERE id_pedido = ? "
+                        f"AND LOWER(estado) NOT IN ({_closed_ph})",
+                        (id_pedido, *ESTADOS_CERRADOS),
+                    )).fetchone()
+                    if open_count_row and open_count_row[0] == 0:
+                        await db.execute(
+                            "UPDATE pedidos SET scraping_completo = 1, actualizado_en = ? "
+                            "WHERE id_pedido = ?",
+                            (datetime.now(timezone.utc).isoformat(), id_pedido),
+                        )
+
+                    await db.execute("COMMIT")
+                    log_event("db_guardado", id_pedido=id_pedido, msg="Estado actualizado")
+
+                except Exception as exc:
+                    await db.execute("ROLLBACK")
+                    log_event(
+                        "db_error",
+                        level="ERROR",
+                        id_pedido=id_pedido,
+                        msg=f"Error persistiendo solo_estado: {exc}",
+                    )
 
 
 # ─────────────────────────────────────────────
@@ -1084,6 +1292,7 @@ async def scraper_worker(
     context: BrowserContext,
     pedidos_queue: asyncio.Queue,
     resultados_queue: asyncio.Queue,
+    db_path: str,
 ) -> None:
     """Consume IDs de pedido de la cola y los procesa uno a uno.
 
@@ -1099,6 +1308,7 @@ async def scraper_worker(
         context: BrowserContext independiente de Playwright.
         pedidos_queue: Cola con IDs de pedido. None es el sentinel de fin.
         resultados_queue: Cola donde publicar los resultados extraídos.
+        db_path: Ruta al archivo SQLite, pasado a procesar_pedido.
     """
     consecutive_failures = 0
     circuit_reopenings   = 0
@@ -1127,7 +1337,7 @@ async def scraper_worker(
         page.on("response", _response_handler)
 
         try:
-            exito = await procesar_pedido(worker_id, page, id_pedido, resultados_queue)
+            exito = await procesar_pedido(worker_id, page, id_pedido, resultados_queue, db_path)
         finally:
             await page.close()
 
@@ -1328,7 +1538,7 @@ async def main(args: argparse.Namespace) -> None:
         )
         worker_tasks = [
             asyncio.create_task(
-                scraper_worker(wid, contexts[wid], pedidos_queue, resultados_queue)
+                scraper_worker(wid, contexts[wid], pedidos_queue, resultados_queue, db_path)
             )
             for wid in range(CONFIG["NUM_WORKERS"])
         ]
