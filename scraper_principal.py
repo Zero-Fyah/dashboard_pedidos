@@ -32,6 +32,9 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict
 
+from dotenv import load_dotenv
+load_dotenv()
+
 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN
