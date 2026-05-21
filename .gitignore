@@ -1,0 +1,20 @@
+# Base de datos local
+pedidos.db
+
+# Logs
+*.log
+scraper_scheduler.log
+
+# Screenshots de errores
+errors/
+
+# Entorno virtual
+.venv/
+
+# Credenciales
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
