@@ -3,9 +3,12 @@ scraper_principal.py
 ====================
 Scraper asíncrono de pedidos para sistema administrativo interno (SPA Vue.js + Element Plus).
 
-Estimación de tiempo (modo incremental con 5 workers):
-    Activos + errores: ~2-3 horas dependiendo del volumen
-    Pedidos nuevos del día: ~2-5 minutos
+Configuración recomendada: NUM_WORKERS=3, PAUSA_ENTRE_PEDIDOS_S=1.2,
+MAX_REINTENTOS=5, NAV_TIMEOUT_MS=45s
+
+Estimación de tiempo (modo incremental con 3 workers):
+    Activos + errores: ~3-5 horas dependiendo del volumen
+    Pedidos nuevos del día: ~3-8 minutos
 
 Uso:
     # Carga histórica completa (primera vez)
@@ -29,6 +32,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -64,8 +68,10 @@ class ConfigDict(TypedDict):
     NUM_WORKERS: int
     QUEUE_MAXSIZE: int
     MAX_SCREENSHOTS: int
+    MAX_HTML_DEBUG: int
     LOG_FILE: str
     ERRORS_DIR: str
+    DEBUG_DIR: str
 
 
 CONFIG: ConfigDict = {
@@ -80,34 +86,36 @@ CONFIG: ConfigDict = {
     "clave":   os.environ.get("SCRAPER_PASSWORD", ""),
 
     # Timeouts (ms)
-    "NAV_TIMEOUT_MS":  30_000,
-    "ELEM_TIMEOUT_MS":  15_000,
+    "NAV_TIMEOUT_MS":  45_000,
+    "ELEM_TIMEOUT_MS": 20_000,
 
     # Pausas (segundos)
-    "PAUSA_ENTRE_PEDIDOS_S": 0.5,
+    "PAUSA_ENTRE_PEDIDOS_S": 1.2,
     "PAUSA_PAGINACION_S":    2.0,
 
     # Retry
-    "MAX_REINTENTOS":   3,
+    "MAX_REINTENTOS":   5,
     "BACKOFF_BASE_S":   2,
-    "BACKOFF_MAX_S":   30,
+    "BACKOFF_MAX_S":   60,
 
     # Circuit breaker
     "CIRCUIT_FAILURE_THRESHOLD": 5,
-    "CIRCUIT_COOLDOWN_S":       60,
-    "CIRCUIT_MAX_REOPENINGS":    3,
+    "CIRCUIT_COOLDOWN_S":        90,
+    "CIRCUIT_MAX_REOPENINGS":     3,
 
     # Rate limiting
-    "RATE_LIMIT_WAIT_S": 30,
+    "RATE_LIMIT_WAIT_S": 45,
 
     # Paralelismo
-    "NUM_WORKERS":   5,
+    "NUM_WORKERS":   3,
     "QUEUE_MAXSIZE": 100,
 
     # Observabilidad
     "MAX_SCREENSHOTS": 50,
+    "MAX_HTML_DEBUG":  50,
     "LOG_FILE":        "scraper.log",
     "ERRORS_DIR":      "errors",
+    "DEBUG_DIR":       "debug",
 }
 
 USUARIO: str = os.environ.get("SCRAPER_USUARIO", CONFIG["usuario"])
@@ -115,6 +123,7 @@ CLAVE:   str = os.environ.get("SCRAPER_PASSWORD", CONFIG["clave"])
 
 LOGIN_LOCK:      asyncio.Lock = asyncio.Lock()
 SCREENSHOT_LOCK: asyncio.Lock = asyncio.Lock()
+HTML_LOCK:       asyncio.Lock = asyncio.Lock()
 
 ESTADOS_CERRADOS: frozenset[str] = frozenset({
     "completado",
@@ -220,15 +229,45 @@ def to_num(val: str) -> float | None:
 
 
 # ─────────────────────────────────────────────
+# VALIDACIÓN DE CONFIGURACIÓN
+# ─────────────────────────────────────────────
+
+def validar_config() -> None:
+    """Falla rápido si faltan variables críticas de entorno.
+
+    Raises:
+        RuntimeError: Con la lista completa de variables faltantes.
+    """
+    faltantes: list[str] = []
+    checks = {
+        "SCRAPER_URL_LOGIN":      CONFIG["url_login"],
+        "SCRAPER_URL_POST_LOGIN": CONFIG["url_post_login"],
+        "SCRAPER_URL_PEDIDOS":    CONFIG["url_pedidos"],
+        "SCRAPER_URL_DETALLE":    CONFIG["url_detalle"],
+        "SCRAPER_USUARIO":        USUARIO,
+        "SCRAPER_PASSWORD":       CLAVE,
+    }
+    for env_key, value in checks.items():
+        if not value:
+            faltantes.append(env_key)
+    if faltantes:
+        raise RuntimeError(
+            f"Variables de entorno faltantes: {', '.join(faltantes)}. "
+            "Defínalas en un archivo .env antes de ejecutar."
+        )
+
+
+# ─────────────────────────────────────────────
 # LOGIN
 # ─────────────────────────────────────────────
 
 async def login(page: Page, usuario: str, clave: str) -> None:
     """Autentica en el panel administrativo y ajusta el idioma a español.
 
-    Realiza hasta 2 intentos con backoff lineal entre ellos. El cambio de
+    Realiza hasta 3 intentos con backoff lineal entre ellos. El cambio de
     idioma se ejecuta después de cada login exitoso: si el botón de idioma
-    muestra texto chino, lo cambia a español.
+    muestra texto chino, lo cambia a español. Usa esperas semánticas en lugar
+    de networkidle para compatibilidad con Vue.js SPA con polling continuo.
 
     Args:
         page: Página Playwright sobre la que operar.
@@ -236,27 +275,42 @@ async def login(page: Page, usuario: str, clave: str) -> None:
         clave: Contraseña de la cuenta.
 
     Raises:
-        RuntimeError: Si la autenticación falla tras 2 intentos consecutivos.
+        RuntimeError: Si la autenticación falla tras 3 intentos consecutivos.
     """
-    for intento in range(1, 3):
+    for intento in range(1, 4):
         try:
             await page.goto(CONFIG["url_login"], timeout=CONFIG["NAV_TIMEOUT_MS"])
-            await page.wait_for_load_state("networkidle")
+            await page.wait_for_selector(
+                "input[type='password'], input[type='email'], input[type='text']",
+                timeout=CONFIG["ELEM_TIMEOUT_MS"],
+            )
 
             await page.locator("input[type='email'], input[type='text']").first.fill(usuario)
             await page.locator("input[type='password']").first.fill(clave)
             await page.locator("button[type='submit'], form button").first.click()
-            await page.wait_for_url(CONFIG["url_post_login"], timeout=CONFIG["NAV_TIMEOUT_MS"])
+            await page.wait_for_function(
+                f"() => window.location.href.startsWith({json.dumps(CONFIG['url_post_login'])})",
+                timeout=CONFIG["NAV_TIMEOUT_MS"],
+            )
+            await page.wait_for_selector(
+                "#app, .el-container, .el-header, .el-main, main, "
+                "[class*='layout'], [class*='container']",
+                timeout=CONFIG["ELEM_TIMEOUT_MS"],
+            )
 
             btn = await page.query_selector(".lang-btn")
             if btn and "中文" in await btn.inner_text():
                 await btn.click()
                 await asyncio.sleep(0.8)
-                for op in await page.query_selector_all(".el-dropdown-menu__item"):
-                    if "西班牙" in await op.inner_text():
-                        await op.click()
-                        await asyncio.sleep(1.0)
-                        break
+                opciones = await page.locator(
+                    ".el-dropdown-menu__item"
+                ).filter(
+                    has_text=re.compile(r"西班牙|español", re.IGNORECASE)
+                ).all()
+                for op in opciones:
+                    await op.click()
+                    await asyncio.sleep(1.0)
+                    break
 
             log_event("login_ok", msg=f"Autenticación exitosa (intento {intento})")
             return
@@ -267,10 +321,10 @@ async def login(page: Page, usuario: str, clave: str) -> None:
                 level="WARNING",
                 msg=f"Intento {intento} fallido: {exc}",
             )
-            if intento < 2:
+            if intento < 3:
                 await asyncio.sleep(CONFIG["BACKOFF_BASE_S"])
 
-    raise RuntimeError("Login fallido tras 2 intentos")
+    raise RuntimeError("Login fallido tras 3 intentos")
 
 
 # ─────────────────────────────────────────────
@@ -290,6 +344,7 @@ async def init_db(db_path: str) -> None:
     async with aiosqlite.connect(db_path) as db:
         await db.execute("PRAGMA journal_mode = WAL")
         await db.execute("PRAGMA busy_timeout = 5000")
+        await db.execute("PRAGMA foreign_keys = ON")
         await db.commit()
 
         await db.executescript("""
@@ -366,6 +421,58 @@ async def init_db(db_path: str) -> None:
                 completado       INTEGER DEFAULT 0,
                 FOREIGN KEY (id_pedido) REFERENCES pedidos(id_pedido)
             );
+
+            CREATE TABLE IF NOT EXISTS estadisticas_monto (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_pedido    TEXT NOT NULL,
+                orden        INTEGER,
+                concepto     TEXT,
+                concepto_tag TEXT,
+                monto_pagar  TEXT,
+                monto_final  TEXT,
+                diferencia   TEXT,
+                FOREIGN KEY (id_pedido) REFERENCES pedidos(id_pedido)
+            );
+
+            CREATE TABLE IF NOT EXISTS gestion_diferencias (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_pedido          TEXT NOT NULL,
+                total_pagar_pedido TEXT,
+                monto_final_pagar  TEXT,
+                monto_pagado       TEXT,
+                monto_diferencia   TEXT,
+                FOREIGN KEY (id_pedido) REFERENCES pedidos(id_pedido)
+            );
+
+            CREATE TABLE IF NOT EXISTS detalle_diferencias (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_pedido           TEXT NOT NULL,
+                nombre_producto     TEXT,
+                especificacion      TEXT,
+                tipo                TEXT,
+                precio_unitario     TEXT,
+                descuento           TEXT,
+                precio_descuento    TEXT,
+                cantidad_pedido     TEXT,
+                cantidad_entregada  TEXT,
+                diferencia_cantidad TEXT,
+                monto_pagar_pedido  TEXT,
+                monto_final_pagar   TEXT,
+                iva                 TEXT,
+                monto_diferencia    TEXT,
+                FOREIGN KEY (id_pedido) REFERENCES pedidos(id_pedido)
+            );
+
+            CREATE TABLE IF NOT EXISTS registro_operaciones (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_pedido    TEXT NOT NULL,
+                momento      TEXT,
+                usuario      TEXT,
+                tipo_usuario TEXT,
+                accion       TEXT,
+                referencia   TEXT,
+                FOREIGN KEY (id_pedido) REFERENCES pedidos(id_pedido)
+            );
         """)
 
         for ddl in (
@@ -395,7 +502,57 @@ async def init_db(db_path: str) -> None:
         except Exception:
             pass
 
+        for ddl in (
+            "ALTER TABLE pedidos ADD COLUMN hora               TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN alistador_pedido   TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN inspector_pedido   TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN movil_cliente      TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN despachador        TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN hora_entrega       TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN obs_entrega        TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN entrega_ruta_tag   TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN entrega_descuento_tag TEXT DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN hay_diferencia     INTEGER DEFAULT 0",
+            "ALTER TABLE subpedidos ADD COLUMN cantidades_definitivas INTEGER DEFAULT 0",
+            "ALTER TABLE lineas_pedido ADD COLUMN numero_caja  TEXT    DEFAULT NULL",
+            "ALTER TABLE lineas_pedido ADD COLUMN tipo         TEXT    DEFAULT NULL",
+        ):
+            try:
+                await db.execute(ddl)
+                await db.commit()
+            except Exception:
+                pass
+
+        for ddl_idx in (
+            "CREATE INDEX IF NOT EXISTS idx_subpedidos_pedido   ON subpedidos(id_pedido)",
+            "CREATE INDEX IF NOT EXISTS idx_lineas_pedido       ON lineas_pedido(id_pedido, numero_subpedido)",
+            "CREATE INDEX IF NOT EXISTS idx_errores_pedido      ON errores(id_pedido)",
+            "CREATE INDEX IF NOT EXISTS idx_estadisticas_pedido ON estadisticas_monto(id_pedido)",
+            "CREATE INDEX IF NOT EXISTS idx_gestion_dif_pedido  ON gestion_diferencias(id_pedido)",
+            "CREATE INDEX IF NOT EXISTS idx_detalle_dif_pedido  ON detalle_diferencias(id_pedido)",
+            "CREATE INDEX IF NOT EXISTS idx_registro_ops_pedido ON registro_operaciones(id_pedido)",
+        ):
+            await db.execute(ddl_idx)
+        await db.commit()
+
     log_event("db_init", msg=f"Base de datos lista: {db_path}")
+
+
+async def limpiar_errores_resueltos(db_path: str) -> int:
+    """Elimina registros de errores para pedidos que ya están scraping_completo=1.
+
+    Returns:
+        Número de filas eliminadas.
+    """
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("""
+            DELETE FROM errores
+            WHERE id_pedido IN (
+                SELECT id_pedido FROM pedidos WHERE scraping_completo = 1
+            )
+        """)
+        await db.commit()
+        return cursor.rowcount
 
 
 # ─────────────────────────────────────────────
@@ -519,6 +676,9 @@ async def extraer_info_general(page: Page) -> dict:
         "telefono":         "",
         "direccion_envio":  "",
         "observaciones":    "",
+        "alistador_pedido": "",
+        "inspector_pedido": "",
+        "movil_cliente":    "",
     }
 
     mapa: dict[str, str] = {
@@ -535,6 +695,9 @@ async def extraer_info_general(page: Page) -> dict:
         "teléfono de contacto":     "telefono",
         "dirección de envío":       "direccion_envio",
         "observaciones del pedido": "observaciones",
+        "alistador":                "alistador_pedido",
+        "inspector":                "inspector_pedido",
+        "móvil del cliente":        "movil_cliente",
     }
 
     items = await page.query_selector_all("div.info-item")
@@ -553,7 +716,368 @@ async def extraer_info_general(page: Page) -> dict:
             "id_pedido vacío — la página de detalle no cargó correctamente"
         )
 
+    pid = datos["id_pedido"]
+    if len(pid) < 3 or pid.lower() in ("n/a", "null", "-"):
+        raise ValueError(f"id_pedido inválido: '{pid}'")
+
     return datos
+
+
+async def extraer_info_entrega(page: Page, id_pedido: str) -> dict:
+    """Extrae el card 'Información de entrega' (tabla el-descriptions).
+
+    Estructura del HTML:
+      Fila 0: Método de entrega (texto + tag ruta opcional + tag descuento)
+              | Despachador
+      Fila 1: Hora de entrega | Número de estante (se omite)
+      Fila 2: Observaciones (colspan 3)
+
+    Returns:
+        Dict con 6 claves. Todas vacías si el card no existe.
+    """
+    resultado = {
+        "entrega_metodo_texto":    "",
+        "entrega_ruta_tag":        "",
+        "entrega_descuento_tag":   "",
+        "despachador":             "",
+        "hora_entrega":            "",
+        "obs_entrega":             "",
+    }
+    try:
+        tabla = await page.query_selector(
+            ".el-descriptions__table.is-bordered"
+        )
+        if not tabla:
+            return resultado
+
+        filas = await tabla.query_selector_all("tbody tr")
+
+        if len(filas) > 0:
+            celdas = await filas[0].query_selector_all("td")
+            if len(celdas) >= 4:
+                celda_metodo = celdas[1]
+
+                texto_raw = (await celda_metodo.inner_text()).strip()
+                for tag_el in await celda_metodo.query_selector_all(".el-tag"):
+                    tag_txt = (await tag_el.inner_text()).strip()
+                    texto_raw = texto_raw.replace(tag_txt, "").strip()
+                resultado["entrega_metodo_texto"] = texto_raw
+
+                tag_ruta = await celda_metodo.query_selector(
+                    ".el-tag--primary .el-tag__content"
+                )
+                if tag_ruta:
+                    resultado["entrega_ruta_tag"] = (
+                        await tag_ruta.inner_text()
+                    ).strip()
+
+                tag_dto = await celda_metodo.query_selector(
+                    ".el-tag--warning .el-tag__content"
+                )
+                if tag_dto:
+                    resultado["entrega_descuento_tag"] = (
+                        await tag_dto.inner_text()
+                    ).strip()
+
+                resultado["despachador"] = (
+                    await celdas[3].inner_text()
+                ).strip()
+
+        if len(filas) > 1:
+            celdas = await filas[1].query_selector_all("td")
+            if len(celdas) >= 2:
+                resultado["hora_entrega"] = (
+                    await celdas[1].inner_text()
+                ).strip()
+
+        if len(filas) > 2:
+            celdas = await filas[2].query_selector_all("td")
+            if len(celdas) >= 2:
+                resultado["obs_entrega"] = (
+                    await celdas[1].inner_text()
+                ).strip()
+
+    except Exception as exc:
+        log_event(
+            "entrega_error",
+            id_pedido=id_pedido,
+            level="WARNING",
+            msg=str(exc),
+        )
+    return resultado
+
+
+async def extraer_estadisticas_monto(
+    page: Page, id_pedido: str
+) -> tuple[list[dict], bool]:
+    """Extrae la tabla 'Estadísticas de monto del pedido'.
+
+    Las filas son dinámicas (N variable según el pedido y los descuentos
+    aplicables). Detecta si hay diferencia en el envío por el tag warning
+    en el header del card.
+
+    Returns:
+        Tupla (lista_filas, hay_diferencia).
+        Lista vacía y False si el card no existe.
+    """
+    filas_data: list[dict] = []
+    hay_diferencia = False
+    try:
+        card = await page.query_selector(".amount-statistics-card")
+        if not card:
+            return filas_data, hay_diferencia
+
+        tag_dif = await card.query_selector(
+            ".statistics-header .el-tag--warning, "
+            ".statistics-header .el-tag--dark"
+        )
+        if tag_dif:
+            hay_diferencia = True
+
+        filas = await card.query_selector_all(
+            ".amount-statistics-table tbody tr"
+        )
+        for orden, fila in enumerate(filas, start=1):
+            celdas = await fila.query_selector_all("td")
+            if not celdas:
+                continue
+
+            celda_concepto = celdas[0]
+            concepto_txt   = ""
+            for span in await celda_concepto.query_selector_all(".cell > span"):
+                clases_span = (await span.get_attribute("class")) or ""
+                if "el-tag" not in clases_span:
+                    concepto_txt = (await span.inner_text()).strip()
+                    break
+            if not concepto_txt:
+                concepto_txt = (await celda_concepto.inner_text()).strip()
+
+            concepto_tag_el = await celda_concepto.query_selector(
+                ".el-tag .el-tag__content"
+            )
+            concepto_tag = (
+                (await concepto_tag_el.inner_text()).strip()
+                if concepto_tag_el else ""
+            )
+
+            monto_pagar = (
+                (await celdas[1].inner_text()).strip()
+                if len(celdas) > 1 else ""
+            )
+            monto_final = (
+                (await celdas[2].inner_text()).strip()
+                if len(celdas) > 2 else ""
+            )
+            diferencia = (
+                (await celdas[3].inner_text()).strip()
+                if len(celdas) > 3 else ""
+            )
+
+            filas_data.append({
+                "id_pedido":    id_pedido,
+                "orden":        orden,
+                "concepto":     concepto_txt,
+                "concepto_tag": concepto_tag,
+                "monto_pagar":  monto_pagar,
+                "monto_final":  monto_final,
+                "diferencia":   diferencia,
+            })
+
+    except Exception as exc:
+        log_event(
+            "estadisticas_error",
+            id_pedido=id_pedido,
+            level="WARNING",
+            msg=str(exc),
+        )
+    return filas_data, hay_diferencia
+
+
+async def extraer_gestion_diferencias(
+    page: Page, id_pedido: str
+) -> dict | None:
+    """Extrae el card 'Gestión de diferencias en el envío'.
+
+    Card condicional — solo aparece cuando hay_diferencia=True.
+    Contiene 4 valores fijos en .difference-item en este orden:
+      Total a pagar del pedido, Monto final a pagar,
+      Monto pagado, Monto de diferencia.
+
+    Returns:
+        Dict con los 4 valores, o None si el card no existe.
+    """
+    try:
+        card = await page.query_selector(".difference-card-wrapper")
+        if not card:
+            return None
+
+        items = await card.query_selector_all(
+            ".difference-content .difference-item"
+        )
+        valores: list[str] = []
+        for item in items:
+            val_el = await item.query_selector(".item-value")
+            valores.append(
+                (await val_el.inner_text()).strip() if val_el else ""
+            )
+
+        return {
+            "id_pedido":           id_pedido,
+            "total_pagar_pedido":  valores[0] if len(valores) > 0 else "",
+            "monto_final_pagar":   valores[1] if len(valores) > 1 else "",
+            "monto_pagado":        valores[2] if len(valores) > 2 else "",
+            "monto_diferencia":    valores[3] if len(valores) > 3 else "",
+        }
+
+    except Exception as exc:
+        log_event(
+            "gestion_dif_error",
+            id_pedido=id_pedido,
+            level="WARNING",
+            msg=str(exc),
+        )
+    return None
+
+
+async def extraer_detalle_diferencias(
+    page: Page, id_pedido: str
+) -> list[dict]:
+    """Extrae el card 'Detalle de diferencias'.
+
+    Card condicional — solo aparece cuando hay_diferencia=True.
+    Tabla con 13 columnas en orden fijo (verificado contra HTML real):
+      0  Nombre del producto      6  Cantidad del pedido
+      1  Especificación            7  Cantidad real entregada
+      2  Tipo (tag)                8  Diferencia de cantidad
+      3  Precio unitario           9  Monto a pagar del pedido
+      4  Descuento (tag o '-')    10  Monto final a pagar
+      5  Precio con descuento     11  IVA
+                                  12  Monto de diferencia
+
+    Returns:
+        Lista de dicts, vacía si el card no existe.
+    """
+    resultado: list[dict] = []
+    try:
+        card = await page.query_selector(".diff-items-card")
+        if not card:
+            return resultado
+
+        filas = await card.query_selector_all("tbody tr")
+        for fila in filas:
+            celdas = await fila.query_selector_all("td")
+            if len(celdas) < 13:
+                continue
+
+            async def ct(idx: int) -> str:
+                return (await celdas[idx].inner_text()).strip()
+
+            tipo_el  = await celdas[2].query_selector(".el-tag__content")
+            tipo_val = (
+                (await tipo_el.inner_text()).strip()
+                if tipo_el else await ct(2)
+            )
+
+            dto_el  = await celdas[4].query_selector(".el-tag__content")
+            dto_val = (
+                (await dto_el.inner_text()).strip()
+                if dto_el else await ct(4)
+            )
+
+            resultado.append({
+                "id_pedido":           id_pedido,
+                "nombre_producto":     await ct(0),
+                "especificacion":      await ct(1),
+                "tipo":                tipo_val,
+                "precio_unitario":     await ct(3),
+                "descuento":           dto_val,
+                "precio_descuento":    await ct(5),
+                "cantidad_pedido":     await ct(6),
+                "cantidad_entregada":  await ct(7),
+                "diferencia_cantidad": await ct(8),
+                "monto_pagar_pedido":  await ct(9),
+                "monto_final_pagar":   await ct(10),
+                "iva":                 await ct(11),
+                "monto_diferencia":    await ct(12),
+            })
+
+    except Exception as exc:
+        log_event(
+            "detalle_dif_error",
+            id_pedido=id_pedido,
+            level="WARNING",
+            msg=str(exc),
+        )
+    return resultado
+
+
+async def extraer_registro_operaciones(
+    page: Page, id_pedido: str
+) -> list[dict]:
+    """Extrae el card 'Registro de operaciones'.
+
+    Cada .log-item contiene:
+      .log-time    → momento (datetime string)
+      .log-user    → nombre de usuario; clase CSS indica tipo:
+                     user-type-member | user-type-system | user-type-staff
+      .log-content → texto de la acción, a veces con sufijo ' - referencia'
+
+    Returns:
+        Lista de dicts, vacía si no hay registros o el card no existe.
+    """
+    resultado: list[dict] = []
+    try:
+        items = await page.query_selector_all(
+            ".operate-log-content .log-item"
+        )
+        for item in items:
+            tiempo_el    = await item.query_selector(".log-time")
+            usuario_el   = await item.query_selector(".log-user")
+            contenido_el = await item.query_selector(".log-content")
+
+            momento = (
+                (await tiempo_el.inner_text()).strip()
+                if tiempo_el else ""
+            )
+            usuario = (
+                (await usuario_el.inner_text()).strip()
+                if usuario_el else ""
+            )
+
+            tipo_usuario = ""
+            if usuario_el:
+                clases = (await usuario_el.get_attribute("class")) or ""
+                if "user-type-member" in clases:
+                    tipo_usuario = "member"
+                elif "user-type-staff" in clases:
+                    tipo_usuario = "staff"
+                elif "user-type-system" in clases:
+                    tipo_usuario = "system"
+
+            contenido_txt = ""
+            if contenido_el:
+                contenido_txt = (await contenido_el.inner_text()).strip()
+            partes     = contenido_txt.split(" - ", 1)
+            accion     = partes[0].strip()
+            referencia = partes[1].strip() if len(partes) > 1 else ""
+
+            resultado.append({
+                "id_pedido":    id_pedido,
+                "momento":      momento,
+                "usuario":      usuario,
+                "tipo_usuario": tipo_usuario,
+                "accion":       accion,
+                "referencia":   referencia,
+            })
+
+    except Exception as exc:
+        log_event(
+            "registro_ops_error",
+            id_pedido=id_pedido,
+            level="WARNING",
+            msg=str(exc),
+        )
+    return resultado
 
 
 async def extraer_subpedidos(page: Page) -> list[dict]:
@@ -745,33 +1269,58 @@ async def extraer_timeline(page: Page, id_pedido: str) -> list[dict]:
 
 
 # ─────────────────────────────────────────────
-# OBSERVABILIDAD — SCREENSHOTS
+# OBSERVABILIDAD — DEBUG
 # ─────────────────────────────────────────────
 
-async def guardar_screenshot(page: Page, id_pedido: str) -> None:
-    """Toma screenshot del estado actual y lo guarda en el directorio de errores.
+async def guardar_debug(page: Page, id_pedido: str) -> None:
+    """Guarda screenshot PNG y HTML del estado actual para diagnóstico de errores.
 
-    Usa SCREENSHOT_LOCK para serializar la rotación: si el directorio supera
-    CONFIG["MAX_SCREENSHOTS"] archivos, elimina el más antiguo antes de guardar.
-
-    Args:
-        page: Página Playwright activa.
-        id_pedido: ID del pedido en proceso (incluido en el nombre del archivo).
+    Respeta los límites MAX_SCREENSHOTS y MAX_HTML_DEBUG eliminando los
+    archivos más antiguos cuando se superan.
     """
+    ts         = int(time.time())
     errors_dir = Path(CONFIG["ERRORS_DIR"])
+    debug_dir  = Path(CONFIG["DEBUG_DIR"])
     errors_dir.mkdir(parents=True, exist_ok=True)
-    ruta = errors_dir / f"error_{id_pedido}_{int(time.time())}.png"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    ruta_png  = errors_dir / f"error_{id_pedido}_{ts}.png"
+    ruta_html = debug_dir  / f"debug_{id_pedido}_{ts}.html"
 
     async with SCREENSHOT_LOCK:
-        archivos = sorted(
-            errors_dir.glob("*.png"),
-            key=lambda f: f.stat().st_mtime,
+        archivos_png = sorted(
+            errors_dir.glob("*.png"), key=lambda f: f.stat().st_mtime
         )
-        while len(archivos) >= CONFIG["MAX_SCREENSHOTS"]:
-            archivos.pop(0).unlink()
-        await page.screenshot(path=str(ruta))
+        while len(archivos_png) >= CONFIG["MAX_SCREENSHOTS"]:
+            archivos_png.pop(0).unlink()
+        await page.screenshot(path=str(ruta_png))
 
-    log_event("screenshot_guardado", id_pedido=id_pedido, msg=str(ruta))
+    async with HTML_LOCK:
+        archivos_html = sorted(
+            debug_dir.glob("*.html"), key=lambda f: f.stat().st_mtime
+        )
+        while len(archivos_html) >= CONFIG["MAX_HTML_DEBUG"]:
+            archivos_html.pop(0).unlink()
+        try:
+            html = await page.content()
+            ruta_html.write_text(html, encoding="utf-8")
+        except Exception as exc:
+            log_event(
+                "html_debug_error",
+                id_pedido=id_pedido,
+                level="WARNING",
+                msg=str(exc),
+            )
+            ruta_html = None
+
+    log_event(
+        "debug_guardado",
+        id_pedido=id_pedido,
+        msg=(
+            f"screenshot={ruta_png.name}, "
+            f"html={ruta_html.name if ruta_html else 'N/A'}"
+        ),
+    )
 
 
 # ─────────────────────────────────────────────
@@ -870,23 +1419,45 @@ async def procesar_pedido(
                 info_general = await extraer_info_general(page)
                 subpedidos   = await extraer_subpedidos(page)
                 timeline     = await extraer_timeline(page, id_pedido)
+                info_entrega          = await extraer_info_entrega(page, id_pedido)
+                estadisticas, hay_dif = await extraer_estadisticas_monto(page, id_pedido)
+                gestion_dif           = await extraer_gestion_diferencias(page, id_pedido)
+                detalle_dif           = await extraer_detalle_diferencias(page, id_pedido)
+                registro_ops          = await extraer_registro_operaciones(page, id_pedido)
                 resultado = {
                     "tipo":         "completo",
                     "id_pedido":    id_pedido,
                     "info_general": info_general,
                     "subpedidos":   subpedidos,
                     "timeline":     timeline,
+                    "info_entrega":   info_entrega,
+                    "estadisticas":   estadisticas,
+                    "hay_diferencia": 1 if hay_dif else 0,
+                    "gestion_dif":    gestion_dif,
+                    "detalle_dif":    detalle_dif,
+                    "registro_ops":   registro_ops,
                 }
                 n_subs = len(subpedidos)
 
             elif modo == "con_cantidades":
                 subpedidos = await extraer_subpedidos(page)
                 timeline   = await extraer_timeline(page, id_pedido)
+                info_entrega          = await extraer_info_entrega(page, id_pedido)
+                estadisticas, hay_dif = await extraer_estadisticas_monto(page, id_pedido)
+                gestion_dif           = await extraer_gestion_diferencias(page, id_pedido)
+                detalle_dif           = await extraer_detalle_diferencias(page, id_pedido)
+                registro_ops          = await extraer_registro_operaciones(page, id_pedido)
                 resultado = {
                     "tipo":       "con_cantidades",
                     "id_pedido":  id_pedido,
                     "subpedidos": subpedidos,
                     "timeline":   timeline,
+                    "info_entrega":   info_entrega,
+                    "estadisticas":   estadisticas,
+                    "hay_diferencia": 1 if hay_dif else 0,
+                    "gestion_dif":    gestion_dif,
+                    "detalle_dif":    detalle_dif,
+                    "registro_ops":   registro_ops,
                 }
                 n_subs = len(subpedidos)
 
@@ -910,11 +1481,21 @@ async def procesar_pedido(
                     subs_estado.append({"numero_subpedido": num_sub, "estado": estado})
 
                 timeline = await extraer_timeline(page, id_pedido)
+                estadisticas, hay_dif = await extraer_estadisticas_monto(page, id_pedido)
+                gestion_dif           = await extraer_gestion_diferencias(page, id_pedido)
+                detalle_dif           = await extraer_detalle_diferencias(page, id_pedido)
+                registro_ops          = await extraer_registro_operaciones(page, id_pedido)
                 resultado = {
                     "tipo":       "solo_estado",
                     "id_pedido":  id_pedido,
                     "subpedidos": subs_estado,
                     "timeline":   timeline,
+                    "info_entrega":   None,
+                    "estadisticas":   estadisticas,
+                    "hay_diferencia": 1 if hay_dif else 0,
+                    "gestion_dif":    gestion_dif,
+                    "detalle_dif":    detalle_dif,
+                    "registro_ops":   registro_ops,
                 }
                 n_subs = len(subs_estado)
 
@@ -939,7 +1520,7 @@ async def procesar_pedido(
                 msg=f"Intento {intento}/{CONFIG['MAX_REINTENTOS']}: {exc}",
             )
             try:
-                await guardar_screenshot(page, id_pedido)
+                await guardar_debug(page, id_pedido)
             except Exception as ss_exc:
                 log_event(
                     "screenshot_error",
@@ -1029,7 +1610,7 @@ async def persistencia_worker(
 
             # ── Modo completo ──────────────────────────────────────────────
             if tipo == "completo":
-                info   = resultado["info_general"]
+                info_g = resultado["info_general"]
                 subped = resultado["subpedidos"]
 
                 lineas_rows: list[dict] = []
@@ -1058,10 +1639,28 @@ async def persistencia_worker(
                             "tipo":              linea["tipo"],
                         })
 
-                fecha_completa = info.get("fecha", "")
+                fecha_completa = info_g.get("fecha", "")
                 partes_fecha   = fecha_completa.split(" ")
                 fecha_val      = partes_fecha[0] if partes_fecha else ""
                 hora_val       = partes_fecha[1] if len(partes_fecha) > 1 else ""
+
+                _info_insert = {
+                    "id_pedido":        info_g.get("id_pedido", ""),
+                    "fecha":            fecha_val,
+                    "hora":             hora_val,
+                    "servicio_cliente": info_g.get("servicio_cliente", ""),
+                    "vendedor":         info_g.get("vendedor", ""),
+                    "forma_pago":       info_g.get("forma_pago", ""),
+                    "comprobante":      info_g.get("comprobante", ""),
+                    "nombre_empresa":   info_g.get("nombre_empresa", ""),
+                    "nit":              info_g.get("nit", ""),
+                    "metodo_entrega":   info_g.get("metodo_entrega", ""),
+                    "destinatario":     info_g.get("destinatario", ""),
+                    "telefono":         info_g.get("telefono", ""),
+                    "direccion_envio":  info_g.get("direccion_envio", ""),
+                    "observaciones":    info_g.get("observaciones", ""),
+                    "actualizado_en":   datetime.now(timezone.utc).isoformat(),
+                }
 
                 try:
                     await db.execute("BEGIN")
@@ -1095,12 +1694,7 @@ async def persistencia_worker(
                             observaciones       = excluded.observaciones,
                             actualizado_en      = excluded.actualizado_en
                         """,
-                        {
-                            **info,
-                            "fecha":          fecha_val,
-                            "hora":           hora_val,
-                            "actualizado_en": datetime.now(timezone.utc).isoformat(),
-                        },
+                        _info_insert,
                     )
 
                     await db.execute("DELETE FROM subpedidos     WHERE id_pedido = ?", (id_pedido,))
@@ -1174,6 +1768,96 @@ async def persistencia_worker(
                         "UPDATE pedidos SET scraping_completo = 1, actualizado_en = ? WHERE id_pedido = ?",
                         (datetime.now(timezone.utc).isoformat(), id_pedido),
                     )
+
+                    info_e = resultado.get("info_entrega") or {}
+                    await db.execute(
+                        """
+                        UPDATE pedidos SET
+                            alistador_pedido      = :ap,
+                            inspector_pedido      = :ip,
+                            movil_cliente         = :mc,
+                            despachador           = :desp,
+                            hora_entrega          = :he,
+                            obs_entrega           = :oe,
+                            entrega_ruta_tag      = :ert,
+                            entrega_descuento_tag = :edt,
+                            hay_diferencia        = :hd
+                        WHERE id_pedido = :pid
+                        """,
+                        {
+                            "ap":   info_g.get("alistador_pedido", ""),
+                            "ip":   info_g.get("inspector_pedido", ""),
+                            "mc":   info_g.get("movil_cliente", ""),
+                            "desp": info_e.get("despachador", ""),
+                            "he":   info_e.get("hora_entrega", ""),
+                            "oe":   info_e.get("obs_entrega", ""),
+                            "ert":  info_e.get("entrega_ruta_tag", ""),
+                            "edt":  info_e.get("entrega_descuento_tag", ""),
+                            "hd":   resultado.get("hay_diferencia", 0),
+                            "pid":  id_pedido,
+                        },
+                    )
+
+                    await db.execute(
+                        "DELETE FROM estadisticas_monto WHERE id_pedido = ?", (id_pedido,)
+                    )
+                    if resultado.get("estadisticas"):
+                        await db.executemany(
+                            """INSERT INTO estadisticas_monto
+                               (id_pedido, orden, concepto, concepto_tag,
+                                monto_pagar, monto_final, diferencia)
+                               VALUES
+                               (:id_pedido, :orden, :concepto, :concepto_tag,
+                                :monto_pagar, :monto_final, :diferencia)""",
+                            resultado["estadisticas"],
+                        )
+
+                    await db.execute(
+                        "DELETE FROM gestion_diferencias WHERE id_pedido = ?", (id_pedido,)
+                    )
+                    if resultado.get("gestion_dif"):
+                        gd = resultado["gestion_dif"]
+                        await db.execute(
+                            """INSERT INTO gestion_diferencias
+                               (id_pedido, total_pagar_pedido, monto_final_pagar,
+                                monto_pagado, monto_diferencia)
+                               VALUES (?, ?, ?, ?, ?)""",
+                            (id_pedido, gd.get("total_pagar_pedido", ""),
+                             gd.get("monto_final_pagar", ""), gd.get("monto_pagado", ""),
+                             gd.get("monto_diferencia", "")),
+                        )
+
+                    await db.execute(
+                        "DELETE FROM detalle_diferencias WHERE id_pedido = ?", (id_pedido,)
+                    )
+                    if resultado.get("detalle_dif"):
+                        await db.executemany(
+                            """INSERT INTO detalle_diferencias
+                               (id_pedido, nombre_producto, especificacion, tipo,
+                                precio_unitario, descuento, precio_descuento,
+                                cantidad_pedido, cantidad_entregada, diferencia_cantidad,
+                                monto_pagar_pedido, monto_final_pagar, iva, monto_diferencia)
+                               VALUES
+                               (:id_pedido, :nombre_producto, :especificacion, :tipo,
+                                :precio_unitario, :descuento, :precio_descuento,
+                                :cantidad_pedido, :cantidad_entregada, :diferencia_cantidad,
+                                :monto_pagar_pedido, :monto_final_pagar, :iva, :monto_diferencia)""",
+                            resultado["detalle_dif"],
+                        )
+
+                    await db.execute(
+                        "DELETE FROM registro_operaciones WHERE id_pedido = ?", (id_pedido,)
+                    )
+                    if resultado.get("registro_ops"):
+                        await db.executemany(
+                            """INSERT INTO registro_operaciones
+                               (id_pedido, momento, usuario, tipo_usuario, accion, referencia)
+                               VALUES
+                               (:id_pedido, :momento, :usuario, :tipo_usuario,
+                                :accion, :referencia)""",
+                            resultado["registro_ops"],
+                        )
+
                     await db.execute("COMMIT")
                     log_event("db_guardado", id_pedido=id_pedido, msg="Pedido persistido")
 
@@ -1217,6 +1901,71 @@ async def persistencia_worker(
                                 (:id_pedido, :paso, :titulo, :fecha_hora, :completado)
                             """,
                             timeline,
+                        )
+
+                    await db.execute(
+                        "UPDATE pedidos SET hay_diferencia = ? WHERE id_pedido = ?",
+                        (resultado.get("hay_diferencia", 0), id_pedido),
+                    )
+
+                    await db.execute(
+                        "DELETE FROM estadisticas_monto WHERE id_pedido = ?", (id_pedido,)
+                    )
+                    if resultado.get("estadisticas"):
+                        await db.executemany(
+                            """INSERT INTO estadisticas_monto
+                               (id_pedido, orden, concepto, concepto_tag,
+                                monto_pagar, monto_final, diferencia)
+                               VALUES
+                               (:id_pedido, :orden, :concepto, :concepto_tag,
+                                :monto_pagar, :monto_final, :diferencia)""",
+                            resultado["estadisticas"],
+                        )
+
+                    await db.execute(
+                        "DELETE FROM gestion_diferencias WHERE id_pedido = ?", (id_pedido,)
+                    )
+                    if resultado.get("gestion_dif"):
+                        gd = resultado["gestion_dif"]
+                        await db.execute(
+                            """INSERT INTO gestion_diferencias
+                               (id_pedido, total_pagar_pedido, monto_final_pagar,
+                                monto_pagado, monto_diferencia)
+                               VALUES (?, ?, ?, ?, ?)""",
+                            (id_pedido, gd.get("total_pagar_pedido", ""),
+                             gd.get("monto_final_pagar", ""), gd.get("monto_pagado", ""),
+                             gd.get("monto_diferencia", "")),
+                        )
+
+                    await db.execute(
+                        "DELETE FROM detalle_diferencias WHERE id_pedido = ?", (id_pedido,)
+                    )
+                    if resultado.get("detalle_dif"):
+                        await db.executemany(
+                            """INSERT INTO detalle_diferencias
+                               (id_pedido, nombre_producto, especificacion, tipo,
+                                precio_unitario, descuento, precio_descuento,
+                                cantidad_pedido, cantidad_entregada, diferencia_cantidad,
+                                monto_pagar_pedido, monto_final_pagar, iva, monto_diferencia)
+                               VALUES
+                               (:id_pedido, :nombre_producto, :especificacion, :tipo,
+                                :precio_unitario, :descuento, :precio_descuento,
+                                :cantidad_pedido, :cantidad_entregada, :diferencia_cantidad,
+                                :monto_pagar_pedido, :monto_final_pagar, :iva, :monto_diferencia)""",
+                            resultado["detalle_dif"],
+                        )
+
+                    await db.execute(
+                        "DELETE FROM registro_operaciones WHERE id_pedido = ?", (id_pedido,)
+                    )
+                    if resultado.get("registro_ops"):
+                        await db.executemany(
+                            """INSERT INTO registro_operaciones
+                               (id_pedido, momento, usuario, tipo_usuario, accion, referencia)
+                               VALUES
+                               (:id_pedido, :momento, :usuario, :tipo_usuario,
+                                :accion, :referencia)""",
+                            resultado["registro_ops"],
                         )
 
                     await db.execute("COMMIT")
@@ -1270,6 +2019,71 @@ async def persistencia_worker(
                             (datetime.now(timezone.utc).isoformat(), id_pedido),
                         )
 
+                    await db.execute(
+                        "UPDATE pedidos SET hay_diferencia = ? WHERE id_pedido = ?",
+                        (resultado.get("hay_diferencia", 0), id_pedido),
+                    )
+
+                    await db.execute(
+                        "DELETE FROM estadisticas_monto WHERE id_pedido = ?", (id_pedido,)
+                    )
+                    if resultado.get("estadisticas"):
+                        await db.executemany(
+                            """INSERT INTO estadisticas_monto
+                               (id_pedido, orden, concepto, concepto_tag,
+                                monto_pagar, monto_final, diferencia)
+                               VALUES
+                               (:id_pedido, :orden, :concepto, :concepto_tag,
+                                :monto_pagar, :monto_final, :diferencia)""",
+                            resultado["estadisticas"],
+                        )
+
+                    await db.execute(
+                        "DELETE FROM gestion_diferencias WHERE id_pedido = ?", (id_pedido,)
+                    )
+                    if resultado.get("gestion_dif"):
+                        gd = resultado["gestion_dif"]
+                        await db.execute(
+                            """INSERT INTO gestion_diferencias
+                               (id_pedido, total_pagar_pedido, monto_final_pagar,
+                                monto_pagado, monto_diferencia)
+                               VALUES (?, ?, ?, ?, ?)""",
+                            (id_pedido, gd.get("total_pagar_pedido", ""),
+                             gd.get("monto_final_pagar", ""), gd.get("monto_pagado", ""),
+                             gd.get("monto_diferencia", "")),
+                        )
+
+                    await db.execute(
+                        "DELETE FROM detalle_diferencias WHERE id_pedido = ?", (id_pedido,)
+                    )
+                    if resultado.get("detalle_dif"):
+                        await db.executemany(
+                            """INSERT INTO detalle_diferencias
+                               (id_pedido, nombre_producto, especificacion, tipo,
+                                precio_unitario, descuento, precio_descuento,
+                                cantidad_pedido, cantidad_entregada, diferencia_cantidad,
+                                monto_pagar_pedido, monto_final_pagar, iva, monto_diferencia)
+                               VALUES
+                               (:id_pedido, :nombre_producto, :especificacion, :tipo,
+                                :precio_unitario, :descuento, :precio_descuento,
+                                :cantidad_pedido, :cantidad_entregada, :diferencia_cantidad,
+                                :monto_pagar_pedido, :monto_final_pagar, :iva, :monto_diferencia)""",
+                            resultado["detalle_dif"],
+                        )
+
+                    await db.execute(
+                        "DELETE FROM registro_operaciones WHERE id_pedido = ?", (id_pedido,)
+                    )
+                    if resultado.get("registro_ops"):
+                        await db.executemany(
+                            """INSERT INTO registro_operaciones
+                               (id_pedido, momento, usuario, tipo_usuario, accion, referencia)
+                               VALUES
+                               (:id_pedido, :momento, :usuario, :tipo_usuario,
+                                :accion, :referencia)""",
+                            resultado["registro_ops"],
+                        )
+
                     await db.execute("COMMIT")
                     log_event("db_guardado", id_pedido=id_pedido, msg="Estado actualizado")
 
@@ -1293,6 +2107,7 @@ async def scraper_worker(
     pedidos_queue: asyncio.Queue,
     resultados_queue: asyncio.Queue,
     db_path: str,
+    stop_queue: asyncio.Queue,
 ) -> None:
     """Consume IDs de pedido de la cola y los procesa uno a uno.
 
@@ -1306,9 +2121,10 @@ async def scraper_worker(
     Args:
         worker_id: Identificador único (0 a NUM_WORKERS-1).
         context: BrowserContext independiente de Playwright.
-        pedidos_queue: Cola con IDs de pedido. None es el sentinel de fin.
+        pedidos_queue: Cola compartida con IDs de pedido.
         resultados_queue: Cola donde publicar los resultados extraídos.
         db_path: Ruta al archivo SQLite, pasado a procesar_pedido.
+        stop_queue: Cola exclusiva de este worker; recibe None para señal de parada.
     """
     consecutive_failures = 0
     circuit_reopenings   = 0
@@ -1328,9 +2144,19 @@ async def scraper_worker(
         await asyncio.sleep(wait_s)
 
     while True:
-        id_pedido = await pedidos_queue.get()
-        if id_pedido is None:
+        get_task  = asyncio.create_task(pedidos_queue.get())
+        stop_task = asyncio.create_task(stop_queue.get())
+        done, pending = await asyncio.wait(
+            {get_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+        if stop_task in done:
+            if get_task in done:
+                # ID llegó al mismo tiempo que la señal de parada — devolverlo
+                await pedidos_queue.put(get_task.result())
             break
+        id_pedido = get_task.result()
 
         current_pedido[0] = id_pedido
         page = await context.new_page()
@@ -1408,8 +2234,17 @@ async def main(args: argparse.Namespace) -> None:
     t_inicio = time.monotonic()
     db_path  = "pedidos.db"
 
+    validar_config()
     await init_db(db_path)
     Path(CONFIG["ERRORS_DIR"]).mkdir(parents=True, exist_ok=True)
+    Path(CONFIG["DEBUG_DIR"]).mkdir(parents=True, exist_ok=True)
+
+    eliminados = await limpiar_errores_resueltos(db_path)
+    if eliminados:
+        log_event(
+            "errores_limpios",
+            msg=f"Eliminados {eliminados} errores de pedidos ya completos",
+        )
 
     async with async_playwright() as pw:
         browser: Browser = await pw.chromium.launch(headless=False, slow_mo=50)
@@ -1533,12 +2368,19 @@ async def main(args: argparse.Namespace) -> None:
         pedidos_queue:    asyncio.Queue = asyncio.Queue(maxsize=CONFIG["QUEUE_MAXSIZE"])
         resultados_queue: asyncio.Queue = asyncio.Queue()
 
+        stop_queues: list[asyncio.Queue] = [
+            asyncio.Queue() for _ in range(CONFIG["NUM_WORKERS"])
+        ]
+
         persist_task = asyncio.create_task(
             persistencia_worker(resultados_queue, db_path)
         )
         worker_tasks = [
             asyncio.create_task(
-                scraper_worker(wid, contexts[wid], pedidos_queue, resultados_queue, db_path)
+                scraper_worker(
+                    wid, contexts[wid], pedidos_queue,
+                    resultados_queue, db_path, stop_queues[wid]
+                )
             )
             for wid in range(CONFIG["NUM_WORKERS"])
         ]
@@ -1547,22 +2389,84 @@ async def main(args: argparse.Namespace) -> None:
         async def _fill() -> None:
             for pid in ids_pendientes:
                 await pedidos_queue.put(pid)
-            for _ in range(CONFIG["NUM_WORKERS"]):
-                await pedidos_queue.put(None)
+            for sq in stop_queues:
+                await sq.put(None)
 
-        try:
-            await asyncio.gather(_fill(), *worker_tasks)
-        except Exception as exc:
-            log_event("critical_error", level="ERROR", msg=str(exc))
-            for t in worker_tasks:
-                t.cancel()
-        finally:
-            await resultados_queue.put(None)
-            await persist_task
+        fill_task = asyncio.create_task(_fill())
+        results = await asyncio.gather(
+            fill_task, *worker_tasks, return_exceptions=True
+        )
+        for wid, res in enumerate(results[1:], start=0):  # [0] es fill_task
+            if isinstance(res, BaseException):
+                log_event(
+                    "worker_exception",
+                    level="ERROR",
+                    worker_id=wid,
+                    msg=repr(res),
+                )
+        await resultados_queue.put(None)
+        await persist_task
 
-        # — Paso 6: cerrar contextos y browser —
+        # — Paso 6: cerrar contextos —
         for ctx in contexts:
             await ctx.close()
+
+        # — Dead-letter: reintentar pedidos con error (hasta 3 pases) —
+        _orig_reintentos = CONFIG["MAX_REINTENTOS"]
+        CONFIG["MAX_REINTENTOS"] = 2
+        try:
+            for _dl_pass in range(1, 4):
+                async with aiosqlite.connect(db_path) as _db_dl:
+                    _rows_dl = await (await _db_dl.execute(
+                        """SELECT DISTINCT id_pedido FROM errores
+                           WHERE id_pedido NOT IN (
+                               SELECT id_pedido FROM pedidos
+                               WHERE scraping_completo = 1
+                           )"""
+                    )).fetchall()
+                retry_ids = [r[0] for r in _rows_dl]
+                if not retry_ids:
+                    break
+                log_event(
+                    "dead_letter_pass",
+                    msg=f"Pase {_dl_pass}: {len(retry_ids)} pedidos a reintentar",
+                )
+                ctx_dl = await browser.new_context(
+                    viewport=_VIEWPORTS[0],
+                    user_agent=_USER_AGENTS[0],
+                    locale="es-CO",
+                )
+                _p_dl = await ctx_dl.new_page()
+                await login(_p_dl, USUARIO, CLAVE)
+                await _p_dl.close()
+
+                dl_pedidos_queue    = asyncio.Queue()
+                dl_resultados_queue = asyncio.Queue()
+                dl_stop_queue       = asyncio.Queue()
+
+                dl_persist = asyncio.create_task(
+                    persistencia_worker(dl_resultados_queue, db_path)
+                )
+                dl_worker = asyncio.create_task(
+                    scraper_worker(
+                        0, ctx_dl, dl_pedidos_queue,
+                        dl_resultados_queue, db_path, dl_stop_queue,
+                    )
+                )
+
+                _snap = list(retry_ids)
+                async def _dl_fill(_ids: list = _snap) -> None:
+                    for _pid in _ids:
+                        await dl_pedidos_queue.put(_pid)
+                    await dl_stop_queue.put(None)
+
+                await asyncio.gather(_dl_fill(), dl_worker, return_exceptions=True)
+                await dl_resultados_queue.put(None)
+                await dl_persist
+                await ctx_dl.close()
+        finally:
+            CONFIG["MAX_REINTENTOS"] = _orig_reintentos
+
         await browser.close()
 
     # — Paso 7: resumen final —
