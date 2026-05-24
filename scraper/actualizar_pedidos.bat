@@ -1,9 +1,7 @@
 @echo off
-
-REM Moverse al directorio del proyecto
-cd /d %~dp0
-
-REM Ejecutar el scraper en modo incremental
-REM No requiere --desde ni --hasta: lee activos y errores desde la DB
-REM y captura solo los pedidos nuevos del dia automaticamente
-py scraper_principal.py --modo incremental >> scraper_scheduler.log 2>&1
+REM Moverse a la raíz del proyecto (un nivel arriba de scraper/)
+cd /d "%~dp0.."
+REM Ejecutar el scraper en modo incremental desde la raíz
+py scraper/scraper_principal.py --modo incremental >> logs\scraper_scheduler.log 2>&1
+REM Ejecutar el ETL después del scraper
+py etl/etl_principal.py >> logs\scraper_scheduler.log 2>&1

@@ -437,6 +437,49 @@ Cada evento emite una línea JSON al stdout y a `logs/scraper.log`:
 
 ---
 
+## ETL — Normalización y VIEWs
+
+**Script:** `etl/etl_principal.py`
+**Ejecución:** automática después de cada ciclo
+incremental via `scraper/actualizar_pedidos.bat`
+**Base de datos:** `data/pedidos.db` (misma que el scraper)
+
+### Columnas normalizadas (_num)
+
+| Tabla | Columnas REAL agregadas |
+|---|---|
+| `lineas_pedido` | `precio_unitario_num`, `descuento_num`, `precio_descuento_num`, `monto_pagar_num`, `monto_final_num`, `iva_num`, `peso_total_num` |
+| `estadisticas_monto` | `monto_pagar_num`, `monto_final_num`, `diferencia_num` |
+| `gestion_diferencias` | `total_pagar_pedido_num`, `monto_final_pagar_num`, `monto_pagado_num`, `monto_diferencia_num` |
+| `detalle_diferencias` | `precio_unitario_num`, `descuento_num`, `precio_descuento_num`, `cantidad_pedido_num`, `cantidad_entregada_num`, `diferencia_cantidad_num`, `monto_pagar_pedido_num`, `monto_final_pagar_num`, `iva_num`, `monto_diferencia_num` |
+
+### VIEWs analíticas
+
+| VIEW | Propósito |
+|---|---|
+| `v_pedidos_activos` | Pedidos con al menos un subpedido abierto |
+| `v_pedidos_cerrados` | Pedidos con todos los subpedidos cerrados |
+| `v_inventario_comprometido` | Productos comprometidos en pedidos previos al picking |
+| `v_diferencias_resumen` | Pedidos con diferencias y montos numéricos |
+| `v_rendimiento_operadores` | Operaciones de alistamiento e inspección por operador |
+| `v_variaciones_timeline` | Títulos únicos del timeline para estandarización |
+| `v_variaciones_operaciones` | Acciones únicas del registro para estandarización |
+
+### Estados que comprometen inventario
+Pendiente de confirmación
+Pendiente de pago (pago inmediato)
+Pendiente de pago (crédito)
+Pendiente de pago (contra entrega)
+Pendiente de recolección
+Aprobación de Pagos
+Pendiente de envío (pago inmediato)
+Pendiente de envío (crédito)
+Pendiente de envío (contra entrega)
+Pendiente de entrega
+En inspección
+
+---
+
 ## Deuda técnica pendiente
 
 | # | Problema | Impacto | Prioridad |

@@ -13,7 +13,7 @@ Su sistema administrativo interno (SPA Vue.js + Element Plus) no expone API; los
 | Etapa | Carpeta | Estado |
 |---|---|---|
 | 1 — Scraper (extracción) | `scraper/` | ✅ Construida |
-| 2 — ETL (normalización + VIEWs) | `etl/` | 🔲 Pendiente |
+| 2 — ETL (normalización + VIEWs) | `etl/` | ✅ Construida |
 | 3 — Dashboard (visualización) | `dashboard/` | 🔲 Pendiente |
 
 ---
@@ -32,8 +32,11 @@ dashboard_pedidos/
 │   ├── integral.md           # Visión, problema y objetivo de negocio
 │   ├── structure.md          # Arquitectura técnica y esquema de datos
 │   ├── agent.md              # Instrucciones de comportamiento para Claude
-│   └── decisions.md          # Registro de decisiones y bugs conocidos
+│   ├── decisions.md          # Registro de decisiones y bugs conocidos
+│   └── testing.md            # Estrategia de tests y fixtures
 ├── etl/                      # Etapa 2 — normalización y VIEWs SQL
+│   ├── __init__.py           # paquete importable por tests/
+│   └── etl_principal.py      # normalización de montos y VIEWs
 ├── logs/                     # Logs de ejecución — gitignored
 ├── scraper/                  # Etapa 1 — extracción de datos
 │   ├── __init__.py           # paquete importable por tests/
@@ -44,13 +47,13 @@ dashboard_pedidos/
 │   ├── conftest.py           # Fixtures y opciones de pytest
 │   ├── unit/                 # Tests unitarios sin I/O externo
 │   ├── integration/          # Tests de integración con SQLite temporal
-│   ├── etl/                  # Etapa 2 — crear cuando se inicie
 │   └── e2e/                  # Tests con browser real — lentos
 ├── .env                      # Credenciales locales — gitignored
 ├── .env.example              # Plantilla de variables de entorno
 ├── .gitignore
 ├── CLAUDE.md                 # Este archivo
 ├── conftest.py               # sys.path para imports de tests/
+├── pytest.ini                    # configuración de pytest y marcadores
 ├── README.md
 └── requirements.txt
 ```
@@ -96,7 +99,7 @@ py scraper/scraper_principal.py --modo incremental
 |---|---|---|
 | Lenguaje | Python 3.14 | ⚠️ Alpha — considerar migrar a 3.11/3.12 antes de producción |
 | Scraping | Playwright (Chromium) + asyncio | Workers paralelos con circuit breaker |
-| Base de datos | SQLite · modo WAL | Suficiente para el volumen actual; evaluar DuckDB al iniciar ETL |
+| Base de datos | SQLite · modo WAL | Confirmado como capa analítica (DEC-010 resuelta 2026-05-23) |
 | Async DB | aiosqlite | |
 | Logging | JSONL estructurado via `log_event()` | |
 | Scheduler | Windows Task Scheduler | Suficiente hoy; requiere alertas de fallo a mediano plazo |
@@ -128,7 +131,12 @@ a procesar en modo incremental.
 - Las URLs del sistema administrativo y el nombre real de la empresa son
 **confidenciales**. Usar siempre `miempresa` como placeholder en documentación, comentarios y ejemplos públicos.
 - Nunca hardcodear URLs, credenciales ni rutas absolutas en el código. Todo desde `.env`.
-- Logging siempre con `log_event()` en formato JSONL. Nunca `print()` sueltos en código de producción.
+- **Scraper:** logging con `log_event()` en formato
+  JSONL. Nunca `print()` sueltos.
+- **ETL y otros módulos:** usar `logging` stdlib con
+  `logger = logging.getLogger("nombre_modulo")`.
+  No importar `log_event()` fuera del scraper para
+  evitar acoplamiento entre módulos.
 - Rutas siempre relativas a la raíz del proyecto.
 - Toda decisión de diseño no trivial debe quedar registrada en `docs/decisions.md` antes de implementarse, no después.
 - `scraper/archive/` es solo referencia histórica: no modificar ni agregar archivos.
@@ -147,10 +155,10 @@ El ETL es prerequisito del dashboard porque:
 - Sin normalización de montos a REAL, no hay sumas ni promedios en SQL.
 - Sin VIEWs definidas, el dashboard no tiene contratos de datos estables.
 
-**Decisión pendiente al iniciar ETL:** evaluar si SQLite sigue siendo adecuado
-como capa analítica o si conviene migrar a DuckDB (embebido como SQLite, pero
-optimizado para consultas analíticas con columnas, agregaciones y joins complejos).
-Esta decisión afecta la tecnología del dashboard. Ver `docs/decisions.md`.
+**DEC-010 resuelta:** SQLite confirmado como capa
+analítica. No se migrará a DuckDB a este volumen.
+Ver `docs/decisions.md` para justificación y umbral
+de reevaluación futura.
 
 ---
 
@@ -171,17 +179,21 @@ Esta decisión afecta la tecnología del dashboard. Ver `docs/decisions.md`.
 - Lógica de pedido cerrado implementada y funcional
 - Para detalles técnicos completos → `docs/structure.md`
 
-**Etapa 2 — ETL 🔲 Pendiente**
-- Normalización de montos de TEXT a REAL
-- Creación de VIEWs SQL para el dashboard
-- Evaluación SQLite vs DuckDB como capa analítica
-- Bugs conocidos que bloquean esta etapa → `docs/decisions.md`
+**Etapa 2 — ETL ✅ Completa**
+- 24 columnas `_num` REAL normalizadas en 4 tablas
+- 7 VIEWs analíticas creadas en `data/pedidos.db`
+- SQLite confirmado como capa analítica (DEC-010)
+- ETL integrado al scheduler — corre cada 2 horas
+- Para detalles técnicos → `docs/structure.md`
 
-**Automatización ⏸ Configuración pendiente**
-- Windows Task Scheduler deshabilitado — configurar al completar ETL
-- Frecuencia objetivo: cada 2 horas en modo incremental
-- A mediano plazo: agregar notificación de fallo por email o similar
+**Automatización ✅ Activa**
+- Windows Task Scheduler configurado — cada 2 horas
+- Secuencia: scraper incremental → ETL → log en
+  `logs/scraper_scheduler.log`
+- Pendiente a mediano plazo: notificación de fallo
+  por email o similar
 
 **Etapa 3 — Dashboard 🔲 Pendiente**
-- Tecnología por definir (depende de decisión SQLite vs DuckDB)
+- Tecnología por definir. SQLite confirmado como
+  capa de datos (DEC-010 resuelta 2026-05-23)
 - Requisitos de negocio → `docs/integral.md`
