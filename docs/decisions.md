@@ -579,6 +579,49 @@ else:
 
 ---
 
+### BUG-011 — Bucle infinito en ETL al normalizar valores NULL
+
+**Archivo:** `etl/etl_principal.py` · `normalizar_montos()`
+**Severidad:** 🔴 Crítica — el ETL no terminaba nunca
+**Estado:** ✅ Resuelto — 2026-05-24
+
+**Problema:** el patrón de batch usaba
+`WHERE {col_num} IS NULL LIMIT 500` para identificar
+filas pendientes de normalizar. Cuando `to_num()`
+retorna `None` para un valor inválido (cadena vacía,
+texto no numérico), el UPDATE escribe `NULL` en la
+columna `_num`. En la siguiente iteración, la misma
+query vuelve a encontrar esas filas porque siguen
+teniendo `NULL`. El loop nunca terminaba.
+
+**Corrección aplicada:** reemplazar el patrón
+`WHERE col_num IS NULL` por paginación sobre `id`:
+
+```python
+last_id = 0
+while True:
+    rows = await (await db.execute(
+        f"SELECT id, {col_src} FROM {tabla} "
+        f"WHERE id > ? ORDER BY id LIMIT 500",
+        (last_id,)
+    )).fetchall()
+    if not rows:
+        break
+    for row_id, val in rows:
+        await db.execute(
+            f"UPDATE {tabla} SET {col_num} = ? WHERE id = ?",
+            (to_num(val) if val is not None else None, row_id),
+        )
+    last_id = rows[-1][0]
+    await db.commit()
+```
+
+Este patrón avanza siempre hacia adelante por `id`
+y termina cuando no hay más filas, independientemente
+de si el valor normalizado es `NULL` o no.
+
+---
+
 ## Pendientes de resolución antes de Etapa 2
 
 Ordenados por prioridad. Los de severidad 🔴 deben resolverse antes de la
@@ -596,3 +639,4 @@ carga inicial de datos.
 | 🟠 Cuando aplique | BUG-006 | Warning en match vacío de `codigo_barras` | Cantidades no actualizadas sin aviso |
 | ✅ | DEC-010 | Decidir SQLite vs DuckDB — SQLite confirmado | Resuelto 2026-05-23 |
 | ✅ | BUG-009 | Condición de carrera — sentinel en pedidos_queue | Resuelto 2026-05-23 |
+| ✅ | BUG-011 | Bucle infinito en ETL — patrón WHERE col_num IS NULL | Resuelto 2026-05-24 |
