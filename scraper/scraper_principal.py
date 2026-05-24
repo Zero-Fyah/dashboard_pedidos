@@ -3,7 +3,7 @@ scraper_principal.py
 ====================
 Scraper asíncrono de pedidos para sistema administrativo interno (SPA Vue.js + Element Plus).
 
-Configuración recomendada: NUM_WORKERS=3, PAUSA_ENTRE_PEDIDOS_S=1.2,
+Configuración recomendada: NUM_WORKERS=5, PAUSA_ENTRE_PEDIDOS_S=1.2,
 MAX_REINTENTOS=5, NAV_TIMEOUT_MS=45s
 
 Estimación de tiempo (modo incremental con 3 workers):
@@ -72,6 +72,8 @@ class ConfigDict(TypedDict):
     LOG_FILE: str
     ERRORS_DIR: str
     DEBUG_DIR: str
+    HEADLESS: bool
+    SLOW_MO:  int
 
 
 CONFIG: ConfigDict = {
@@ -107,15 +109,17 @@ CONFIG: ConfigDict = {
     "RATE_LIMIT_WAIT_S": 45,
 
     # Paralelismo
-    "NUM_WORKERS":   3,
+    "NUM_WORKERS":   5,
     "QUEUE_MAXSIZE": 100,
 
     # Observabilidad
     "MAX_SCREENSHOTS": 50,
     "MAX_HTML_DEBUG":  50,
     "LOG_FILE":        "scraper.log",
-    "ERRORS_DIR":      "errors",
-    "DEBUG_DIR":       "debug",
+    "ERRORS_DIR": str(Path(__file__).parent.parent / "data" / "errors"),
+    "DEBUG_DIR":  str(Path(__file__).parent.parent / "data" / "debug"),
+    "HEADLESS": False,
+    "SLOW_MO":  50,
 }
 
 USUARIO: str = os.environ.get("SCRAPER_USUARIO", CONFIG["usuario"])
@@ -131,6 +135,10 @@ ESTADOS_CERRADOS: frozenset[str] = frozenset({
     "comentado",
 })
 
+# Referencia histórica: estados del sistema que fijan
+# cantidades en el flujo operacional. Conservado como
+# documentación del dominio. con_cantidades usa
+# ESTADOS_CERRADOS desde la resolución de BUG-005 opción B.
 ESTADOS_FIJAN_CANTIDADES: frozenset[str] = frozenset({
     "pendiente de confirmación",
     "pendiente de envío (pago inmediato)",
@@ -625,11 +633,10 @@ async def obtener_lista_pedidos(
             msg=f"Página {pagina_actual} — {len(ids_pagina)} pedidos",
         )
 
-        btn_next      = await page.query_selector("button.btn-next.is-last")
+        btn_next = await page.query_selector("button.btn-next")
         if btn_next:
-            clases        = (await btn_next.get_attribute("class")) or ""
-            disabled_attr = await btn_next.get_attribute("disabled")
-            if "disabled" in clases or disabled_attr is not None:
+            aria_disabled = await btn_next.get_attribute("aria-disabled")
+            if aria_disabled == "true":
                 break
             await btn_next.click()
             await page.wait_for_load_state("networkidle")
@@ -1323,6 +1330,33 @@ async def guardar_debug(page: Page, id_pedido: str) -> None:
     )
 
 
+def determinar_modo(
+    es_nuevo: bool,
+    subs_db: list[tuple[str, int]],
+) -> str:
+    """Determina el modo de extracción sin I/O.
+
+    Args:
+        es_nuevo: True si el pedido no existe en DB.
+        subs_db: Lista de (estado, cantidades_definitivas)
+                 de los subpedidos del pedido.
+
+    Returns:
+        "completo"        — pedido nuevo.
+        "con_cantidades"  — subpedido en estado cerrado
+                           con cantidades aún no registradas.
+        "solo_estado"     — actualizar solo estado.
+    """
+    if es_nuevo:
+        return "completo"
+    if any(
+        cd == 0 and estado.lower() in ESTADOS_CERRADOS
+        for estado, cd in subs_db
+    ):
+        return "con_cantidades"
+    return "solo_estado"
+
+
 # ─────────────────────────────────────────────
 # SCRAPING — PEDIDO INDIVIDUAL
 # ─────────────────────────────────────────────
@@ -1375,15 +1409,7 @@ async def procesar_pedido(
         else:
             subs_db = []
 
-    if es_nuevo:
-        modo = "completo"
-    elif any(
-        cd == 0 and estado.lower() in ESTADOS_FIJAN_CANTIDADES
-        for estado, cd in subs_db
-    ):
-        modo = "con_cantidades"
-    else:
-        modo = "solo_estado"
+    modo = determinar_modo(es_nuevo, subs_db)
 
     nav_kwargs: dict = {} if modo == "completo" else {"wait_until": "domcontentloaded"}
 
@@ -2107,7 +2133,6 @@ async def scraper_worker(
     pedidos_queue: asyncio.Queue,
     resultados_queue: asyncio.Queue,
     db_path: str,
-    stop_queue: asyncio.Queue,
 ) -> None:
     """Consume IDs de pedido de la cola y los procesa uno a uno.
 
@@ -2124,7 +2149,6 @@ async def scraper_worker(
         pedidos_queue: Cola compartida con IDs de pedido.
         resultados_queue: Cola donde publicar los resultados extraídos.
         db_path: Ruta al archivo SQLite, pasado a procesar_pedido.
-        stop_queue: Cola exclusiva de este worker; recibe None para señal de parada.
     """
     consecutive_failures = 0
     circuit_reopenings   = 0
@@ -2144,19 +2168,9 @@ async def scraper_worker(
         await asyncio.sleep(wait_s)
 
     while True:
-        get_task  = asyncio.create_task(pedidos_queue.get())
-        stop_task = asyncio.create_task(stop_queue.get())
-        done, pending = await asyncio.wait(
-            {get_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-            t.cancel()
-        if stop_task in done:
-            if get_task in done:
-                # ID llegó al mismo tiempo que la señal de parada — devolverlo
-                await pedidos_queue.put(get_task.result())
+        id_pedido = await pedidos_queue.get()
+        if id_pedido is None:
             break
-        id_pedido = get_task.result()
 
         current_pedido[0] = id_pedido
         page = await context.new_page()
@@ -2219,6 +2233,21 @@ _USER_AGENTS: list[str] = [
 ]
 
 
+def get_db_path() -> str:
+    """Retorna la ruta absoluta a data/pedidos.db.
+
+    La ruta se calcula relativa a la ubicación de
+    este script, no al directorio de trabajo actual.
+    Crea data/ si no existe.
+
+    Returns:
+        Ruta absoluta como string a data/pedidos.db.
+    """
+    path = Path(__file__).parent.parent / "data" / "pedidos.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
 async def main(args: argparse.Namespace) -> None:
     """Orquesta el scraping completo: DB, lista de IDs, workers y persistencia.
 
@@ -2232,7 +2261,7 @@ async def main(args: argparse.Namespace) -> None:
         args: Namespace de argparse con atributos desde, hasta y modo.
     """
     t_inicio = time.monotonic()
-    db_path  = "pedidos.db"
+    db_path  = get_db_path()
 
     validar_config()
     await init_db(db_path)
@@ -2247,7 +2276,10 @@ async def main(args: argparse.Namespace) -> None:
         )
 
     async with async_playwright() as pw:
-        browser: Browser = await pw.chromium.launch(headless=False, slow_mo=50)
+        browser: Browser = await pw.chromium.launch(
+            headless=CONFIG["HEADLESS"],
+            slow_mo=CONFIG["SLOW_MO"],
+        )
 
         # ── Obtener lista de IDs ──────────────────────────────────────────
         if args.modo == "incremental":
@@ -2368,10 +2400,6 @@ async def main(args: argparse.Namespace) -> None:
         pedidos_queue:    asyncio.Queue = asyncio.Queue(maxsize=CONFIG["QUEUE_MAXSIZE"])
         resultados_queue: asyncio.Queue = asyncio.Queue()
 
-        stop_queues: list[asyncio.Queue] = [
-            asyncio.Queue() for _ in range(CONFIG["NUM_WORKERS"])
-        ]
-
         persist_task = asyncio.create_task(
             persistencia_worker(resultados_queue, db_path)
         )
@@ -2379,7 +2407,7 @@ async def main(args: argparse.Namespace) -> None:
             asyncio.create_task(
                 scraper_worker(
                     wid, contexts[wid], pedidos_queue,
-                    resultados_queue, db_path, stop_queues[wid]
+                    resultados_queue, db_path,
                 )
             )
             for wid in range(CONFIG["NUM_WORKERS"])
@@ -2389,8 +2417,8 @@ async def main(args: argparse.Namespace) -> None:
         async def _fill() -> None:
             for pid in ids_pendientes:
                 await pedidos_queue.put(pid)
-            for sq in stop_queues:
-                await sq.put(None)
+            for _ in range(CONFIG["NUM_WORKERS"]):
+                await pedidos_queue.put(None)
 
         fill_task = asyncio.create_task(_fill())
         results = await asyncio.gather(
@@ -2442,7 +2470,6 @@ async def main(args: argparse.Namespace) -> None:
 
                 dl_pedidos_queue    = asyncio.Queue()
                 dl_resultados_queue = asyncio.Queue()
-                dl_stop_queue       = asyncio.Queue()
 
                 dl_persist = asyncio.create_task(
                     persistencia_worker(dl_resultados_queue, db_path)
@@ -2450,7 +2477,7 @@ async def main(args: argparse.Namespace) -> None:
                 dl_worker = asyncio.create_task(
                     scraper_worker(
                         0, ctx_dl, dl_pedidos_queue,
-                        dl_resultados_queue, db_path, dl_stop_queue,
+                        dl_resultados_queue, db_path,
                     )
                 )
 
@@ -2458,7 +2485,7 @@ async def main(args: argparse.Namespace) -> None:
                 async def _dl_fill(_ids: list = _snap) -> None:
                     for _pid in _ids:
                         await dl_pedidos_queue.put(_pid)
-                    await dl_stop_queue.put(None)
+                    await dl_pedidos_queue.put(None)
 
                 await asyncio.gather(_dl_fill(), dl_worker, return_exceptions=True)
                 await dl_resultados_queue.put(None)
@@ -2507,11 +2534,19 @@ async def main(args: argparse.Namespace) -> None:
 # ENTRY POINT
 # ─────────────────────────────────────────────
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Scraper de pedidos Calabaza Pets")
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Construye y retorna el parser de argumentos.
+
+    Returns:
+        ArgumentParser configurado con --desde,
+        --hasta y --modo.
+    """
+    parser = argparse.ArgumentParser(
+        description="Scraper de pedidos — sistema administrativo interno"
+    )
     parser.add_argument(
         "--desde",
-        default="2025-05-01",
+        default="2026-05-01",
         help="Fecha inicio YYYY-MM-DD",
     )
     parser.add_argument(
@@ -2523,9 +2558,14 @@ if __name__ == "__main__":
         "--modo",
         choices=["completo", "incremental"],
         default="completo",
-        help="completo: encola todos los IDs | incremental: omite scraping_completo=1",
+        help="completo: encola todos los IDs | "
+             "incremental: omite scraping_completo=1",
     )
-    args = parser.parse_args()
+    return parser
+
+
+if __name__ == "__main__":
+    args = build_arg_parser().parse_args()
     log_event(
         "scraper_iniciado",
         msg=f"modo={args.modo} | {args.desde} -> {args.hasta}",
