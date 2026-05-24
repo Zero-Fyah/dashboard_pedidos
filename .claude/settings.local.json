@@ -4,7 +4,9 @@
       "Bash(pip install *)",
       "Bash(python -m git_filter_repo --replace-text reemplazos.txt --force)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(python -c ' *)",
+      "Bash(git *)"
     ]
   }
 }

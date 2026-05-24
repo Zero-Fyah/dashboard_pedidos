@@ -1,12 +1,13 @@
 # Base de datos local
-pedidos.db
+data/pedidos.db
+
+# Artefactos de scraping
+data/errors/
+data/debug/
 
 # Logs
+logs/
 *.log
-scraper_scheduler.log
-
-# Screenshots de errores
-errors/
 
 # Entorno virtual
 .venv/
@@ -18,3 +19,29 @@ errors/
 __pycache__/
 *.pyc
 *.pyo
+
+# Base de datos — cobertura ampliada (cubre pedidos.db en raíz y cualquier otra DB)
+*.db
+
+# Credenciales adicionales
+.env.local
+.env.*.local
+
+# Python — adicional
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Testing
+**/.pytest_cache/
+.coverage
+htmlcov/
+
+# Playwright
+playwright-report/
+test-results/
+
+# Windows
+Desktop.ini
+*.lnk
