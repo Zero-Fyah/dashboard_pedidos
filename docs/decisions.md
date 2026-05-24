@@ -212,6 +212,31 @@ o una capa ETL que exporte a un archivo DuckDB separado.
 **Implicación:** la tecnología del dashboard puede depender de esta decisión.
 Resolverla antes de diseñar las VIEWs del ETL.
 
+### DEC-011 — Arquitectura del ETL
+
+**Fecha:** 2026-05-24
+**Estado:** ✅ Activa
+
+**Decisión:** el ETL vive en `etl/etl_principal.py`,
+corre después de cada ciclo incremental del scraper
+via `actualizar_pedidos.bat`, y escribe en la misma
+`data/pedidos.db`.
+
+**Justificación:**
+- Separación de responsabilidades: el scraper extrae,
+  el ETL normaliza y agrega valor analítico.
+- Misma DB: el volumen (~167.000 filas) no justifica
+  una DB separada. Las VIEWs y columnas `_num` viven
+  junto a los datos crudos.
+- Idempotente: puede re-ejecutarse sin efectos
+  secundarios.
+
+**Alcance:**
+- 24 columnas `_num` REAL en 4 tablas
+  (lp=7, em=3, gd=4, dd=10)
+- 7 VIEWs analíticas
+- Integrado al scheduler cada 2 horas
+
 ---
 
 ## Bugs conocidos

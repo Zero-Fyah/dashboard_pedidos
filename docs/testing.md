@@ -119,10 +119,8 @@ tests/
 ├── integration/
 │   ├── test_init_db.py            # schema, migraciones, índices
 │   ├── test_persistencia.py       # los 3 modos de persistencia
-│   └── test_idempotencia.py       # re-ejecuciones y ciclo incremental
-├── etl/                           # Etapa 2 — crear cuando se inicie
-│   ├── test_normalizacion.py      # to_num sobre todos los campos monetarios
-│   └── test_views.py              # VIEWs SQL retornan datos correctos
+│   ├── test_idempotencia.py       # re-ejecuciones y ciclo incremental
+│   └── test_etl.py                # 4 tests ETL (normalización + VIEWs)
 └── e2e/                           # tests con browser real — lentos
     └── test_extraccion_real.py    # extracción contra sistema administrativo real
 ```
@@ -589,47 +587,34 @@ async def test_extraccion_pedido_real(page):
 
 ## Etapa 2 — ETL
 
-### Tests de normalización (`tests/etl/test_normalizacion.py`)
+### Tests de integración del ETL (`tests/integration/test_etl.py`)
 
-```python
-import pytest
-from scraper.scraper_principal import to_num
+Los tests del ETL se implementaron como tests de
+integración. Archivo: `tests/integration/test_etl.py`
+— 4 tests pasando:
 
-@pytest.mark.parametrize("campo,valor_texto,esperado_float", [
-    ("precio_unitario", "10.000,00",  10000.0),
-    ("monto_pagar",     "100.000,00", 100000.0),
-    ("monto_final",     "95.000,00",  95000.0),
-    ("diferencia",      "-5.000,00",  -5000.0),
-    ("iva",             "0,00",       0.0),
-    ("peso_total",      "1,50",       1.5),
-    ("cualquier",       "",           None),
-])
-def test_normalizacion_campos_monetarios(campo, valor_texto, esperado_float):
-    assert to_num(valor_texto) == pytest.approx(esperado_float) if esperado_float is not None \
-        else to_num(valor_texto) is None
-```
+- `test_columnas_num_creadas` — verifica que las
+  24 columnas `_num` existen tras `normalizar_montos()`
+- `test_normalizacion_es_idempotente` — verifica que
+  ejecutar `normalizar_montos()` dos veces no genera
+  errores
+- `test_views_creadas` — verifica que las 7 VIEWs
+  existen tras `normalizar_montos()` + `crear_views()`
+- `test_views_son_idempotentes` — verifica que
+  ejecutar `crear_views()` dos veces produce
+  exactamente 7 VIEWs
 
-### Tests de VIEWs (`tests/etl/test_views.py`)
-
-Para cada VIEW definida en `docs/structure.md`, un test que:
-1. Inserta datos controlados en DB de test
-2. Consulta la VIEW
-3. Verifica exactamente el resultado esperado
-
-Patrón base:
-```python
-async def test_view_pedidos_activos_excluye_cerrados(db_path):
-    """v_pedidos_activos solo retorna pedidos con subpedidos abiertos."""
-    # 1. Insertar pedido con subpedido abierto → debe aparecer en la VIEW
-    # 2. Cerrar el subpedido → no debe aparecer
-    ...
-```
+> Los tests de normalización y VIEWs descritos
+> previamente en este documento para `tests/etl/`
+> no se crearon. La cobertura del ETL está en
+> `tests/integration/test_etl.py`.
 
 ---
 
 ## Etapa 3 — Dashboard
 
-Estrategia por definir cuando se decida la tecnología (ver DEC-010).
+Estrategia por definir cuando se decida la tecnología.
+SQLite confirmado como capa de datos (DEC-010 resuelta).
 Mínimo requerido al implementar:
 
 - Test de que las consultas retornan datos correctos contra DB de test

@@ -148,7 +148,7 @@ en una sola pasada de workers paralelos.
 | Etapa | Estado |
 |---|---|
 | Etapa 1 — Scraper (extracción) | ✅ Completa |
-| Etapa 2 — ETL (normalización + VIEWs SQL) | 🔲 Pendiente |
+| Etapa 2 — ETL (normalización + VIEWs SQL) | ✅ Completa |
 | Etapa 3 — Dashboard (visualización) | 🔲 Pendiente |
 
 ---

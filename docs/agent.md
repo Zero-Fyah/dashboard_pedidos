@@ -104,8 +104,9 @@ es incorrecto, independientemente de la especificación del TASK:
 
 - **Todo campo monetario** se convierte con `to_num()` antes de cualquier
   operación numérica. Formato nativo en DB: texto español ("1.234,56").
-- Las VIEWs SQL se definen en el `init_db()` del ETL o en un archivo de
-  migración dedicado. Nunca inline en código de consulta.
+- Las VIEWs SQL se definen en `crear_views()` en
+  `etl/etl_principal.py`, llamada desde `main()`.
+  Nunca inline en código de consulta.
 - Toda VIEW nueva se documenta en `docs/structure.md` **antes** de implementarse.
 - El ETL no modifica el schema original de las 9 tablas del scraper.
   Solo puede agregar columnas nuevas o crear nuevas tablas y VIEWs.
@@ -128,7 +129,12 @@ es incorrecto, independientemente de la especificación del TASK:
 - **Docstrings** formato Google en toda función pública, con `Args:` y `Returns:`.
 - **Async por defecto** para funciones de I/O (Playwright, aiosqlite).
 - **f-strings** para interpolación. Sin `.format()` ni `%`.
-- Sin `print()` en código de producción. Todo via `log_event()`.
+- **Scraper:** logging con `log_event()` en formato
+  JSONL. Nunca `print()` sueltos.
+- **ETL y otros módulos:** usar `logging` stdlib con
+  `logger = logging.getLogger("nombre_modulo")`.
+  No importar `log_event()` fuera del scraper para
+  evitar acoplamiento entre módulos.
 - Sin rutas absolutas hardcodeadas. Usar `Path` relativo a la raíz del proyecto.
 - Sin credenciales ni URLs en el código. Siempre desde `.env`.
 
