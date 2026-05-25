@@ -15,13 +15,37 @@ import aiosqlite
 from datetime import datetime, timezone
 from scraper.scraper_principal import to_num, get_db_path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='{"ts": "%(asctime)s", "level": "%(levelname)s", '
-           '"event": "%(message)s"}',
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("etl")
+
+
+def _log_event(
+    event: str,
+    level: str = "INFO",
+    msg: str = "",
+    **kwargs,
+) -> None:
+    """Emite una línea JSONL a stderr con schema consistente con el scraper.
+
+    Args:
+        event: Categoría semántica del evento (snake_case).
+        level: Nivel de log: INFO, WARNING o ERROR.
+        msg: Descripción textual del evento.
+        **kwargs: Campos adicionales a incluir en el JSON.
+    """
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "level": level,
+        "event": event,
+        "msg": msg,
+        "modulo": "etl",
+        **kwargs,
+    }
+    line = json.dumps(record, ensure_ascii=False)
+    if level == "ERROR":
+        logger.error(line)
+    else:
+        logger.info(line)
 
 
 async def normalizar_montos(db: aiosqlite.Connection) -> None:
@@ -96,9 +120,9 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
                     (last_id,)
                 )).fetchall()
                 if not rows:
-                    logger.info(
-                        f"etl_columna_ok | {tabla}.{col_num} | "
-                        f"{total_filas} filas totales"
+                    _log_event(
+                        "etl_columna_ok",
+                        msg=f"{tabla}.{col_num} | {total_filas} filas totales",
                     )
                     break
                 for row_id, val in rows:
@@ -113,9 +137,9 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
                 batch_count += 1
                 total_filas += len(rows)
                 if batch_count % 10 == 0:
-                    logger.info(
-                        f"etl_batch | {tabla}.{col_num} | "
-                        f"batch {batch_count} | {total_filas} filas acumuladas"
+                    _log_event(
+                        "etl_batch",
+                        msg=f"{tabla}.{col_num} | batch {batch_count} | {total_filas} filas acumuladas",
                     )
 
 
@@ -302,20 +326,16 @@ async def main() -> None:
             await normalizar_montos(db)
             await crear_views(db)
             await db.commit()
-        logger.info(json.dumps({
-            "event": "etl_completado",
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "db_path": db_path,
-        }))
+        _log_event("etl_completado", db_path=db_path)
         sys.exit(0)
     except Exception as exc:
-        logger.error(json.dumps({
-            "event": "etl_fallido",
-            "error": str(exc),
-            "error_type": type(exc).__name__,
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "db_path": db_path,
-        }))
+        _log_event(
+            "etl_fallido",
+            level="ERROR",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            db_path=db_path,
+        )
         sys.exit(1)
 
 
