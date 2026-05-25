@@ -85,6 +85,8 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
         for col_num in columnas:
             col_src = col_num[:-4]  # quitar "_num"
             last_id = 0
+            batch_count = 0
+            total_filas = 0
             while True:
                 rows = await (await db.execute(
                     f"SELECT id, {col_src} FROM {tabla} "
@@ -92,6 +94,10 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
                     (last_id,)
                 )).fetchall()
                 if not rows:
+                    logger.info(
+                        f"etl_columna_ok | {tabla}.{col_num} | "
+                        f"{total_filas} filas totales"
+                    )
                     break
                 for row_id, val in rows:
                     await db.execute(
@@ -102,8 +108,13 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
                     )
                 last_id = rows[-1][0]
                 await db.commit()
-                logger.info(f"etl_batch | {tabla}.{col_num} | "
-                            f"{len(rows)} filas procesadas")
+                batch_count += 1
+                total_filas += len(rows)
+                if batch_count % 10 == 0:
+                    logger.info(
+                        f"etl_batch | {tabla}.{col_num} | "
+                        f"batch {batch_count} | {total_filas} filas acumuladas"
+                    )
 
 
 async def crear_views(db: aiosqlite.Connection) -> None:
