@@ -195,7 +195,7 @@ def log_event(
     }
     line = json.dumps(record, ensure_ascii=False)
     print(line, flush=True)
-    _logger.info(line)
+    _logger.log(getattr(logging, level), line)
 
 
 # ─────────────────────────────────────────────
