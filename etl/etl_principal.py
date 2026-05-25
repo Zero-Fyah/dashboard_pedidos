@@ -9,8 +9,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import asyncio
+import json
 import logging
 import aiosqlite
+from datetime import datetime, timezone
 from scraper.scraper_principal import to_num, get_db_path
 
 logging.basicConfig(
@@ -287,15 +289,34 @@ async def main() -> None:
     Abre la conexión a data/pedidos.db, ejecuta la
     normalización de montos y la creación de VIEWs,
     y cierra la conexión.
+
+    Exits:
+        0: ETL completado sin errores.
+        1: Error no recuperable durante la ejecución.
     """
     db_path = get_db_path()
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("PRAGMA foreign_keys=ON")
-        await normalizar_montos(db)
-        await crear_views(db)
-        await db.commit()
-    logger.info("etl_completado")
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA foreign_keys=ON")
+            await normalizar_montos(db)
+            await crear_views(db)
+            await db.commit()
+        logger.info(json.dumps({
+            "event": "etl_completado",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "db_path": db_path,
+        }))
+        sys.exit(0)
+    except Exception as exc:
+        logger.error(json.dumps({
+            "event": "etl_fallido",
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "db_path": db_path,
+        }))
+        sys.exit(1)
 
 
 if __name__ == "__main__":
