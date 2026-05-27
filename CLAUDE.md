@@ -67,7 +67,7 @@ Antes de escribir cualquier línea de código o proponer cambios, leer en este o
 1. **`docs/agent.md`** — define cómo debe comportarse Claude en este proyecto, qué tono usar y qué restricciones respetar.
 2. **`docs/integral.md`** — explica el problema de negocio, el objetivo del proyecto y el alcance esperado del dashboard.
 3. **`docs/structure.md`** — documenta la arquitectura técnica actual: esquema de las 9 tablas SQLite, los modos de extracción del scraper y las VIEWs planificadas para el ETL.
-4. **`docs/decisions.md`** — registra decisiones de diseño ya tomadas y bugsconocidos. No reabrir lo que ya está decidido sin justificación explícita documentada en la misma sesión.
+4. **`docs/decisions.md`** — registra decisiones de diseño ya tomadas y bugs conocidos. No reabrir lo que ya está decidido sin justificación explícita documentada en la misma sesión.
 5. **`docs/testing.md`** — solo en sesiones que involucren escritura o modificación de tests.
 
 ---
@@ -77,7 +77,7 @@ Antes de escribir cualquier línea de código o proponer cambios, leer en este o
 - **SO:** Windows 11
 - **Editor:** VS Code
 - **Python:** 3.14 — ⚠️ versión alpha, ver nota de riesgo en Stack técnico
-- **Entorno virtual:** `.venv/` — activar con `.venv\Scripts\activate`
+- **Entorno virtual:** `.venv/` — activar con `.venv\Scriptsctivate`
 - **Dependencias:** `pip install -r requirements.txt`
 - **Navegador:** Playwright Chromium — `playwright install chromium`
 - **Variables de entorno:** copiar `.env.example` → `.env` y completar valores
@@ -117,7 +117,7 @@ el mismo rango de fechas no genera duplicados: sobreescribe los registros existe
 con los datos más recientes. Los modos de extracción son:
 
 - **`completo`** — extrae las 8 secciones del pedido. Se usa en la carga inicial y para pedidos nuevos.
-- **`con_cantidades`** — actualiza cantidades entregadas y estado. Para pedidos activos con subpedidos que aún no tienen cantidades definitivas (cantidades_definitivas=0) y cuyo estado está en ESTADOS_FIJAN_CANTIDADES.
+- **`con_cantidades`** — actualiza cantidades entregadas y estado. Para pedidos activos con subpedidos que aún no tienen cantidades definitivas (`cantidades_definitivas=0`) y cuyo estado está en `ESTADOS_CERRADOS`.
 - **`solo_estado`** — actualiza únicamente el estado. El más liviano; para pedidos activos sin cambios en cantidades.
 
 Un pedido se considera **cerrado** cuando todos sus subpedidos están en estado
