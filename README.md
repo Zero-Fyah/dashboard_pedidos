@@ -3,6 +3,8 @@
 
 # dashboard_pedidos
 
+**Actualizado:** 2026-05-24
+
 Scraper asíncrono de pedidos para un sistema administrativo interno (SPA Vue.js + Element Plus)
 de una empresa colombiana que gestiona su propia operación logística. Extrae pedidos, subpedidos,
 líneas de producto, línea de tiempo de alistamiento y registros operacionales; los almacena en
@@ -65,6 +67,51 @@ scraper/scraper_principal.py
                 │
                 ▼
         data/pedidos.db (SQLite · modo WAL)
+                │
+                ▼
+        etl/etl_principal.py   ← normalización de montos + 7 VIEWs analíticas
+```
+
+---
+
+## Estructura del repositorio
+
+```text
+dashboard_pedidos/
+├── .claude/                  # Configuración Claude Code
+├── data/                     # Datos locales — gitignored
+│   ├── pedidos.db            # Base de datos SQLite
+│   ├── debug/                # HTMLs de debug — pueden contener PII
+│   └── errors/               # Screenshots de errores del scraper
+├── dashboard/                # Etapa 3 — visualización
+├── docs/                     # Contexto persistente del proyecto
+│   ├── integral.md           # Visión, problema y objetivo de negocio
+│   ├── structure.md          # Arquitectura técnica y esquema de datos
+│   ├── agent.md              # Instrucciones de comportamiento para Claude
+│   ├── decisions.md          # Registro de decisiones y bugs conocidos
+│   └── testing.md            # Estrategia de tests y fixtures
+├── etl/                      # Etapa 2 — normalización y VIEWs SQL
+│   ├── __init__.py           # paquete importable por tests/
+│   └── etl_principal.py      # normalización de montos y VIEWs
+├── logs/                     # Logs de ejecución — gitignored
+├── scraper/                  # Etapa 1 — extracción de datos
+│   ├── __init__.py           # paquete importable por tests/
+│   ├── archive/              # Versión inicial del scraper — solo referencia
+│   ├── actualizar_pedidos.bat
+│   └── scraper_principal.py
+├── tests/                    # Suite de tests
+│   ├── conftest.py           # Fixtures y opciones de pytest
+│   ├── unit/                 # Tests unitarios sin I/O externo
+│   ├── integration/          # Tests de integración con SQLite temporal
+│   └── e2e/                  # Tests con browser real — lentos
+├── .env                      # Credenciales locales — gitignored
+├── .env.example              # Plantilla de variables de entorno
+├── .gitignore
+├── CLAUDE.md                 # Guía de arranque para Claude Code
+├── conftest.py               # sys.path para imports de tests/
+├── pytest.ini                # configuración de pytest y marcadores
+├── README.md
+└── requirements.txt
 ```
 
 ---
@@ -94,7 +141,7 @@ cd dashboard_pedidos
 
 # 2. Crear entorno virtual e instalar dependencias
 python -m venv .venv
-.venv\Scripts\activate
+.venv\Scriptsctivate
 pip install -r requirements.txt
 
 # 3. Instalar el navegador que usa Playwright

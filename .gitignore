@@ -46,3 +46,9 @@ test-results/
 Desktop.ini
 Thumbs.db
 *.lnk
+
+# Ignorar carpeta docs
+docs/
+
+# Ignorar archivo CLAUDE.md
+CLAUDE.md

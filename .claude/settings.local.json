@@ -6,7 +6,9 @@
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
       "Bash(python -c ' *)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(python -m pytest tests/integration/test_persistencia.py -v)",
+      "Bash(python -m pytest tests/integration/ -v)"
     ]
   }
 }

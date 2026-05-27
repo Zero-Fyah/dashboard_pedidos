@@ -1904,12 +1904,23 @@ async def persistencia_worker(
                     for sp in resultado["subpedidos"]:
                         num_sub = sp["numero_subpedido"]
                         for linea in sp["lineas"]:
-                            await db.execute(
+                            cursor = await db.execute(
                                 "UPDATE lineas_pedido SET cantidad_entregada = ? "
                                 "WHERE id_pedido = ? AND numero_subpedido = ? "
                                 "AND codigo_barras = ?",
                                 (linea["cantidad_entregada"], id_pedido, num_sub, linea["codigo_barras"]),
                             )
+                            if cursor.rowcount == 0:
+                                log_event(
+                                    "update_sin_match",
+                                    level="WARNING",
+                                    id_pedido=id_pedido,
+                                    msg=(
+                                        f"cantidad_entregada no actualizada — "
+                                        f"codigo_barras vacío o no encontrado en "
+                                        f"subpedido {num_sub}"
+                                    ),
+                                )
                         await db.execute(
                             "UPDATE subpedidos SET estado = ?, cantidades_definitivas = 1 "
                             "WHERE id_pedido = ? AND numero_subpedido = ?",
@@ -1994,6 +2005,10 @@ async def persistencia_worker(
                             resultado["registro_ops"],
                         )
 
+                    await db.execute(
+                        "UPDATE pedidos SET actualizado_en = ? WHERE id_pedido = ?",
+                        (datetime.now(timezone.utc).isoformat(), id_pedido),
+                    )
                     await db.execute("COMMIT")
                     log_event("db_guardado", id_pedido=id_pedido, msg="Cantidades actualizadas")
 
