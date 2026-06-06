@@ -72,6 +72,8 @@ scraper/scraper_principal.py
         etl/etl_principal.py   ← normalización de montos + 7 VIEWs analíticas
 ```
 
+El pipeline continúa hacia `dashboard/app.py` (Streamlit), que consume `data/pedidos.db` directamente.
+
 ---
 
 ## Estructura del repositorio
@@ -84,6 +86,9 @@ dashboard_pedidos/
 │   ├── debug/                # HTMLs de debug — pueden contener PII
 │   └── errors/               # Screenshots de errores del scraper
 ├── dashboard/                # Etapa 3 — visualización
+│   ├── __init__.py
+│   ├── app.py                # Aplicación Streamlit
+│   └── db.py                 # Capa de datos (consultas SQLite)
 ├── docs/                     # Contexto persistente del proyecto
 │   ├── integral.md           # Visión, problema y objetivo de negocio
 │   ├── structure.md          # Arquitectura técnica y esquema de datos
@@ -97,6 +102,8 @@ dashboard_pedidos/
 ├── scraper/                  # Etapa 1 — extracción de datos
 │   ├── __init__.py           # paquete importable por tests/
 │   ├── archive/              # Versión inicial del scraper — solo referencia
+│   ├── migrations/           # Scripts de migración de única ejecución
+│   │   └── reset_timeline_incompleto.py
 │   ├── actualizar_pedidos.bat
 │   └── scraper_principal.py
 ├── tests/                    # Suite de tests
@@ -166,6 +173,15 @@ py scraper/scraper_principal.py --desde 2026-05-01
 # Modo incremental — actualiza activos, reintenta errores
 # y captura pedidos nuevos del día
 py scraper/scraper_principal.py --modo incremental
+
+# Normalizar montos y crear VIEWs analíticas
+python etl/etl_principal.py
+
+# Migración puntual: resetear pedidos sin timeline para re-scraping (ver BUG-012)
+python scraper/migrations/reset_timeline_incompleto.py
+
+# Iniciar el dashboard
+python -m streamlit run dashboard/app.py
 ```
 
 Al finalizar, el scraper imprime un resumen JSON con tiempo total, pedidos procesados, errores
@@ -196,7 +212,7 @@ en una sola pasada de workers paralelos.
 |---|---|
 | Etapa 1 — Scraper (extracción) | ✅ Completa |
 | Etapa 2 — ETL (normalización + VIEWs SQL) | ✅ Completa |
-| Etapa 3 — Dashboard (visualización) | 🔲 Pendiente |
+| Etapa 3 — Dashboard (visualización) | 🔧 En desarrollo (vista de inventario operacional) |
 
 ---
 

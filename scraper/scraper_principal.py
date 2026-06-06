@@ -24,6 +24,7 @@ from playwright.async_api import (
     BrowserContext,
     Page,
     Response,
+    TimeoutError as PlaywrightTimeoutError,
 )
 import aiosqlite
 import asyncio
@@ -230,7 +231,17 @@ def to_num(val: str) -> float | None:
         Valor float, o None si la conversión falla.
     """
     try:
-        cleaned = val.strip().replace(".", "").replace(",", ".")
+        cleaned = val.strip()
+        # BUG-017: capturar signo negativo antes de strip del prefijo
+        # para manejar "-COP 137.706" además de "COP 137.706"
+        negative = cleaned.startswith("-")
+        if negative:
+            cleaned = cleaned[1:]
+        if cleaned.startswith("COP "):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+        if negative:
+            cleaned = "-" + cleaned
         return float(cleaned)
     except (ValueError, AttributeError):
         return None
@@ -615,6 +626,15 @@ async def obtener_lista_pedidos(
     pagina_actual = 1
 
     while True:
+        try:
+            await page.wait_for_selector(
+                "#app > div > div > div > main > div > div > "
+                "div:nth-child(4) > div > div > table > tbody > tr",
+                state="visible",
+                timeout=CONFIG["ELEM_TIMEOUT_MS"],
+            )
+        except Exception:
+            pass
         filas = await page.query_selector_all(
             "#app > div > div > div > main > div > div > "
             "div:nth-child(4) > div > div > table > tbody > tr"
@@ -628,6 +648,21 @@ async def obtener_lista_pedidos(
                 ids_pagina.append((await el.inner_text()).strip())
 
         todos_los_ids.extend(ids_pagina)
+        
+        if len(ids_pagina) == 0 and pagina_actual > 1:
+            await asyncio.sleep(CONFIG["PAUSA_PAGINACION_S"])
+            filas = await page.query_selector_all(
+                "#app > div > div > div > main > div > div > "
+                "div:nth-child(4) > div > div > table > tbody > tr"
+            )
+            for fila in filas:
+                el = await fila.query_selector(
+                    "td:nth-child(2) > div > div:nth-child(1) > span.value"
+                )
+                if el:
+                    ids_pagina.append((await el.inner_text()).strip())
+            todos_los_ids.extend(ids_pagina)
+        
         log_event(
             "pagina_extraida",
             msg=f"Página {pagina_actual} — {len(ids_pagina)} pedidos",
@@ -1136,8 +1171,12 @@ async def extraer_subpedidos(page: Page) -> list[dict]:
                     "td.el-table__expanded-cell",
                     timeout=CONFIG["ELEM_TIMEOUT_MS"],
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event(
+                    "subpedido_expand_error",
+                    level="WARNING",
+                    msg=f"td.el-table__expanded-cell no expandió — líneas de este subpedido vacías: {type(exc).__name__}: {exc}",
+                )
             await asyncio.sleep(0.5)
 
     # 2 — Leer filas DESPUÉS de haber expandido todo
@@ -1333,6 +1372,7 @@ async def guardar_debug(page: Page, id_pedido: str) -> None:
 def determinar_modo(
     es_nuevo: bool,
     subs_db: list[tuple[str, int]],
+    scraping_completo: int = 1,
 ) -> str:
     """Determina el modo de extracción sin I/O.
 
@@ -1340,13 +1380,19 @@ def determinar_modo(
         es_nuevo: True si el pedido no existe en DB.
         subs_db: Lista de (estado, cantidades_definitivas)
                  de los subpedidos del pedido.
+        scraping_completo: Valor de la columna scraping_completo en pedidos.
+                           0 indica que la migración requiere re-extracción
+                           completa aunque el pedido ya exista en DB.
+                           Default 1 preserva el comportamiento previo.
 
     Returns:
-        "completo"        — pedido nuevo.
+        "completo"        — pedido nuevo o scraping_completo=0 (migración).
         "con_cantidades"  — subpedido en estado cerrado
                            con cantidades aún no registradas.
         "solo_estado"     — actualizar solo estado.
     """
+    if scraping_completo == 0:
+        return "completo"
     if es_nuevo:
         return "completo"
     if any(
@@ -1409,7 +1455,8 @@ async def procesar_pedido(
         else:
             subs_db = []
 
-    modo = determinar_modo(es_nuevo, subs_db)
+    scraping_completo = row[0] if row is not None else 1
+    modo = determinar_modo(es_nuevo, subs_db, scraping_completo)
 
     nav_kwargs: dict = {} if modo == "completo" else {"wait_until": "domcontentloaded"}
 
@@ -1440,7 +1487,16 @@ async def procesar_pedido(
                 await page.wait_for_load_state("domcontentloaded")
                 await page.wait_for_selector("div.info-item", timeout=CONFIG["ELEM_TIMEOUT_MS"])
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(1)
+                try:
+                    await page.wait_for_selector(
+                        "div.order-steps-wrapper",
+                        state="visible",
+                        timeout=CONFIG["ELEM_TIMEOUT_MS"],
+                    )
+                except PlaywrightTimeoutError:
+                    # El selector no apareció en el tiempo esperado.
+                    # La extracción retornará [] — los Cambios 2/3 lo manejan.
+                    pass
 
                 info_general = await extraer_info_general(page)
                 subpedidos   = await extraer_subpedidos(page)
@@ -1723,63 +1779,71 @@ async def persistencia_worker(
                         _info_insert,
                     )
 
-                    await db.execute("DELETE FROM subpedidos     WHERE id_pedido = ?", (id_pedido,))
-                    await db.execute("DELETE FROM lineas_pedido  WHERE id_pedido = ?", (id_pedido,))
-                    await db.execute("DELETE FROM timeline_pedido WHERE id_pedido = ?", (id_pedido,))
+                    if subped:
+                        await db.execute("DELETE FROM subpedidos     WHERE id_pedido = ?", (id_pedido,))
+                        await db.execute("DELETE FROM lineas_pedido  WHERE id_pedido = ?", (id_pedido,))
 
-                    await db.executemany(
-                        """
-                        INSERT INTO subpedidos (
-                            id_pedido, numero_subpedido, tipo_subpedido, estado,
-                            inicio_alistamiento, alistamiento_completado, alistador,
-                            inicio_inspeccion, inspeccion_completada, inspector
-                        ) VALUES (
-                            :id_pedido, :numero_subpedido, :tipo_subpedido, :estado,
-                            :inicio_alistamiento, :alistamiento_completado, :alistador,
-                            :inicio_inspeccion, :inspeccion_completada, :inspector
-                        )
-                        """,
-                        [
-                            {
-                                "id_pedido":               id_pedido,
-                                "numero_subpedido":        sp["numero_subpedido"],
-                                "tipo_subpedido":          sp["tipo_subpedido"],
-                                "estado":                  sp["estado"],
-                                "inicio_alistamiento":     sp["inicio_alistamiento"],
-                                "alistamiento_completado": sp["alistamiento_completado"],
-                                "alistador":               sp["alistador"],
-                                "inicio_inspeccion":       sp["inicio_inspeccion"],
-                                "inspeccion_completada":   sp["inspeccion_completada"],
-                                "inspector":               sp["inspector"],
-                            }
-                            for sp in subped
-                        ],
-                    )
-
-                    if lineas_rows:
                         await db.executemany(
                             """
-                            INSERT INTO lineas_pedido (
-                                id_pedido, numero_subpedido, tipo_subpedido,
-                                nombre_producto, referencia, codigo_barras, presentacion,
-                                almacen, cantidad_comprada, cantidad_entregada,
-                                precio_unitario, descuento, precio_descuento,
-                                monto_pagar, monto_final, iva, peso_total, observaciones,
-                                numero_caja, tipo
+                            INSERT INTO subpedidos (
+                                id_pedido, numero_subpedido, tipo_subpedido, estado,
+                                inicio_alistamiento, alistamiento_completado, alistador,
+                                inicio_inspeccion, inspeccion_completada, inspector
                             ) VALUES (
-                                :id_pedido, :numero_subpedido, :tipo_subpedido,
-                                :nombre_producto, :referencia, :codigo_barras, :presentacion,
-                                :almacen, :cantidad_comprada, :cantidad_entregada,
-                                :precio_unitario, :descuento, :precio_descuento,
-                                :monto_pagar, :monto_final, :iva, :peso_total, :observaciones,
-                                :numero_caja, :tipo
+                                :id_pedido, :numero_subpedido, :tipo_subpedido, :estado,
+                                :inicio_alistamiento, :alistamiento_completado, :alistador,
+                                :inicio_inspeccion, :inspeccion_completada, :inspector
                             )
                             """,
-                            lineas_rows,
+                            [
+                                {
+                                    "id_pedido":               id_pedido,
+                                    "numero_subpedido":        sp["numero_subpedido"],
+                                    "tipo_subpedido":          sp["tipo_subpedido"],
+                                    "estado":                  sp["estado"],
+                                    "inicio_alistamiento":     sp["inicio_alistamiento"],
+                                    "alistamiento_completado": sp["alistamiento_completado"],
+                                    "alistador":               sp["alistador"],
+                                    "inicio_inspeccion":       sp["inicio_inspeccion"],
+                                    "inspeccion_completada":   sp["inspeccion_completada"],
+                                    "inspector":               sp["inspector"],
+                                }
+                                for sp in subped
+                            ],
+                        )
+
+                        if lineas_rows:
+                            await db.executemany(
+                                """
+                                INSERT INTO lineas_pedido (
+                                    id_pedido, numero_subpedido, tipo_subpedido,
+                                    nombre_producto, referencia, codigo_barras, presentacion,
+                                    almacen, cantidad_comprada, cantidad_entregada,
+                                    precio_unitario, descuento, precio_descuento,
+                                    monto_pagar, monto_final, iva, peso_total, observaciones,
+                                    numero_caja, tipo
+                                ) VALUES (
+                                    :id_pedido, :numero_subpedido, :tipo_subpedido,
+                                    :nombre_producto, :referencia, :codigo_barras, :presentacion,
+                                    :almacen, :cantidad_comprada, :cantidad_entregada,
+                                    :precio_unitario, :descuento, :precio_descuento,
+                                    :monto_pagar, :monto_final, :iva, :peso_total, :observaciones,
+                                    :numero_caja, :tipo
+                                )
+                                """,
+                                lineas_rows,
+                            )
+                    else:
+                        log_event(
+                            "subpedidos_vacio",
+                            level="WARNING",
+                            msg="extracción de subpedidos retornó vacío — datos existentes preservados",
+                            id_pedido=id_pedido,
                         )
 
                     timeline = resultado.get("timeline", [])
                     if timeline:
+                        await db.execute("DELETE FROM timeline_pedido WHERE id_pedido = ?", (id_pedido,))
                         await db.executemany(
                             """
                             INSERT INTO timeline_pedido
@@ -1788,6 +1852,13 @@ async def persistencia_worker(
                                 (:id_pedido, :paso, :titulo, :fecha_hora, :completado)
                             """,
                             timeline,
+                        )
+                    elif tipo == "completo":
+                        log_event(
+                            "timeline_vacio",
+                            level="WARNING",
+                            msg="div.order-steps-wrapper no renderizó o retornó vacío",
+                            id_pedido=id_pedido,
                         )
 
                     await db.execute(
@@ -1824,10 +1895,12 @@ async def persistencia_worker(
                         },
                     )
 
-                    await db.execute(
-                        "DELETE FROM estadisticas_monto WHERE id_pedido = ?", (id_pedido,)
-                    )
+                    # HAL-004: DELETE movido dentro de if para evitar
+                    # borrar datos existentes cuando la extracción retorna vacío
                     if resultado.get("estadisticas"):
+                        await db.execute(
+                            "DELETE FROM estadisticas_monto WHERE id_pedido = ?", (id_pedido,)
+                        )
                         await db.executemany(
                             """INSERT INTO estadisticas_monto
                                (id_pedido, orden, concepto, concepto_tag,
@@ -1837,11 +1910,18 @@ async def persistencia_worker(
                                 :monto_pagar, :monto_final, :diferencia)""",
                             resultado["estadisticas"],
                         )
+                    else:
+                        log_event(
+                            "estadisticas_vacio",
+                            level="WARNING",
+                            msg="estadisticas_monto retornó vacío — datos existentes preservados",
+                            id_pedido=id_pedido,
+                        )
 
-                    await db.execute(
-                        "DELETE FROM gestion_diferencias WHERE id_pedido = ?", (id_pedido,)
-                    )
                     if resultado.get("gestion_dif"):
+                        await db.execute(
+                            "DELETE FROM gestion_diferencias WHERE id_pedido = ?", (id_pedido,)
+                        )
                         gd = resultado["gestion_dif"]
                         await db.execute(
                             """INSERT INTO gestion_diferencias
@@ -1852,11 +1932,18 @@ async def persistencia_worker(
                              gd.get("monto_final_pagar", ""), gd.get("monto_pagado", ""),
                              gd.get("monto_diferencia", "")),
                         )
+                    else:
+                        log_event(
+                            "gestion_dif_vacio",
+                            level="WARNING",
+                            msg="gestion_diferencias retornó vacío — datos existentes preservados",
+                            id_pedido=id_pedido,
+                        )
 
-                    await db.execute(
-                        "DELETE FROM detalle_diferencias WHERE id_pedido = ?", (id_pedido,)
-                    )
                     if resultado.get("detalle_dif"):
+                        await db.execute(
+                            "DELETE FROM detalle_diferencias WHERE id_pedido = ?", (id_pedido,)
+                        )
                         await db.executemany(
                             """INSERT INTO detalle_diferencias
                                (id_pedido, nombre_producto, especificacion, tipo,
@@ -1870,11 +1957,18 @@ async def persistencia_worker(
                                 :monto_pagar_pedido, :monto_final_pagar, :iva, :monto_diferencia)""",
                             resultado["detalle_dif"],
                         )
+                    else:
+                        log_event(
+                            "detalle_dif_vacio",
+                            level="WARNING",
+                            msg="detalle_diferencias retornó vacío — datos existentes preservados",
+                            id_pedido=id_pedido,
+                        )
 
-                    await db.execute(
-                        "DELETE FROM registro_operaciones WHERE id_pedido = ?", (id_pedido,)
-                    )
                     if resultado.get("registro_ops"):
+                        await db.execute(
+                            "DELETE FROM registro_operaciones WHERE id_pedido = ?", (id_pedido,)
+                        )
                         await db.executemany(
                             """INSERT INTO registro_operaciones
                                (id_pedido, momento, usuario, tipo_usuario, accion, referencia)
@@ -1882,6 +1976,13 @@ async def persistencia_worker(
                                (:id_pedido, :momento, :usuario, :tipo_usuario,
                                 :accion, :referencia)""",
                             resultado["registro_ops"],
+                        )
+                    else:
+                        log_event(
+                            "registro_ops_vacio",
+                            level="WARNING",
+                            msg="registro_operaciones retornó vacío — datos existentes preservados",
+                            id_pedido=id_pedido,
                         )
 
                     await db.execute("COMMIT")
@@ -1927,9 +2028,9 @@ async def persistencia_worker(
                             (sp["estado"], id_pedido, num_sub),
                         )
 
-                    await db.execute("DELETE FROM timeline_pedido WHERE id_pedido = ?", (id_pedido,))
                     timeline = resultado.get("timeline", [])
                     if timeline:
+                        await db.execute("DELETE FROM timeline_pedido WHERE id_pedido = ?", (id_pedido,))
                         await db.executemany(
                             """
                             INSERT INTO timeline_pedido
@@ -1945,10 +2046,13 @@ async def persistencia_worker(
                         (resultado.get("hay_diferencia", 0), id_pedido),
                     )
 
-                    await db.execute(
-                        "DELETE FROM estadisticas_monto WHERE id_pedido = ?", (id_pedido,)
-                    )
+                    # HAL-004: DELETE movido dentro de if — sin WARNING en
+                    # con_cantidades porque el modo no garantiza renderizado
+                    # de estas secciones (mismo criterio que BUG-013/timeline)
                     if resultado.get("estadisticas"):
+                        await db.execute(
+                            "DELETE FROM estadisticas_monto WHERE id_pedido = ?", (id_pedido,)
+                        )
                         await db.executemany(
                             """INSERT INTO estadisticas_monto
                                (id_pedido, orden, concepto, concepto_tag,
@@ -1959,10 +2063,10 @@ async def persistencia_worker(
                             resultado["estadisticas"],
                         )
 
-                    await db.execute(
-                        "DELETE FROM gestion_diferencias WHERE id_pedido = ?", (id_pedido,)
-                    )
                     if resultado.get("gestion_dif"):
+                        await db.execute(
+                            "DELETE FROM gestion_diferencias WHERE id_pedido = ?", (id_pedido,)
+                        )
                         gd = resultado["gestion_dif"]
                         await db.execute(
                             """INSERT INTO gestion_diferencias
@@ -1974,10 +2078,10 @@ async def persistencia_worker(
                              gd.get("monto_diferencia", "")),
                         )
 
-                    await db.execute(
-                        "DELETE FROM detalle_diferencias WHERE id_pedido = ?", (id_pedido,)
-                    )
                     if resultado.get("detalle_dif"):
+                        await db.execute(
+                            "DELETE FROM detalle_diferencias WHERE id_pedido = ?", (id_pedido,)
+                        )
                         await db.executemany(
                             """INSERT INTO detalle_diferencias
                                (id_pedido, nombre_producto, especificacion, tipo,
@@ -1992,10 +2096,10 @@ async def persistencia_worker(
                             resultado["detalle_dif"],
                         )
 
-                    await db.execute(
-                        "DELETE FROM registro_operaciones WHERE id_pedido = ?", (id_pedido,)
-                    )
                     if resultado.get("registro_ops"):
+                        await db.execute(
+                            "DELETE FROM registro_operaciones WHERE id_pedido = ?", (id_pedido,)
+                        )
                         await db.executemany(
                             """INSERT INTO registro_operaciones
                                (id_pedido, momento, usuario, tipo_usuario, accion, referencia)
@@ -2033,9 +2137,9 @@ async def persistencia_worker(
                             (sp["estado"], id_pedido, sp["numero_subpedido"]),
                         )
 
-                    await db.execute("DELETE FROM timeline_pedido WHERE id_pedido = ?", (id_pedido,))
                     timeline = resultado.get("timeline", [])
                     if timeline:
+                        await db.execute("DELETE FROM timeline_pedido WHERE id_pedido = ?", (id_pedido,))
                         await db.executemany(
                             """
                             INSERT INTO timeline_pedido
@@ -2065,10 +2169,13 @@ async def persistencia_worker(
                         (resultado.get("hay_diferencia", 0), id_pedido),
                     )
 
-                    await db.execute(
-                        "DELETE FROM estadisticas_monto WHERE id_pedido = ?", (id_pedido,)
-                    )
+                    # HAL-004: DELETE movido dentro de if — sin WARNING en
+                    # solo_estado porque el modo no garantiza renderizado
+                    # de estas secciones (mismo criterio que BUG-013/timeline)
                     if resultado.get("estadisticas"):
+                        await db.execute(
+                            "DELETE FROM estadisticas_monto WHERE id_pedido = ?", (id_pedido,)
+                        )
                         await db.executemany(
                             """INSERT INTO estadisticas_monto
                                (id_pedido, orden, concepto, concepto_tag,
@@ -2079,10 +2186,10 @@ async def persistencia_worker(
                             resultado["estadisticas"],
                         )
 
-                    await db.execute(
-                        "DELETE FROM gestion_diferencias WHERE id_pedido = ?", (id_pedido,)
-                    )
                     if resultado.get("gestion_dif"):
+                        await db.execute(
+                            "DELETE FROM gestion_diferencias WHERE id_pedido = ?", (id_pedido,)
+                        )
                         gd = resultado["gestion_dif"]
                         await db.execute(
                             """INSERT INTO gestion_diferencias
@@ -2094,10 +2201,10 @@ async def persistencia_worker(
                              gd.get("monto_diferencia", "")),
                         )
 
-                    await db.execute(
-                        "DELETE FROM detalle_diferencias WHERE id_pedido = ?", (id_pedido,)
-                    )
                     if resultado.get("detalle_dif"):
+                        await db.execute(
+                            "DELETE FROM detalle_diferencias WHERE id_pedido = ?", (id_pedido,)
+                        )
                         await db.executemany(
                             """INSERT INTO detalle_diferencias
                                (id_pedido, nombre_producto, especificacion, tipo,
@@ -2112,10 +2219,10 @@ async def persistencia_worker(
                             resultado["detalle_dif"],
                         )
 
-                    await db.execute(
-                        "DELETE FROM registro_operaciones WHERE id_pedido = ?", (id_pedido,)
-                    )
                     if resultado.get("registro_ops"):
+                        await db.execute(
+                            "DELETE FROM registro_operaciones WHERE id_pedido = ?", (id_pedido,)
+                        )
                         await db.executemany(
                             """INSERT INTO registro_operaciones
                                (id_pedido, momento, usuario, tipo_usuario, accion, referencia)
