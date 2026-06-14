@@ -116,7 +116,7 @@ CONFIG: ConfigDict = {
     # Observabilidad
     "MAX_SCREENSHOTS": 50,
     "MAX_HTML_DEBUG":  50,
-    "LOG_FILE":        "scraper.log",
+    "LOG_FILE":        str(Path(__file__).parent.parent / "logs" / "scraper.log"),
     "ERRORS_DIR": str(Path(__file__).parent.parent / "data" / "errors"),
     "DEBUG_DIR":  str(Path(__file__).parent.parent / "data" / "debug"),
     "HEADLESS": False,
@@ -158,6 +158,7 @@ ESTADOS_FIJAN_CANTIDADES: frozenset[str] = frozenset({
 # LOGGING JSONL
 # ─────────────────────────────────────────────
 
+Path(CONFIG["LOG_FILE"]).parent.mkdir(parents=True, exist_ok=True)
 _file_handler = logging.FileHandler(CONFIG["LOG_FILE"], encoding="utf-8", mode="a")
 _file_handler.setFormatter(logging.Formatter("%(message)s"))
 _logger = logging.getLogger(__name__)
@@ -222,10 +223,12 @@ def to_num(val: str) -> float | None:
     """Convierte un string numérico en formato español a float.
 
     Elimina puntos de separador de miles y reemplaza la coma decimal por
-    punto. Retorna None si el valor no es convertible (nunca lanza excepción).
+    punto. También elimina prefijos monetarios (COP) y sufijos de unidad
+    (g, kg, ml, l) que el scraper captura pegados al número.
+    Retorna None si el valor no es convertible (nunca lanza excepción).
 
     Args:
-        val: String a convertir, ej. "1.234,56" o "200".
+        val: String a convertir, ej. "1.234,56", "200", "402g", "1.5kg".
 
     Returns:
         Valor float, o None si la conversión falla.
@@ -239,6 +242,12 @@ def to_num(val: str) -> float | None:
             cleaned = cleaned[1:]
         if cleaned.startswith("COP "):
             cleaned = cleaned[4:]
+        # Eliminar sufijos de unidad pegados al número (ej: "402g", "1.5kg")
+        # Orden importa: kg/ml antes que g/l para no dejar letra suelta
+        for unit in ("kg", "ml", "mg", "g", "l"):
+            if cleaned.lower().endswith(unit):
+                cleaned = cleaned[: -len(unit)].strip()
+                break
         cleaned = cleaned.replace(".", "").replace(",", ".")
         if negative:
             cleaned = "-" + cleaned
@@ -495,46 +504,19 @@ async def init_db(db_path: str) -> None:
         """)
 
         for ddl in (
-            "ALTER TABLE lineas_pedido ADD COLUMN numero_caja TEXT DEFAULT NULL",
-            "ALTER TABLE lineas_pedido ADD COLUMN tipo        TEXT DEFAULT NULL",
-        ):
-            try:
-                await db.execute(ddl)
-                await db.commit()
-            except Exception:
-                pass
-
-        try:
-            await db.execute(
-                "ALTER TABLE pedidos ADD COLUMN hora TEXT DEFAULT NULL"
-            )
-            await db.commit()
-        except Exception:
-            pass
-
-        try:
-            await db.execute(
-                "ALTER TABLE subpedidos ADD COLUMN "
-                "cantidades_definitivas INTEGER DEFAULT 0"
-            )
-            await db.commit()
-        except Exception:
-            pass
-
-        for ddl in (
-            "ALTER TABLE pedidos ADD COLUMN hora               TEXT    DEFAULT NULL",
-            "ALTER TABLE pedidos ADD COLUMN alistador_pedido   TEXT    DEFAULT NULL",
-            "ALTER TABLE pedidos ADD COLUMN inspector_pedido   TEXT    DEFAULT NULL",
-            "ALTER TABLE pedidos ADD COLUMN movil_cliente      TEXT    DEFAULT NULL",
-            "ALTER TABLE pedidos ADD COLUMN despachador        TEXT    DEFAULT NULL",
-            "ALTER TABLE pedidos ADD COLUMN hora_entrega       TEXT    DEFAULT NULL",
-            "ALTER TABLE pedidos ADD COLUMN obs_entrega        TEXT    DEFAULT NULL",
-            "ALTER TABLE pedidos ADD COLUMN entrega_ruta_tag   TEXT    DEFAULT NULL",
-            "ALTER TABLE pedidos ADD COLUMN entrega_descuento_tag TEXT DEFAULT NULL",
-            "ALTER TABLE pedidos ADD COLUMN hay_diferencia     INTEGER DEFAULT 0",
+            "ALTER TABLE pedidos ADD COLUMN hora                  TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN alistador_pedido      TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN inspector_pedido      TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN movil_cliente         TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN despachador           TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN hora_entrega          TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN obs_entrega           TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN entrega_ruta_tag      TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN entrega_descuento_tag TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN hay_diferencia        INTEGER DEFAULT 0",
             "ALTER TABLE subpedidos ADD COLUMN cantidades_definitivas INTEGER DEFAULT 0",
-            "ALTER TABLE lineas_pedido ADD COLUMN numero_caja  TEXT    DEFAULT NULL",
-            "ALTER TABLE lineas_pedido ADD COLUMN tipo         TEXT    DEFAULT NULL",
+            "ALTER TABLE lineas_pedido ADD COLUMN numero_caja     TEXT    DEFAULT NULL",
+            "ALTER TABLE lineas_pedido ADD COLUMN tipo            TEXT    DEFAULT NULL",
         ):
             try:
                 await db.execute(ddl)
@@ -550,6 +532,7 @@ async def init_db(db_path: str) -> None:
             "CREATE INDEX IF NOT EXISTS idx_gestion_dif_pedido  ON gestion_diferencias(id_pedido)",
             "CREATE INDEX IF NOT EXISTS idx_detalle_dif_pedido  ON detalle_diferencias(id_pedido)",
             "CREATE INDEX IF NOT EXISTS idx_registro_ops_pedido ON registro_operaciones(id_pedido)",
+            "CREATE INDEX IF NOT EXISTS idx_pedidos_scraping    ON pedidos(scraping_completo)",
         ):
             await db.execute(ddl_idx)
         await db.commit()
@@ -1248,6 +1231,19 @@ async def extraer_subpedidos(page: Page) -> list[dict]:
                 tipo_el  = await cols[5].query_selector(".el-tag__content") if len(cols) > 5 else None
                 tipo_val = (await tipo_el.inner_text()).strip() if tipo_el else await col_text(cols, 5)
 
+                # La columna descuento (índice 7) tiene dos hijos:
+                #   <span>-</span>                  ← valor real (guión o %)
+                #   <span class="el-tag">...</span> ← etiqueta "Tipo de cambio3%"
+                # inner_text() los concatena con \n → "-\nTipo de cambio3%".
+                # Extraemos solo el primer <span> para obtener únicamente el valor.
+                descuento_val = ""
+                if len(cols) > 7:
+                    span_desc = await cols[7].query_selector("span:first-child")
+                    if span_desc:
+                        descuento_val = (await span_desc.inner_text()).strip()
+                    else:
+                        descuento_val = await col_text(cols, 7)
+
                 subpedidos[-1]["lineas"].append({
                     "numero_caja":        await col_text(cols, 0),
                     "nombre_producto":    nombre,
@@ -1259,7 +1255,7 @@ async def extraer_subpedidos(page: Page) -> list[dict]:
                     "cantidad_entregada": cant_e,
                     "tipo":               tipo_val,
                     "precio_unitario":    await col_text(cols, 6),
-                    "descuento":          await col_text(cols, 7),
+                    "descuento":          descuento_val,
                     "precio_descuento":   await col_text(cols, 8),
                     "monto_pagar":        await col_text(cols, 9),
                     "monto_final":        await col_text(cols, 10),
@@ -1544,6 +1540,20 @@ async def procesar_pedido(
                 n_subs = len(subpedidos)
 
             else:  # solo_estado
+                try:
+                    await page.wait_for_selector(
+                        "div.el-scrollbar__wrap--hidden-default table tbody tr",
+                        state="visible",
+                        timeout=CONFIG["ELEM_TIMEOUT_MS"],
+                    )
+                except PlaywrightTimeoutError:
+                    log_event(
+                        "solo_estado_tabla_timeout",
+                        level="WARNING",
+                        worker_id=worker_id,
+                        id_pedido=id_pedido,
+                        msg="Tabla de subpedidos no renderizada — estados no actualizados en esta pasada",
+                    )
                 filas = await page.query_selector_all(
                     "div.el-scrollbar__wrap--hidden-default table tbody tr"
                 )
@@ -2157,11 +2167,17 @@ async def persistencia_worker(
                         f"AND LOWER(estado) NOT IN ({_closed_ph})",
                         (id_pedido, *ESTADOS_CERRADOS),
                     )).fetchone()
+                    ts_ahora = datetime.now(timezone.utc).isoformat()
                     if open_count_row and open_count_row[0] == 0:
                         await db.execute(
                             "UPDATE pedidos SET scraping_completo = 1, actualizado_en = ? "
                             "WHERE id_pedido = ?",
-                            (datetime.now(timezone.utc).isoformat(), id_pedido),
+                            (ts_ahora, id_pedido),
+                        )
+                    else:
+                        await db.execute(
+                            "UPDATE pedidos SET actualizado_en = ? WHERE id_pedido = ?",
+                            (ts_ahora, id_pedido),
                         )
 
                     await db.execute(
@@ -2622,17 +2638,22 @@ async def main(args: argparse.Namespace) -> None:
     t_min  = (time.monotonic() - t_inicio) / 60
     n_ids  = len(ids_pendientes)
 
+    _CHUNK = 900
     async with aiosqlite.connect(db_path) as db_r:
-        ph    = ",".join("?" * n_ids)
-        n_ok  = (await (await db_r.execute(
-            f"SELECT COUNT(*) FROM pedidos "
-            f"WHERE scraping_completo = 1 AND id_pedido IN ({ph})",
-            ids_pendientes,
-        )).fetchone())[0]
-        n_err = (await (await db_r.execute(
-            f"SELECT COUNT(*) FROM errores WHERE id_pedido IN ({ph})",
-            ids_pendientes,
-        )).fetchone())[0]
+        n_ok = 0
+        n_err = 0
+        for _i in range(0, n_ids, _CHUNK):
+            _chunk = ids_pendientes[_i:_i + _CHUNK]
+            _ph = ",".join("?" * len(_chunk))
+            n_ok += (await (await db_r.execute(
+                f"SELECT COUNT(*) FROM pedidos "
+                f"WHERE scraping_completo = 1 AND id_pedido IN ({_ph})",
+                _chunk,
+            )).fetchone())[0]
+            n_err += (await (await db_r.execute(
+                f"SELECT COUNT(*) FROM errores WHERE id_pedido IN ({_ph})",
+                _chunk,
+            )).fetchone())[0]
 
     tasa = (n_ok / n_ids * 100) if n_ids else 100.0
     resumen = {

@@ -1,7 +1,7 @@
 import streamlit as st
 
-from dashboard.db import (
-    _VIEW_CONSOLIDADO_EXISTS,
+from db import (
+    _view_consolidado_exists,
     get_consolidado,
     get_detalle_operacional,
     get_detalle_pedido,
@@ -62,10 +62,14 @@ almacenes_key   = tuple(sorted(almacenes_sel))
 tipos_sub_key   = tuple(sorted(tipos_sub_sel))
 
 # ── Carga de datos ─────────────────────────────────────────────────────────────
-with st.spinner("Cargando datos..."):
-    df_consolidado    = get_consolidado(estados_sub_key, almacenes_key)
-    df_pedidos        = get_pedidos(estado_pedido_sel, estados_sub_key, almacenes_key)
-    df_pedidos_activos = get_pedidos_activos(estados_sub_key, almacenes_key, tipos_sub_key)
+try:
+    with st.spinner("Cargando datos..."):
+        df_consolidado    = get_consolidado(estados_sub_key, almacenes_key)
+        df_pedidos        = get_pedidos(estado_pedido_sel, estados_sub_key, almacenes_key)
+        df_pedidos_activos = get_pedidos_activos(estados_sub_key, almacenes_key, tipos_sub_key)
+except FileNotFoundError as e:
+    st.error(str(e))
+    st.stop()
 
 # ── KPIs ───────────────────────────────────────────────────────────────────────
 st.divider()
@@ -79,7 +83,7 @@ k4.metric("Pendiente", f"{int(df_consolidado['Pendiente'].sum()):,}")
 st.divider()
 st.subheader("Consolidado de mercancía comprometida")
 
-if df_consolidado.empty and not _VIEW_CONSOLIDADO_EXISTS:
+if df_consolidado.empty and not _view_consolidado_exists():
     st.warning("La VIEW v_inventario_comprometido no existe. Ejecuta el ETL primero.")
 elif df_consolidado.empty:
     st.info("Sin mercancía comprometida para el filtro seleccionado.")
@@ -195,8 +199,8 @@ else:
                     "Comprometido":  st.column_config.NumberColumn(format="%g"),
                     "Entregado":     st.column_config.NumberColumn(format="%g"),
                     "Pendiente":     st.column_config.NumberColumn(format="%g"),
-                    "Monto a pagar": st.column_config.NumberColumn(format="$ {:,.0f}"),
-                    "Monto final":   st.column_config.NumberColumn(format="$ {:,.0f}"),
+                    "Monto a pagar": st.column_config.NumberColumn(format="$%.0f"),
+                    "Monto final":   st.column_config.NumberColumn(format="$%.0f"),
                 },
             )
 
@@ -267,7 +271,7 @@ st.dataframe(
         "Comprometido":  st.column_config.NumberColumn(format="%g"),
         "Entregado":     st.column_config.NumberColumn(format="%g"),
         "Pendiente":     st.column_config.NumberColumn(format="%g"),
-        "Monto a pagar": st.column_config.NumberColumn(format="$ {:,.0f}"),
-        "Monto final":   st.column_config.NumberColumn(format="$ {:,.0f}"),
+        "Monto a pagar": st.column_config.NumberColumn(format="$%.0f"),
+        "Monto final":   st.column_config.NumberColumn(format="$%.0f"),
     },
 )

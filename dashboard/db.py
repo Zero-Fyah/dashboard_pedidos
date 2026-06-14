@@ -7,21 +7,37 @@ import streamlit as st
 DB_PATH = Path(__file__).parent.parent / "data" / "pedidos.db"
 ESTADOS_CERRADOS = ("completado", "cancelado", "comentado")
 
-try:
-    _con = sqlite3.connect(DB_PATH)
-    _cols = [r[1] for r in _con.execute("PRAGMA table_info(lineas_pedido)")]
-    _NUM_COLS_EXIST = "monto_pagar_num" in _cols
-    _VIEW_CONSOLIDADO_EXISTS = (
-        _con.execute(
-            "SELECT COUNT(*) FROM sqlite_master "
-            "WHERE type='view' AND name='v_inventario_comprometido'"
-        ).fetchone()[0]
-        > 0
-    )
-    _con.close()
-except Exception:
-    _NUM_COLS_EXIST = False
-    _VIEW_CONSOLIDADO_EXISTS = False
+@st.cache_data(ttl=300, show_spinner=False)
+def _num_cols_exist() -> bool:
+    if not DB_PATH.exists():
+        return False
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cols = [r[1] for r in con.execute("PRAGMA table_info(lineas_pedido)")]
+        con.close()
+        return "monto_pagar_num" in cols
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _view_consolidado_exists() -> bool:
+    if not DB_PATH.exists():
+        return False
+    try:
+        con = sqlite3.connect(DB_PATH)
+        exists = (
+            con.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='view' AND name='v_inventario_comprometido'"
+            ).fetchone()[0]
+            > 0
+        )
+        con.close()
+        return exists
+    except Exception:
+        return False
+
 
 COLS_CONSOLIDADO = [
     "Producto", "Referencia", "Presentación", "Almacén",
@@ -80,52 +96,53 @@ def get_consolidado(
     almacenes: tuple[str, ...],
 ) -> pd.DataFrame:
     con = _conn()
-    view_exists = (
-        con.execute(
-            "SELECT COUNT(*) FROM sqlite_master "
-            "WHERE type='view' AND name='v_inventario_comprometido'"
-        ).fetchone()[0]
-        > 0
-    )
-    if not view_exists:
+    try:
+        view_exists = (
+            con.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='view' AND name='v_inventario_comprometido'"
+            ).fetchone()[0]
+            > 0
+        )
+        if not view_exists:
+            return pd.DataFrame(columns=COLS_CONSOLIDADO)
+
+        conditions = ["nombre_producto IS NOT NULL", "nombre_producto != ''"]
+        params: list = []
+
+        if estados_sub:
+            placeholders = ",".join("?" * len(estados_sub))
+            conditions.append(f"estado IN ({placeholders})")
+            params.extend(estados_sub)
+
+        if almacenes:
+            placeholders = ",".join("?" * len(almacenes))
+            conditions.append(f"almacen IN ({placeholders})")
+            params.extend(almacenes)
+
+        where_clause = " AND ".join(conditions)
+
+        sql = f"""
+            SELECT
+                nombre_producto                  AS "Producto",
+                referencia                       AS "Referencia",
+                presentacion                     AS "Presentación",
+                almacen                          AS "Almacén",
+                estado                           AS "Estado subpedido",
+                SUM(cantidad_comprometida_total) AS "Comprometido",
+                SUM(cantidad_entregada_total)    AS "Entregado",
+                SUM(cantidad_pendiente)          AS "Pendiente",
+                SUM(pedidos_activos)             AS "Pedidos con stock"
+            FROM v_inventario_comprometido
+            WHERE {where_clause}
+            GROUP BY nombre_producto, referencia, presentacion, almacen, estado
+            ORDER BY SUM(cantidad_pendiente) DESC
+        """
+
+        df = pd.read_sql_query(sql, con, params=params)
+        return df
+    finally:
         con.close()
-        return pd.DataFrame(columns=COLS_CONSOLIDADO)
-
-    conditions = ["nombre_producto IS NOT NULL", "nombre_producto != ''"]
-    params: list = []
-
-    if estados_sub:
-        placeholders = ",".join("?" * len(estados_sub))
-        conditions.append(f"estado IN ({placeholders})")
-        params.extend(estados_sub)
-
-    if almacenes:
-        placeholders = ",".join("?" * len(almacenes))
-        conditions.append(f"almacen IN ({placeholders})")
-        params.extend(almacenes)
-
-    where_clause = " AND ".join(conditions)
-
-    sql = f"""
-        SELECT
-            nombre_producto                  AS "Producto",
-            referencia                       AS "Referencia",
-            presentacion                     AS "Presentación",
-            almacen                          AS "Almacén",
-            estado                           AS "Estado subpedido",
-            SUM(cantidad_comprometida_total) AS "Comprometido",
-            SUM(cantidad_entregada_total)    AS "Entregado",
-            SUM(cantidad_pendiente)          AS "Pendiente",
-            SUM(pedidos_activos)             AS "Pedidos con stock"
-        FROM v_inventario_comprometido
-        WHERE {where_clause}
-        GROUP BY nombre_producto, referencia, presentacion, almacen, estado
-        ORDER BY SUM(cantidad_pendiente) DESC
-    """
-
-    df = pd.read_sql_query(sql, con, params=params)
-    con.close()
-    return df
 
 
 @st.cache_data(ttl=7200, show_spinner=False)
@@ -189,8 +206,10 @@ def get_pedidos(
 
     params = params_join_sub + params_join_alm
     con = _conn()
-    df = pd.read_sql_query(sql, con, params=params)
-    con.close()
+    try:
+        df = pd.read_sql_query(sql, con, params=params)
+    finally:
+        con.close()
     df["⚠ Diferencia"] = df.pop("_hay_diferencia").map({1: "Sí", 0: ""})
     return df
 
@@ -293,8 +312,10 @@ def get_pedidos_activos(
     """
 
     con = _conn()
-    df = pd.read_sql_query(sql, con, params=params)
-    con.close()
+    try:
+        df = pd.read_sql_query(sql, con, params=params)
+    finally:
+        con.close()
     df["⚠ Dif."] = df.pop("_hay_diferencia").map({1: "Sí", 0: ""})
     return df
 
@@ -339,8 +360,10 @@ def get_detalle_operacional(
         filtro_almacen = f"AND l.almacen IN ({placeholders})"
         params_almacen = list(almacenes)
 
-    monto_a_pagar = "l.monto_pagar_num" if _NUM_COLS_EXIST else "NULL"
-    monto_final   = "l.monto_final_num"  if _NUM_COLS_EXIST else "NULL"
+    _use_view = _num_cols_exist()
+    _lineas_src   = "v_lineas_pedido_num" if _use_view else "lineas_pedido"
+    monto_a_pagar = "l.monto_pagar"       if _use_view else "NULL"
+    monto_final   = "l.monto_final"       if _use_view else "NULL"
 
     sql = f"""
         SELECT
@@ -360,7 +383,7 @@ def get_detalle_operacional(
             {monto_a_pagar}             AS "Monto a pagar",
             {monto_final}               AS "Monto final",
             l.observaciones             AS "Observaciones"
-        FROM lineas_pedido l
+        FROM {_lineas_src} l
         JOIN subpedidos s
             ON l.id_pedido = s.id_pedido
             AND l.numero_subpedido = s.numero_subpedido
@@ -375,8 +398,10 @@ def get_detalle_operacional(
 
     params = params_tipo + params_estado + [id_pedido] + params_almacen
     con = _conn()
-    df = pd.read_sql_query(sql, con, params=params)
-    con.close()
+    try:
+        df = pd.read_sql_query(sql, con, params=params)
+    finally:
+        con.close()
     return df
 
 
@@ -400,8 +425,10 @@ def get_detalle_pedido(
         filtro_almacen_en_where = f"AND l.almacen IN ({placeholders})"
         params_alm = list(almacenes)
 
-    monto_a_pagar = "l.monto_pagar_num" if _NUM_COLS_EXIST else "NULL"
-    monto_final = "l.monto_final_num" if _NUM_COLS_EXIST else "NULL"
+    _use_view = _num_cols_exist()
+    _lineas_src   = "v_lineas_pedido_num" if _use_view else "lineas_pedido"
+    monto_a_pagar = "l.monto_pagar"       if _use_view else "NULL"
+    monto_final   = "l.monto_final"       if _use_view else "NULL"
 
     sql = f"""
         SELECT
@@ -420,7 +447,7 @@ def get_detalle_pedido(
             {monto_a_pagar}                 AS "Monto a pagar",
             {monto_final}                   AS "Monto final",
             l.observaciones                 AS Observaciones
-        FROM lineas_pedido l
+        FROM {_lineas_src} l
         JOIN subpedidos s ON l.id_pedido = s.id_pedido
                          AND l.numero_subpedido = s.numero_subpedido
                          {filtro_estado_sub_en_join}
@@ -433,6 +460,8 @@ def get_detalle_pedido(
 
     params = params_sub + [id_pedido] + params_alm
     con = _conn()
-    df = pd.read_sql_query(sql, con, params=params)
-    con.close()
+    try:
+        df = pd.read_sql_query(sql, con, params=params)
+    finally:
+        con.close()
     return df

@@ -105,32 +105,50 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
                 # La columna ya existe — continuar
                 pass
 
-        # Paso 2: poblar en batches de 500 filas
-        # El nombre de la columna fuente se obtiene
-        # quitando el sufijo _num
+        # Paso 2: poblar en batches de 500 filas.
+        # Filtra por col_num IS NULL para procesar únicamente
+        # las filas que aún no tienen valor convertido.
+        # Esto hace el ETL idempotente y captura correctamente
+        # las filas nuevas que deja el scraper en cada ejecución.
         for col_num in columnas:
             col_src = col_num[:-4]  # quitar "_num"
             last_id = 0
             batch_count = 0
             total_filas = 0
+            total_fallidos = 0
             while True:
                 rows = await (await db.execute(
                     f"SELECT id, {col_src} FROM {tabla} "
-                    f"WHERE id > ? ORDER BY id LIMIT 500",
+                    f"WHERE id > ? AND {col_num} IS NULL "
+                    f"ORDER BY id LIMIT 500",
                     (last_id,)
                 )).fetchall()
                 if not rows:
                     _log_event(
                         "etl_columna_ok",
-                        msg=f"{tabla}.{col_num} | {total_filas} filas totales",
+                        msg=(
+                            f"{tabla}.{col_num} | "
+                            f"{total_filas} filas convertidas | "
+                            f"{total_fallidos} sin valor fuente"
+                        ),
                     )
                     break
                 for row_id, val in rows:
+                    valor_num = to_num(val) if val is not None else None
+                    if val is not None and valor_num is None:
+                        total_fallidos += 1
+                        _log_event(
+                            "etl_conversion_fallida",
+                            level="WARNING",
+                            msg=(
+                                f"{tabla}.{col_src} id={row_id} "
+                                f"valor_original={val!r}"
+                            ),
+                        )
                     await db.execute(
                         f"UPDATE {tabla} SET {col_num} = ? "
                         f"WHERE id = ?",
-                        (to_num(val) if val is not None else None,
-                         row_id),
+                        (valor_num, row_id),
                     )
                 last_id = rows[-1][0]
                 await db.commit()
@@ -139,15 +157,30 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
                 if batch_count % 10 == 0:
                     _log_event(
                         "etl_batch",
-                        msg=f"{tabla}.{col_num} | batch {batch_count} | {total_filas} filas acumuladas",
+                        msg=(
+                            f"{tabla}.{col_num} | "
+                            f"batch {batch_count} | "
+                            f"{total_filas} filas acumuladas"
+                        ),
                     )
 
 
 async def crear_views(db: aiosqlite.Connection) -> None:
-    """Crea o reemplaza las 7 VIEWs analíticas.
+    """Crea o reemplaza las VIEWs analíticas y de montos limpios.
 
     Usa DROP VIEW IF EXISTS antes de cada CREATE VIEW
     para garantizar idempotencia.
+
+    VIEWs analíticas (7): v_pedidos_activos, v_pedidos_cerrados,
+    v_inventario_comprometido, v_diferencias_resumen,
+    v_rendimiento_operadores, v_variaciones_timeline,
+    v_variaciones_operaciones.
+
+    VIEWs para el dashboard (4): v_lineas_pedido_num,
+    v_estadisticas_monto_num, v_gestion_diferencias_num,
+    v_detalle_diferencias_num. Exponen los valores monetarios
+    ya convertidos a REAL con nombres limpios (sin sufijo _num)
+    para que el dashboard los consuma directamente.
 
     Args:
         db: Conexión abierta a pedidos.db.
@@ -209,18 +242,18 @@ async def crear_views(db: aiosqlite.Connection) -> None:
             JOIN subpedidos s
                 ON l.id_pedido = s.id_pedido
                 AND l.numero_subpedido = s.numero_subpedido
-            WHERE s.estado IN (
-                'Pendiente de confirmación',
-                'Pendiente de pago (pago inmediato)',
-                'Pendiente de pago (crédito)',
-                'Pendiente de pago (contra entrega)',
-                'Pendiente de recolección',
-                'Aprobación de Pagos',
-                'Pendiente de envío (pago inmediato)',
-                'Pendiente de envío (crédito)',
-                'Pendiente de envío (contra entrega)',
-                'Pendiente de entrega',
-                'En inspección'
+            WHERE LOWER(s.estado) IN (
+                'pendiente de confirmación',
+                'pendiente de pago (pago inmediato)',
+                'pendiente de pago (crédito)',
+                'pendiente de pago (contra entrega)',
+                'pendiente de recolección',
+                'aprobación de pagos',
+                'pendiente de envío (pago inmediato)',
+                'pendiente de envío (crédito)',
+                'pendiente de envío (contra entrega)',
+                'pendiente de entrega',
+                'en inspección'
             )
             AND l.nombre_producto IS NOT NULL
             AND l.nombre_producto != ''
@@ -299,6 +332,78 @@ async def crear_views(db: aiosqlite.Connection) -> None:
             GROUP BY accion, tipo_usuario
             ORDER BY total_ocurrencias DESC
         """,
+
+        # ── VIEWs para el dashboard ────────────────────────────────────
+        # Exponen los valores monetarios ya convertidos a REAL con
+        # nombres limpios (sin sufijo _num). El dashboard lee estas
+        # views en lugar de las tablas base.
+        # Ejemplo: precio_unitario = 1940.0 en lugar de "COP 1.940"
+        "v_lineas_pedido_num": """
+            SELECT
+                l.id,
+                l.id_pedido,
+                l.numero_subpedido,
+                l.tipo_subpedido,
+                l.nombre_producto,
+                l.referencia,
+                l.codigo_barras,
+                l.presentacion,
+                l.almacen,
+                l.cantidad_comprada,
+                l.cantidad_entregada,
+                l.precio_unitario_num   AS precio_unitario,
+                l.descuento_num         AS descuento,
+                l.precio_descuento_num  AS precio_descuento,
+                l.monto_pagar_num       AS monto_pagar,
+                l.monto_final_num       AS monto_final,
+                l.iva_num               AS iva,
+                l.peso_total_num        AS peso_total,
+                l.observaciones,
+                l.numero_caja,
+                l.tipo
+            FROM lineas_pedido l
+        """,
+        "v_estadisticas_monto_num": """
+            SELECT
+                e.id,
+                e.id_pedido,
+                e.orden,
+                e.concepto,
+                e.concepto_tag,
+                e.monto_pagar_num   AS monto_pagar,
+                e.monto_final_num   AS monto_final,
+                e.diferencia_num    AS diferencia
+            FROM estadisticas_monto e
+        """,
+        "v_gestion_diferencias_num": """
+            SELECT
+                g.id,
+                g.id_pedido,
+                g.total_pagar_pedido_num  AS total_pagar_pedido,
+                g.monto_final_pagar_num   AS monto_final_pagar,
+                g.monto_pagado_num        AS monto_pagado,
+                g.monto_diferencia_num    AS monto_diferencia
+            FROM gestion_diferencias g
+        """,
+        "v_detalle_diferencias_num": """
+            SELECT
+                d.id,
+                d.id_pedido,
+                d.nombre_producto,
+                d.especificacion,
+                d.tipo,
+                d.precio_unitario_num        AS precio_unitario,
+                d.descuento_num              AS descuento,
+                d.precio_descuento_num       AS precio_descuento,
+                d.cantidad_pedido_num        AS cantidad_pedido,
+                d.cantidad_entregada_num     AS cantidad_entregada,
+                d.diferencia_cantidad_num    AS diferencia_cantidad,
+                d.monto_pagar_pedido_num     AS monto_pagar_pedido,
+                d.monto_final_pagar_num      AS monto_final_pagar,
+                d.iva_num                    AS iva,
+                d.monto_diferencia_num       AS monto_diferencia
+            FROM detalle_diferencias d
+        """,
     }
 
     for nombre, sql in views.items():
@@ -322,10 +427,19 @@ async def main() -> None:
     try:
         async with aiosqlite.connect(db_path) as db:
             await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=5000")
             await db.execute("PRAGMA foreign_keys=ON")
             await normalizar_montos(db)
             await crear_views(db)
-            await db.commit()
+            row = await (await db.execute(
+                "SELECT COUNT(*) FROM v_rendimiento_operadores"
+            )).fetchone()
+            if row and row[0] == 0:
+                _log_event(
+                    "etl_view_vacia",
+                    level="WARNING",
+                    msg="v_rendimiento_operadores retorna 0 filas — verificar acciones hardcodeadas en WHERE",
+                )
         _log_event("etl_completado", db_path=db_path)
         sys.exit(0)
     except Exception as exc:
