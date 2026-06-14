@@ -144,6 +144,7 @@ else:
             "⚠ Dif.":       st.column_config.TextColumn(width="small"),
             "Días abierto": st.column_config.NumberColumn(format="%d días", width="small"),
             "Días sin mov.":st.column_config.NumberColumn(format="%d días", width="small"),
+            "Estado estancado": st.column_config.TextColumn(width="medium"),
             "Subpedidos":   st.column_config.NumberColumn(format="%d",      width="small"),
             "Sub. abiertos":st.column_config.NumberColumn(format="%d",      width="small"),
         },

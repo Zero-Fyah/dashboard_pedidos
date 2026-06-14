@@ -6,6 +6,9 @@ import streamlit as st
 
 DB_PATH = Path(__file__).parent.parent / "data" / "pedidos.db"
 ESTADOS_CERRADOS = ("completado", "cancelado", "comentado")
+# Lista de estados de cierre lista para interpolar en IN (...) / NOT IN (...).
+# Único origen de verdad para los filtros SQL de "activo"/"cerrado" del módulo.
+_cerr = ",".join(f"'{e}'" for e in ESTADOS_CERRADOS)
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _num_cols_exist() -> bool:
@@ -166,16 +169,16 @@ def get_pedidos(
         params_join_alm = list(almacenes)
 
     if estado_pedido == "Abiertos":
-        filtro_estado_pedido = """AND EXISTS (
+        filtro_estado_pedido = f"""AND EXISTS (
             SELECT 1 FROM subpedidos s2
             WHERE s2.id_pedido = p.id_pedido
-              AND LOWER(s2.estado) NOT IN ('completado', 'cancelado', 'comentado')
+              AND LOWER(s2.estado) NOT IN ({_cerr})
         )"""
     elif estado_pedido == "Cerrados":
-        filtro_estado_pedido = """AND NOT EXISTS (
+        filtro_estado_pedido = f"""AND NOT EXISTS (
             SELECT 1 FROM subpedidos s2
             WHERE s2.id_pedido = p.id_pedido
-              AND LOWER(s2.estado) NOT IN ('completado', 'cancelado', 'comentado')
+              AND LOWER(s2.estado) NOT IN ({_cerr})
         )"""
     else:
         filtro_estado_pedido = ""
@@ -286,12 +289,28 @@ def get_pedidos_activos(
                 AS INTEGER
             )                                                   AS "Días abierto",
             CAST(
-                JULIANDAY(DATE('now')) - JULIANDAY(DATE(p.actualizado_en))
+                JULIANDAY(DATE('now'))
+                - JULIANDAY(DATE(
+                    MIN(CASE
+                        WHEN LOWER(s.estado) NOT IN ({_cerr})
+                        THEN s.estado_cambiado_en
+                        ELSE NULL
+                    END)
+                ))
                 AS INTEGER
             )                                                   AS "Días sin mov.",
+            (
+                SELECT sub2.estado
+                FROM subpedidos sub2
+                WHERE sub2.id_pedido = p.id_pedido
+                  AND LOWER(sub2.estado) NOT IN ({_cerr})
+                ORDER BY sub2.estado_cambiado_en ASC NULLS LAST,
+                         sub2.numero_subpedido   ASC
+                LIMIT 1
+            )                                                   AS "Estado estancado",
             COUNT(DISTINCT s.numero_subpedido)                  AS "Subpedidos",
             SUM(CASE WHEN LOWER(s.estado) NOT IN
-                ('completado','cancelado','comentado')
+                ({_cerr})
                 THEN 1 ELSE 0 END)                              AS "Sub. abiertos",
             GROUP_CONCAT(DISTINCT s.estado)                     AS "Estados"
         FROM pedidos p
@@ -300,7 +319,7 @@ def get_pedidos_activos(
           AND EXISTS (
               SELECT 1 FROM subpedidos s2
               WHERE s2.id_pedido = p.id_pedido
-                AND LOWER(s2.estado) NOT IN ('completado','cancelado','comentado')
+                AND LOWER(s2.estado) NOT IN ({_cerr})
           )
           {filtro_tipo}
           {filtro_estado}
