@@ -1644,6 +1644,66 @@ async def procesar_pedido(
 # PERSISTENCIA
 # ─────────────────────────────────────────────
 
+async def _actualizar_estado_subpedido(
+    db,
+    id_pedido: str,
+    numero_subpedido: str,
+    estado_scrapeado: str,
+) -> str:
+    """Actualiza estado + estado_cambiado_en de un subpedido solo si el estado cambió.
+
+    Compara el estado recién scrapeado contra el almacenado, ignorando
+    diferencias de capitalización y espacios (la comparación usa
+    strip().lower(); el valor que se guarda es el original de la SPA).
+    Debe invocarse dentro de una transacción ya abierta (BEGIN) sobre db;
+    no hace commit y usa el mismo objeto de conexión para SELECT y UPDATE.
+
+    Args:
+        db: Conexión aiosqlite con una transacción abierta.
+        id_pedido: ID del pedido.
+        numero_subpedido: Identificador del subpedido dentro del pedido.
+        estado_scrapeado: Estado recién extraído de la SPA (sin normalizar).
+
+    Returns:
+        "actualizado"   — el estado cambió; se actualizó estado + estado_cambiado_en.
+        "sin_cambio"    — el estado coincide (ignorando case/espacios); no se tocó nada.
+        "no_encontrado" — no existe fila para (id_pedido, numero_subpedido); se loggeó WARNING.
+    """
+    fila = await (await db.execute(
+        "SELECT estado FROM subpedidos "
+        "WHERE id_pedido = ? AND numero_subpedido = ?",
+        (id_pedido, numero_subpedido),
+    )).fetchone()
+
+    if fila is None:
+        log_event(
+            "subpedido_no_encontrado",
+            level="WARNING",
+            id_pedido=id_pedido,
+            msg=(
+                f"subpedido {numero_subpedido} no existe en DB — "
+                f"estado no actualizado (scrapeado: '{estado_scrapeado}')"
+            ),
+        )
+        return "no_encontrado"
+
+    estado_en_db = fila[0]
+    if (estado_en_db or "").strip().lower() != (estado_scrapeado or "").strip().lower():
+        await db.execute(
+            "UPDATE subpedidos SET estado = ?, estado_cambiado_en = ? "
+            "WHERE id_pedido = ? AND numero_subpedido = ?",
+            (
+                estado_scrapeado,
+                datetime.now(timezone.utc).isoformat(),
+                id_pedido,
+                numero_subpedido,
+            ),
+        )
+        return "actualizado"
+
+    return "sin_cambio"
+
+
 async def persistencia_worker(
     resultados_queue: asyncio.Queue,
     db_path: str,
@@ -1793,16 +1853,19 @@ async def persistencia_worker(
                         await db.execute("DELETE FROM subpedidos     WHERE id_pedido = ?", (id_pedido,))
                         await db.execute("DELETE FROM lineas_pedido  WHERE id_pedido = ?", (id_pedido,))
 
+                        ts_completo = datetime.now(timezone.utc).isoformat()
                         await db.executemany(
                             """
                             INSERT INTO subpedidos (
                                 id_pedido, numero_subpedido, tipo_subpedido, estado,
                                 inicio_alistamiento, alistamiento_completado, alistador,
-                                inicio_inspeccion, inspeccion_completada, inspector
+                                inicio_inspeccion, inspeccion_completada, inspector,
+                                estado_cambiado_en
                             ) VALUES (
                                 :id_pedido, :numero_subpedido, :tipo_subpedido, :estado,
                                 :inicio_alistamiento, :alistamiento_completado, :alistador,
-                                :inicio_inspeccion, :inspeccion_completada, :inspector
+                                :inicio_inspeccion, :inspeccion_completada, :inspector,
+                                :estado_cambiado_en
                             )
                             """,
                             [
@@ -1817,6 +1880,7 @@ async def persistencia_worker(
                                     "inicio_inspeccion":       sp["inicio_inspeccion"],
                                     "inspeccion_completada":   sp["inspeccion_completada"],
                                     "inspector":               sp["inspector"],
+                                    "estado_cambiado_en":      ts_completo,
                                 }
                                 for sp in subped
                             ],
@@ -2032,10 +2096,27 @@ async def persistencia_worker(
                                         f"subpedido {num_sub}"
                                     ),
                                 )
+                        # Estado / estado_cambiado_en: la función auxiliar decide su
+                        # propio UPDATE condicional (solo escribe si el estado cambió,
+                        # ignorando diferencias de capitalización) y maneja el caso
+                        # "fila no encontrada" con WARNING. Misma lógica que solo_estado.
+                        await _actualizar_estado_subpedido(
+                            db, id_pedido, num_sub, sp["estado"]
+                        )
+                        # cantidades_definitivas: segundo UPDATE SEPARADO e
+                        # INCONDICIONAL. Se ejecuta siempre, sin importar si el estado
+                        # cambió o no — preserva el comportamiento previo (cantidades
+                        # marcadas como definitivas en cada pasada con_cantidades).
+                        # El orden relativo a la llamada anterior es indiferente:
+                        # ambas operan sobre columnas distintas de la misma fila,
+                        # dentro de la misma transacción ya abierta. Si la fila no
+                        # existe, este UPDATE es un no-op (rowcount 0), sin reportar
+                        # nada adicional aquí — el caso "fila no encontrada" ya fue
+                        # loggeado con WARNING por la llamada anterior.
                         await db.execute(
-                            "UPDATE subpedidos SET estado = ?, cantidades_definitivas = 1 "
+                            "UPDATE subpedidos SET cantidades_definitivas = 1 "
                             "WHERE id_pedido = ? AND numero_subpedido = ?",
-                            (sp["estado"], id_pedido, num_sub),
+                            (id_pedido, num_sub),
                         )
 
                     timeline = resultado.get("timeline", [])
@@ -2141,10 +2222,8 @@ async def persistencia_worker(
                     await db.execute("BEGIN")
 
                     for sp in resultado["subpedidos"]:
-                        await db.execute(
-                            "UPDATE subpedidos SET estado = ? "
-                            "WHERE id_pedido = ? AND numero_subpedido = ?",
-                            (sp["estado"], id_pedido, sp["numero_subpedido"]),
+                        await _actualizar_estado_subpedido(
+                            db, id_pedido, sp["numero_subpedido"], sp["estado"]
                         )
 
                     timeline = resultado.get("timeline", [])
