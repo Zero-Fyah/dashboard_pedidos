@@ -22,6 +22,9 @@ __pycache__/
 
 # Base de datos — cobertura ampliada (cubre pedidos.db en raíz y cualquier otra DB)
 *.db
+# Artefactos volátiles de SQLite en modo WAL (write-ahead log e índice compartido)
+*.db-shm
+*.db-wal
 
 # Credenciales adicionales
 .env.local
