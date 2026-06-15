@@ -515,6 +515,7 @@ async def init_db(db_path: str) -> None:
             "ALTER TABLE pedidos ADD COLUMN entrega_descuento_tag TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN hay_diferencia        INTEGER DEFAULT 0",
             "ALTER TABLE subpedidos ADD COLUMN cantidades_definitivas INTEGER DEFAULT 0",
+            "ALTER TABLE subpedidos ADD COLUMN estado_cambiado_en TEXT DEFAULT NULL",
             "ALTER TABLE lineas_pedido ADD COLUMN numero_caja     TEXT    DEFAULT NULL",
             "ALTER TABLE lineas_pedido ADD COLUMN tipo            TEXT    DEFAULT NULL",
         ):
