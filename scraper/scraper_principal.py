@@ -835,7 +835,7 @@ async def extraer_info_entrega(page: Page, id_pedido: str) -> dict:
 
 async def extraer_estadisticas_monto(
     page: Page, id_pedido: str
-) -> tuple[list[dict], bool]:
+) -> tuple[list[dict], bool | None]:
     """Extrae la tabla 'Estadísticas de monto del pedido'.
 
     Las filas son dinámicas (N variable según el pedido y los descuentos
@@ -844,10 +844,13 @@ async def extraer_estadisticas_monto(
 
     Returns:
         Tupla (lista_filas, hay_diferencia).
-        Lista vacía y False si el card no existe.
+        hay_diferencia es True/False si el card se pudo leer, o None si
+        no se pudo verificar (card ausente o excepción).
     """
     filas_data: list[dict] = []
-    hay_diferencia = False
+    # FIX C-3 (auditoría 2026-07-01): None = no verificado (card ausente
+    # o excepción). Distingue "sin diferencia" de "no se pudo comprobar".
+    hay_diferencia: bool | None = None
     try:
         card = await page.query_selector(".amount-statistics-card")
         if not card:
@@ -857,8 +860,8 @@ async def extraer_estadisticas_monto(
             ".statistics-header .el-tag--warning, "
             ".statistics-header .el-tag--dark"
         )
-        if tag_dif:
-            hay_diferencia = True
+        # FIX C-3: card presente → estado verificado (True o False)
+        hay_diferencia = tag_dif is not None
 
         filas = await card.query_selector_all(
             ".amount-statistics-table tbody tr"
@@ -916,6 +919,7 @@ async def extraer_estadisticas_monto(
             level="WARNING",
             msg=str(exc),
         )
+        hay_diferencia = None  # FIX C-3: excepción → estado no verificado
     return filas_data, hay_diferencia
 
 
@@ -1511,7 +1515,8 @@ async def procesar_pedido(
                     "timeline":     timeline,
                     "info_entrega":   info_entrega,
                     "estadisticas":   estadisticas,
-                    "hay_diferencia": 1 if hay_dif else 0,
+                    # FIX C-3: None se propaga como "no verificado"
+                    "hay_diferencia": None if hay_dif is None else (1 if hay_dif else 0),
                     "gestion_dif":    gestion_dif,
                     "detalle_dif":    detalle_dif,
                     "registro_ops":   registro_ops,
@@ -1533,7 +1538,8 @@ async def procesar_pedido(
                     "timeline":   timeline,
                     "info_entrega":   info_entrega,
                     "estadisticas":   estadisticas,
-                    "hay_diferencia": 1 if hay_dif else 0,
+                    # FIX C-3: None se propaga como "no verificado"
+                    "hay_diferencia": None if hay_dif is None else (1 if hay_dif else 0),
                     "gestion_dif":    gestion_dif,
                     "detalle_dif":    detalle_dif,
                     "registro_ops":   registro_ops,
@@ -1585,7 +1591,8 @@ async def procesar_pedido(
                     "timeline":   timeline,
                     "info_entrega":   None,
                     "estadisticas":   estadisticas,
-                    "hay_diferencia": 1 if hay_dif else 0,
+                    # FIX C-3: None se propaga como "no verificado"
+                    "hay_diferencia": None if hay_dif is None else (1 if hay_dif else 0),
                     "gestion_dif":    gestion_dif,
                     "detalle_dif":    detalle_dif,
                     "registro_ops":   registro_ops,
@@ -1936,10 +1943,21 @@ async def persistencia_worker(
                             id_pedido=id_pedido,
                         )
 
-                    await db.execute(
-                        "UPDATE pedidos SET scraping_completo = 1, actualizado_en = ? WHERE id_pedido = ?",
-                        (datetime.now(timezone.utc).isoformat(), id_pedido),
-                    )
+                    # FIX C-2 (auditoría 2026-07-01): no cerrar scraping_completo
+                    # sin subpedidos extraídos. Si subped vino vacío, se conserva
+                    # el valor actual (0 en pedidos nuevos) para que
+                    # determinar_modo() re-extraiga en modo completo en la
+                    # próxima corrida.
+                    if subped:
+                        await db.execute(
+                            "UPDATE pedidos SET scraping_completo = 1, actualizado_en = ? WHERE id_pedido = ?",
+                            (datetime.now(timezone.utc).isoformat(), id_pedido),
+                        )
+                    else:
+                        await db.execute(
+                            "UPDATE pedidos SET actualizado_en = ? WHERE id_pedido = ?",
+                            (datetime.now(timezone.utc).isoformat(), id_pedido),
+                        )
 
                     info_e = resultado.get("info_entrega") or {}
                     await db.execute(
@@ -1952,8 +1970,7 @@ async def persistencia_worker(
                             hora_entrega          = :he,
                             obs_entrega           = :oe,
                             entrega_ruta_tag      = :ert,
-                            entrega_descuento_tag = :edt,
-                            hay_diferencia        = :hd
+                            entrega_descuento_tag = :edt
                         WHERE id_pedido = :pid
                         """,
                         {
@@ -1965,10 +1982,18 @@ async def persistencia_worker(
                             "oe":   info_e.get("obs_entrega", ""),
                             "ert":  info_e.get("entrega_ruta_tag", ""),
                             "edt":  info_e.get("entrega_descuento_tag", ""),
-                            "hd":   resultado.get("hay_diferencia", 0),
                             "pid":  id_pedido,
                         },
                     )
+
+                    # FIX C-3 (auditoría 2026-07-01): hay_diferencia solo se
+                    # actualiza si se pudo verificar (None = card no leído).
+                    _hd = resultado.get("hay_diferencia")
+                    if _hd is not None:
+                        await db.execute(
+                            "UPDATE pedidos SET hay_diferencia = ? WHERE id_pedido = ?",
+                            (_hd, id_pedido),
+                        )
 
                     # HAL-004: DELETE movido dentro de if para evitar
                     # borrar datos existentes cuando la extracción retorna vacío
@@ -2133,10 +2158,14 @@ async def persistencia_worker(
                             timeline,
                         )
 
-                    await db.execute(
-                        "UPDATE pedidos SET hay_diferencia = ? WHERE id_pedido = ?",
-                        (resultado.get("hay_diferencia", 0), id_pedido),
-                    )
+                    # FIX C-3 (auditoría 2026-07-01): no pisar hay_diferencia
+                    # cuando no se pudo verificar (card no renderizado).
+                    _hd = resultado.get("hay_diferencia")
+                    if _hd is not None:
+                        await db.execute(
+                            "UPDATE pedidos SET hay_diferencia = ? WHERE id_pedido = ?",
+                            (_hd, id_pedido),
+                        )
 
                     # HAL-004: DELETE movido dentro de if — sin WARNING en
                     # con_cantidades porque el modo no garantiza renderizado
@@ -2260,10 +2289,14 @@ async def persistencia_worker(
                             (ts_ahora, id_pedido),
                         )
 
-                    await db.execute(
-                        "UPDATE pedidos SET hay_diferencia = ? WHERE id_pedido = ?",
-                        (resultado.get("hay_diferencia", 0), id_pedido),
-                    )
+                    # FIX C-3 (auditoría 2026-07-01): no pisar hay_diferencia
+                    # cuando no se pudo verificar (card no renderizado).
+                    _hd = resultado.get("hay_diferencia")
+                    if _hd is not None:
+                        await db.execute(
+                            "UPDATE pedidos SET hay_diferencia = ? WHERE id_pedido = ?",
+                            (_hd, id_pedido),
+                        )
 
                     # HAL-004: DELETE movido dentro de if — sin WARNING en
                     # solo_estado porque el modo no garantiza renderizado

@@ -235,7 +235,10 @@ async def crear_views(db: aiosqlite.Connection) -> None:
                     AS cantidad_comprometida_total,
                 SUM(l.cantidad_entregada)
                     AS cantidad_entregada_total,
-                SUM(l.cantidad_comprada - l.cantidad_entregada)
+                -- FIX C-4 (auditoría 2026-07-01): COALESCE evita que
+                -- cantidad_entregada NULL anule la fila entera en el SUM
+                -- (x - NULL = NULL y SUM ignora NULLs → subcuenta Pendiente)
+                SUM(l.cantidad_comprada - COALESCE(l.cantidad_entregada, 0))
                     AS cantidad_pendiente,
                 COUNT(DISTINCT l.id_pedido) AS pedidos_activos
             FROM lineas_pedido l
