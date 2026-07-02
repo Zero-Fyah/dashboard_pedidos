@@ -56,3 +56,17 @@ def test_modo_solo_estado_todos_definitivos():
     """Todos los subs con cantidades definitivas → solo_estado."""
     subs = [("completado", 1), ("cancelado", 1)]
     assert determinar_modo(False, subs) == "solo_estado"
+
+
+@pytest.mark.unit
+def test_modo_completo_si_scraping_incompleto():
+    """BUG-015 / FIX C-2: scraping_completo=0 fuerza re-extracción completa.
+
+    Es la garantía de recuperación del FIX C-2: un pedido que quedó con
+    scraping_completo=0 (extracción de subpedidos vacía) debe re-extraerse
+    en modo completo aunque ya exista en DB.
+    """
+    assert determinar_modo(False, [], scraping_completo=0) == "completo"
+    assert determinar_modo(
+        False, [("en alistamiento", 0)], scraping_completo=0
+    ) == "completo"

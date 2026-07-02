@@ -309,3 +309,151 @@ async def test_update_sin_match_codigo_barras_vacio(db_path, pedido_sin_diferenc
         )).fetchone()
     assert row is not None
     assert row[0] == "TEST-BAR-EMPTY"
+
+
+# ── FIX C-2 (auditoría 2026-07-01) — scraping_completo condicional ─────────────
+
+async def _leer_scraping_completo(db_path: str, id_pedido: str = "TEST-001") -> int:
+    async with aiosqlite.connect(db_path) as db:
+        row = await (await db.execute(
+            "SELECT scraping_completo FROM pedidos WHERE id_pedido = ?",
+            (id_pedido,),
+        )).fetchone()
+    assert row is not None
+    return row[0]
+
+
+@pytest.mark.integration
+async def test_completo_sin_subpedidos_no_marca_scraping_completo(
+    db_path, pedido_sin_diferencias
+):
+    """FIX C-2: pedido nuevo con extracción de subpedidos vacía NO se marca
+    completo — queda scraping_completo=0 para re-extracción en modo completo."""
+    pedido_sin_diferencias["subpedidos"] = []
+    await persistir_uno(pedido_sin_diferencias, db_path)
+    assert await _leer_scraping_completo(db_path) == 0
+
+
+@pytest.mark.integration
+async def test_completo_sin_subpedidos_preserva_estado_previo(
+    db_path, pedido_sin_diferencias
+):
+    """FIX C-2: re-scrape completo con extracción vacía no degrada un pedido
+    ya completo — conserva scraping_completo=1 y sus subpedidos."""
+    await persistir_uno(pedido_sin_diferencias, db_path)
+    assert await _leer_scraping_completo(db_path) == 1
+
+    vacio = copy.deepcopy(_PEDIDO_BASE)
+    vacio["subpedidos"] = []
+    await persistir_uno(vacio, db_path)
+
+    assert await _leer_scraping_completo(db_path) == 1
+    async with aiosqlite.connect(db_path) as db:
+        count = (await (await db.execute(
+            "SELECT COUNT(*) FROM subpedidos WHERE id_pedido = 'TEST-001'"
+        )).fetchone())[0]
+    assert count == 1
+
+
+@pytest.mark.integration
+async def test_completo_recupera_pedido_tras_extraccion_vacia(
+    db_path, pedido_sin_diferencias
+):
+    """FIX C-2: el pedido que quedó incompleto se completa en la pasada
+    siguiente cuando la extracción sí trae subpedidos."""
+    vacio = copy.deepcopy(_PEDIDO_BASE)
+    vacio["subpedidos"] = []
+    await persistir_uno(vacio, db_path)
+    assert await _leer_scraping_completo(db_path) == 0
+
+    await persistir_uno(pedido_sin_diferencias, db_path)
+    assert await _leer_scraping_completo(db_path) == 1
+    async with aiosqlite.connect(db_path) as db:
+        count = (await (await db.execute(
+            "SELECT COUNT(*) FROM subpedidos WHERE id_pedido = 'TEST-001'"
+        )).fetchone())[0]
+    assert count == 1
+
+
+# ── FIX C-3 (auditoría 2026-07-01) — hay_diferencia tri-estado ─────────────────
+
+async def _leer_hay_diferencia(db_path: str, id_pedido: str = "TEST-001") -> int:
+    async with aiosqlite.connect(db_path) as db:
+        row = await (await db.execute(
+            "SELECT hay_diferencia FROM pedidos WHERE id_pedido = ?",
+            (id_pedido,),
+        )).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def _resultado_solo_estado(hay_diferencia) -> dict:
+    return {
+        "tipo": "solo_estado", "id_pedido": "TEST-001",
+        "subpedidos": [{"numero_subpedido": "SUB-001", "estado": "en alistamiento"}],
+        "timeline": [], "estadisticas": [], "hay_diferencia": hay_diferencia,
+        "gestion_dif": None, "detalle_dif": [], "registro_ops": [],
+    }
+
+
+@pytest.mark.integration
+async def test_hay_diferencia_none_no_pisa_en_solo_estado(
+    db_path, pedido_sin_diferencias
+):
+    """FIX C-3: hay_diferencia=None (card no verificado) NO sobreescribe
+    el valor confirmado en una pasada anterior."""
+    pedido_sin_diferencias["hay_diferencia"] = 1
+    await persistir_uno(pedido_sin_diferencias, db_path)
+    assert await _leer_hay_diferencia(db_path) == 1
+
+    await persistir_uno(_resultado_solo_estado(None), db_path)
+    assert await _leer_hay_diferencia(db_path) == 1  # preservado
+
+
+@pytest.mark.integration
+async def test_hay_diferencia_cero_verificado_si_actualiza(
+    db_path, pedido_sin_diferencias
+):
+    """FIX C-3: hay_diferencia=0 verificado (card leído sin tag) SÍ
+    actualiza — una diferencia puede resolverse en el sistema origen."""
+    pedido_sin_diferencias["hay_diferencia"] = 1
+    await persistir_uno(pedido_sin_diferencias, db_path)
+
+    await persistir_uno(_resultado_solo_estado(0), db_path)
+    assert await _leer_hay_diferencia(db_path) == 0
+
+
+@pytest.mark.integration
+async def test_hay_diferencia_none_no_pisa_en_completo(
+    db_path, pedido_sin_diferencias
+):
+    """FIX C-3: la rama completo también omite el UPDATE cuando None."""
+    pedido_sin_diferencias["hay_diferencia"] = 1
+    await persistir_uno(pedido_sin_diferencias, db_path)
+
+    p2 = copy.deepcopy(_PEDIDO_BASE)
+    p2["hay_diferencia"] = None
+    await persistir_uno(p2, db_path)
+    assert await _leer_hay_diferencia(db_path) == 1  # preservado
+
+
+@pytest.mark.integration
+async def test_hay_diferencia_none_no_pisa_en_con_cantidades(
+    db_path, pedido_sin_diferencias
+):
+    """FIX C-3: la rama con_cantidades también omite el UPDATE cuando None."""
+    pedido_sin_diferencias["hay_diferencia"] = 1
+    await persistir_uno(pedido_sin_diferencias, db_path)
+
+    con_cant = {
+        "tipo": "con_cantidades", "id_pedido": "TEST-001",
+        "subpedidos": [{
+            "numero_subpedido": "SUB-001",
+            "estado": "en alistamiento",
+            "lineas": [],
+        }],
+        "timeline": [], "estadisticas": [], "hay_diferencia": None,
+        "gestion_dif": None, "detalle_dif": [], "registro_ops": [],
+    }
+    await persistir_uno(con_cant, db_path)
+    assert await _leer_hay_diferencia(db_path) == 1  # preservado
