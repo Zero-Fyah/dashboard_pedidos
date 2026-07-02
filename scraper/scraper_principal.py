@@ -80,7 +80,7 @@ class ConfigDict(TypedDict):
     CIRCUIT_MAX_REOPENINGS: int
     RATE_LIMIT_WAIT_S: int
     NUM_WORKERS: int
-    QUEUE_MAXSIZE: int
+    RUN_TIMEOUT_S: int
     MAX_SCREENSHOTS: int
     MAX_HTML_DEBUG: int
     LOG_FILE: str
@@ -124,7 +124,12 @@ CONFIG: ConfigDict = {
 
     # Paralelismo
     "NUM_WORKERS":   5,
-    "QUEUE_MAXSIZE": 100,
+
+    # FIX C-1 (auditoría 2026-07-01): timeout global del run como red de
+    # seguridad de última instancia. Debe superar el peor caso legítimo:
+    # la carga histórica más larga registrada tomó ~5.5h (DEC-010) y el
+    # incremental estimado es 3-5h.
+    "RUN_TIMEOUT_S": 8 * 3600,
 
     # Observabilidad
     "MAX_SCREENSHOTS": 50,
@@ -2595,7 +2600,11 @@ async def main(args: argparse.Namespace) -> None:
             contexts.append(ctx)
 
         # — Paso 4: colas y tasks —
-        pedidos_queue:    asyncio.Queue = asyncio.Queue(maxsize=CONFIG["QUEUE_MAXSIZE"])
+        # FIX C-1 (auditoría 2026-07-01): pedidos_queue sin maxsize. Con cota,
+        # _fill() quedaba bloqueado para siempre en put() si todos los workers
+        # morían por circuit breaker (deadlock del orquestador). Los IDs son
+        # strings: la cota no protegía nada real.
+        pedidos_queue:    asyncio.Queue = asyncio.Queue()
         resultados_queue: asyncio.Queue = asyncio.Queue()
 
         persist_task = asyncio.create_task(
@@ -2619,9 +2628,28 @@ async def main(args: argparse.Namespace) -> None:
                 await pedidos_queue.put(None)
 
         fill_task = asyncio.create_task(_fill())
-        results = await asyncio.gather(
-            fill_task, *worker_tasks, return_exceptions=True
-        )
+        # FIX C-1: timeout global de red de seguridad — si algo cuelga pese a
+        # los timeouts locales, el run cancela los workers y termina con ERROR
+        # en el log en vez de quedar congelado bajo el Task Scheduler.
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(fill_task, *worker_tasks, return_exceptions=True),
+                timeout=CONFIG["RUN_TIMEOUT_S"],
+            )
+        except asyncio.TimeoutError:
+            log_event(
+                "run_timeout",
+                level="ERROR",
+                msg=(
+                    f"Timeout global de {CONFIG['RUN_TIMEOUT_S']}s alcanzado — "
+                    "cancelando workers y cerrando el run"
+                ),
+            )
+            # wait_for ya canceló el gather; re-esperar las tasks recoge
+            # los CancelledError sin relanzarlos.
+            results = await asyncio.gather(
+                fill_task, *worker_tasks, return_exceptions=True
+            )
         for wid, res in enumerate(results[1:], start=0):  # [0] es fill_task
             if isinstance(res, BaseException):
                 log_event(
@@ -2630,6 +2658,29 @@ async def main(args: argparse.Namespace) -> None:
                     worker_id=wid,
                     msg=repr(res),
                 )
+
+        # FIX C-1: si los workers terminaron (circuit breaker o cancelación)
+        # dejando IDs sin consumir, registrarlos como error para que el
+        # dead-letter de este mismo run o la próxima corrida incremental
+        # los reintente. Se drena aquí — nunca dentro del worker — para no
+        # robarle pedidos a workers que sigan vivos.
+        sin_procesar = 0
+        while not pedidos_queue.empty():
+            pid_pendiente = pedidos_queue.get_nowait()
+            if pid_pendiente is None:
+                continue
+            sin_procesar += 1
+            await resultados_queue.put({
+                "id_pedido": pid_pendiente,
+                "_error":    True,
+                "detalle":   "No procesado — workers terminados antes de vaciar la cola",
+            })
+        if sin_procesar:
+            log_event(
+                "cola_drenada",
+                level="WARNING",
+                msg=f"{sin_procesar} pedidos sin procesar registrados en errores",
+            )
         await resultados_queue.put(None)
         await persist_task
 
