@@ -12,7 +12,7 @@ Estimación de tiempo (modo incremental con 3 workers):
 
 Uso:
     # Carga histórica completa (primera vez)
-    py scraper_principal.py --desde 2026-05-01 --hasta 2026-05-21 --modo completo
+    py scraper_principal.py --desde 2026-01-01 --hasta 2026-05-21 --modo completo
 
     # Actualización incremental (uso normal, cada 2 horas)
     py scraper_principal.py --modo incremental
@@ -2802,7 +2802,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--desde",
-        default="2026-05-01",
+        default="2026-01-01",
         help="Fecha inicio YYYY-MM-DD",
     )
     parser.add_argument(
