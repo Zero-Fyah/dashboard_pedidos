@@ -6,13 +6,13 @@ Scraper asíncrono de pedidos para sistema administrativo interno (SPA Vue.js + 
 Configuración recomendada: NUM_WORKERS=5, PAUSA_ENTRE_PEDIDOS_S=1.2,
 MAX_REINTENTOS=5, NAV_TIMEOUT_MS=45s
 
-Estimación de tiempo (modo incremental con 3 workers):
+Estimación de tiempo (modo incremental con 5 workers):
     Activos + errores: ~3-5 horas dependiendo del volumen
     Pedidos nuevos del día: ~3-8 minutos
 
 Uso:
     # Carga histórica completa (primera vez)
-    py scraper_principal.py --desde 2026-01-01 --hasta 2026-05-21 --modo completo
+    py scraper_principal.py --desde 2026-05-01 --hasta 2026-05-21 --modo completo
 
     # Actualización incremental (uso normal, cada 2 horas)
     py scraper_principal.py --modo incremental
@@ -2800,7 +2800,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--desde",
-        default="2026-01-01",
+        default="2026-05-01",
         help="Fecha inicio YYYY-MM-DD",
     )
     parser.add_argument(

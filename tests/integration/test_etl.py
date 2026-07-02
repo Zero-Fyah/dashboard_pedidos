@@ -52,7 +52,7 @@ async def test_normalizacion_es_idempotente(db_path):
 
 @pytest.mark.integration
 async def test_views_creadas(db_path):
-    """Las 7 VIEWs existen tras normalizar y crear_views.
+    """Las 11 VIEWs existen tras normalizar y crear_views.
 
     normalizar_montos debe ejecutarse primero porque
     v_diferencias_resumen referencia columnas _num de
@@ -67,6 +67,7 @@ async def test_views_creadas(db_path):
         views = {r[0] for r in await cursor.fetchall()}
 
     views_esperadas = {
+        # 7 VIEWs analíticas
         "v_pedidos_activos",
         "v_pedidos_cerrados",
         "v_inventario_comprometido",
@@ -74,6 +75,11 @@ async def test_views_creadas(db_path):
         "v_rendimiento_operadores",
         "v_variaciones_timeline",
         "v_variaciones_operaciones",
+        # 4 VIEWs para el dashboard (montos _num con nombres limpios)
+        "v_lineas_pedido_num",
+        "v_estadisticas_monto_num",
+        "v_gestion_diferencias_num",
+        "v_detalle_diferencias_num",
     }
     assert views_esperadas.issubset(views), (
         f"VIEWs faltantes: {views_esperadas - views}"
@@ -82,7 +88,11 @@ async def test_views_creadas(db_path):
 
 @pytest.mark.integration
 async def test_views_son_idempotentes(db_path):
-    """Ejecutar crear_views dos veces produce exactamente 7 VIEWs."""
+    """Ejecutar crear_views dos veces produce exactamente 11 VIEWs.
+
+    11 = 7 analíticas + 4 del dashboard. Actualizado 2026-07-02: el test
+    esperaba 7 desde antes de que se agregaran las views del dashboard.
+    """
     async with aiosqlite.connect(db_path) as db:
         await normalizar_montos(db)   # ← obligatorio primero
         await crear_views(db)
@@ -90,7 +100,7 @@ async def test_views_son_idempotentes(db_path):
         count = (await (await db.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='view'"
         )).fetchone())[0]
-    assert count == 7
+    assert count == 11
 
 
 # ── FIX C-4 (auditoría 2026-07-01) — COALESCE en cantidad_pendiente ────────────
