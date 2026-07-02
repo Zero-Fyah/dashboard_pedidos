@@ -13,10 +13,27 @@ import json
 import logging
 import aiosqlite
 from datetime import datetime, timezone
-from scraper.scraper_principal import to_num, get_db_path
+
+# AUD-M5 (auditoría 2026-07-01): importar del módulo común — el ETL ya no
+# carga el scraper (ni Playwright, ni sus efectos secundarios de import).
+from comun import (
+    ESTADOS_ACTIVOS_INVENTARIO,
+    ESTADOS_CERRADOS,
+    ESTADOS_CONOCIDOS,
+    get_db_path,
+    to_num,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("etl")
+
+# AUD-M8 (auditoría 2026-07-01): literales SQL generados desde las
+# constantes del módulo común — único origen de verdad para
+# "cerrado"/"activo" en las VIEWs. sorted() para SQL determinístico.
+_CERRADOS_SQL = ",".join(f"'{e}'" for e in sorted(ESTADOS_CERRADOS))
+_ACTIVOS_INVENTARIO_SQL = ",".join(
+    f"'{e}'" for e in ESTADOS_ACTIVOS_INVENTARIO
+)
 
 
 def _log_event(
@@ -186,7 +203,8 @@ async def crear_views(db: aiosqlite.Connection) -> None:
         db: Conexión abierta a pedidos.db.
     """
     views = {
-        "v_pedidos_activos": """
+        # AUD-M8: los literales de estados se generan desde comun/
+        "v_pedidos_activos": f"""
             SELECT
                 p.id_pedido,
                 p.fecha,
@@ -198,7 +216,7 @@ async def crear_views(db: aiosqlite.Connection) -> None:
                 p.actualizado_en,
                 COUNT(s.id) AS total_subpedidos,
                 SUM(CASE WHEN LOWER(s.estado) NOT IN
-                    ('completado','cancelado','comentado')
+                    ({_CERRADOS_SQL})
                     THEN 1 ELSE 0 END) AS subpedidos_abiertos
             FROM pedidos p
             JOIN subpedidos s ON p.id_pedido = s.id_pedido
@@ -206,7 +224,7 @@ async def crear_views(db: aiosqlite.Connection) -> None:
             GROUP BY p.id_pedido
             HAVING subpedidos_abiertos > 0
         """,
-        "v_pedidos_cerrados": """
+        "v_pedidos_cerrados": f"""
             SELECT
                 p.id_pedido,
                 p.fecha,
@@ -220,10 +238,10 @@ async def crear_views(db: aiosqlite.Connection) -> None:
             WHERE p.scraping_completo = 1
             GROUP BY p.id_pedido
             HAVING SUM(CASE WHEN LOWER(s.estado) NOT IN
-                ('completado','cancelado','comentado')
+                ({_CERRADOS_SQL})
                 THEN 1 ELSE 0 END) = 0
         """,
-        "v_inventario_comprometido": """
+        "v_inventario_comprometido": f"""
             SELECT
                 l.nombre_producto,
                 l.referencia,
@@ -245,19 +263,7 @@ async def crear_views(db: aiosqlite.Connection) -> None:
             JOIN subpedidos s
                 ON l.id_pedido = s.id_pedido
                 AND l.numero_subpedido = s.numero_subpedido
-            WHERE LOWER(s.estado) IN (
-                'pendiente de confirmación',
-                'pendiente de pago (pago inmediato)',
-                'pendiente de pago (crédito)',
-                'pendiente de pago (contra entrega)',
-                'pendiente de recolección',
-                'aprobación de pagos',
-                'pendiente de envío (pago inmediato)',
-                'pendiente de envío (crédito)',
-                'pendiente de envío (contra entrega)',
-                'pendiente de entrega',
-                'en inspección'
-            )
+            WHERE LOWER(s.estado) IN ({_ACTIVOS_INVENTARIO_SQL})
             AND l.nombre_producto IS NOT NULL
             AND l.nombre_producto != ''
             GROUP BY
@@ -442,6 +448,27 @@ async def main() -> None:
                     "etl_view_vacia",
                     level="WARNING",
                     msg="v_rendimiento_operadores retorna 0 filas — verificar acciones hardcodeadas en WHERE",
+                )
+
+            # AUD-M8 (auditoría 2026-07-01): check defensivo — un estado en
+            # DB fuera de las listas del módulo común indica que el sistema
+            # origen agregó o renombró estados; las VIEWs podrían estar
+            # excluyéndolo en silencio.
+            rows_est = await (await db.execute(
+                "SELECT DISTINCT LOWER(estado) FROM subpedidos "
+                "WHERE estado IS NOT NULL AND estado != ''"
+            )).fetchall()
+            desconocidos = sorted(
+                r[0] for r in rows_est if r[0] not in ESTADOS_CONOCIDOS
+            )
+            if desconocidos:
+                _log_event(
+                    "etl_estado_desconocido",
+                    level="WARNING",
+                    msg=(
+                        "Estados de subpedidos fuera de las listas conocidas "
+                        f"del módulo común: {desconocidos}"
+                    ),
                 )
         _log_event("etl_completado", db_path=db_path)
         sys.exit(0)

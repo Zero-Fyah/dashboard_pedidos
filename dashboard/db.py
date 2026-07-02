@@ -1,14 +1,21 @@
 import sqlite3
+import sys
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
+# AUD-M5/M8 (auditoría 2026-07-01): ESTADOS_CERRADOS vive en el módulo
+# común — único origen de verdad. El insert de sys.path permite resolver
+# `comun` cuando Streamlit ejecuta la app con dashboard/ como directorio
+# del script.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from comun import ESTADOS_CERRADOS
+
 DB_PATH = Path(__file__).parent.parent / "data" / "pedidos.db"
-ESTADOS_CERRADOS = ("completado", "cancelado", "comentado")
 # Lista de estados de cierre lista para interpolar en IN (...) / NOT IN (...).
-# Único origen de verdad para los filtros SQL de "activo"/"cerrado" del módulo.
-_cerr = ",".join(f"'{e}'" for e in ESTADOS_CERRADOS)
+# sorted() para SQL determinístico (frozenset no garantiza orden).
+_cerr = ",".join(f"'{e}'" for e in sorted(ESTADOS_CERRADOS))
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _num_cols_exist() -> bool:

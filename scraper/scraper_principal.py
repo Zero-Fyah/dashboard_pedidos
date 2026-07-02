@@ -43,6 +43,19 @@ from typing import TypedDict
 from dotenv import load_dotenv
 load_dotenv()
 
+# AUD-M5 (auditoría 2026-07-01): las utilidades puras y las constantes de
+# dominio viven en el módulo común (comun/). El insert de sys.path permite
+# ejecutar este archivo como script (py scraper/scraper_principal.py) además
+# de importarlo como paquete. Los nombres se re-exportan desde este módulo
+# para compatibilidad con importadores existentes (tests, migraciones).
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from comun import (
+    ESTADOS_CERRADOS,
+    ESTADOS_FIJAN_CANTIDADES,
+    get_db_path,
+    to_num,
+)
+
 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN
@@ -130,28 +143,8 @@ LOGIN_LOCK:      asyncio.Lock = asyncio.Lock()
 SCREENSHOT_LOCK: asyncio.Lock = asyncio.Lock()
 HTML_LOCK:       asyncio.Lock = asyncio.Lock()
 
-ESTADOS_CERRADOS: frozenset[str] = frozenset({
-    "completado",
-    "cancelado",
-    "comentado",
-})
-
-# Referencia histórica: estados del sistema que fijan
-# cantidades en el flujo operacional. Conservado como
-# documentación del dominio. con_cantidades usa
-# ESTADOS_CERRADOS desde la resolución de BUG-005 opción B.
-ESTADOS_FIJAN_CANTIDADES: frozenset[str] = frozenset({
-    "pendiente de confirmación",
-    "pendiente de envío (pago inmediato)",
-    "pendiente de envío (crédito)",
-    "pendiente de envío (contra entrega)",
-    "pendiente de entrega",
-    "enviado",
-    "período contable",
-    "completado",
-    "cancelado",
-    "comentado",
-})
+# ESTADOS_CERRADOS y ESTADOS_FIJAN_CANTIDADES viven en comun/ (AUD-M5/M8)
+# y se importan arriba — único origen de verdad para las listas de estados.
 
 
 # ─────────────────────────────────────────────
@@ -219,41 +212,7 @@ async def col_text(cols: list, i: int) -> str:
     return ""
 
 
-def to_num(val: str) -> float | None:
-    """Convierte un string numérico en formato español a float.
-
-    Elimina puntos de separador de miles y reemplaza la coma decimal por
-    punto. También elimina prefijos monetarios (COP) y sufijos de unidad
-    (g, kg, ml, l) que el scraper captura pegados al número.
-    Retorna None si el valor no es convertible (nunca lanza excepción).
-
-    Args:
-        val: String a convertir, ej. "1.234,56", "200", "402g", "1.5kg".
-
-    Returns:
-        Valor float, o None si la conversión falla.
-    """
-    try:
-        cleaned = val.strip()
-        # BUG-017: capturar signo negativo antes de strip del prefijo
-        # para manejar "-COP 137.706" además de "COP 137.706"
-        negative = cleaned.startswith("-")
-        if negative:
-            cleaned = cleaned[1:]
-        if cleaned.startswith("COP "):
-            cleaned = cleaned[4:]
-        # Eliminar sufijos de unidad pegados al número (ej: "402g", "1.5kg")
-        # Orden importa: kg/ml antes que g/l para no dejar letra suelta
-        for unit in ("kg", "ml", "mg", "g", "l"):
-            if cleaned.lower().endswith(unit):
-                cleaned = cleaned[: -len(unit)].strip()
-                break
-        cleaned = cleaned.replace(".", "").replace(",", ".")
-        if negative:
-            cleaned = "-" + cleaned
-        return float(cleaned)
-    except (ValueError, AttributeError):
-        return None
+# to_num() vive en comun/ (AUD-M5) y se importa arriba.
 
 
 # ─────────────────────────────────────────────
@@ -2484,19 +2443,7 @@ _USER_AGENTS: list[str] = [
 ]
 
 
-def get_db_path() -> str:
-    """Retorna la ruta absoluta a data/pedidos.db.
-
-    La ruta se calcula relativa a la ubicación de
-    este script, no al directorio de trabajo actual.
-    Crea data/ si no existe.
-
-    Returns:
-        Ruta absoluta como string a data/pedidos.db.
-    """
-    path = Path(__file__).parent.parent / "data" / "pedidos.db"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return str(path)
+# get_db_path() vive en comun/ (AUD-M5) y se importa arriba.
 
 
 async def main(args: argparse.Namespace) -> None:
@@ -2535,34 +2482,34 @@ async def main(args: argparse.Namespace) -> None:
         # ── Obtener lista de IDs ──────────────────────────────────────────
         if args.modo == "incremental":
 
+            # AUD-M8 (auditoría 2026-07-01): estados cerrados parametrizados
+            # desde la constante del módulo común — sin literales inline.
+            _cerr_ph = ",".join("?" * len(ESTADOS_CERRADOS))
+
             # Proceso 1 — Actualizar pedidos activos (sin recorrer páginas)
             async with aiosqlite.connect(db_path) as db_r:
-                rows = await (await db_r.execute("""
+                rows = await (await db_r.execute(f"""
                     SELECT DISTINCT p.id_pedido
                     FROM pedidos p
                     JOIN subpedidos s ON p.id_pedido = s.id_pedido
                     WHERE p.scraping_completo = 1
-                      AND LOWER(s.estado) NOT IN (
-                          'completado','cancelado','comentado'
-                      )
-                """)).fetchall()
+                      AND LOWER(s.estado) NOT IN ({_cerr_ph})
+                """, tuple(ESTADOS_CERRADOS))).fetchall()
             ids_activos = [r[0] for r in rows]
 
             # Proceso 2 — Reintentar pedidos con error
             async with aiosqlite.connect(db_path) as db_r:
-                rows = await (await db_r.execute("""
+                rows = await (await db_r.execute(f"""
                     SELECT DISTINCT id_pedido FROM errores
                     WHERE id_pedido NOT IN (
                         SELECT id_pedido FROM pedidos
                         WHERE scraping_completo = 1
                           AND id_pedido NOT IN (
                             SELECT DISTINCT id_pedido FROM subpedidos
-                            WHERE LOWER(estado) NOT IN (
-                                'completado','cancelado','comentado'
-                            )
+                            WHERE LOWER(estado) NOT IN ({_cerr_ph})
                           )
                     )
-                """)).fetchall()
+                """, tuple(ESTADOS_CERRADOS))).fetchall()
             ids_error = [r[0] for r in rows]
 
             # Proceso 3 — Capturar pedidos nuevos (solo ayer-hoy)
