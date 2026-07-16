@@ -3,7 +3,7 @@
 
 # dashboard_pedidos
 
-**Actualizado:** 2026-05-24
+**Actualizado:** 2026-07-16
 
 Scraper asíncrono de pedidos para un sistema administrativo interno (SPA Vue.js + Element Plus)
 de una empresa colombiana que gestiona su propia operación logística. Extrae pedidos, subpedidos,
@@ -46,7 +46,7 @@ scraper/scraper_principal.py
    │           Modo incremental (diario)            │
    │  1. Activos en DB   →  ids_activos[]           │
    │  2. Con errores     →  ids_error[]             │
-   │  3. Nuevos hoy      →  ids_nuevos[]            │
+   │  3. Nuevos (watermark) → ids_nuevos[]          │
    └────┬───────────────────────────────────────────┘
         │  ids_pendientes[] (unión sin duplicados)
         ▼
@@ -69,7 +69,7 @@ scraper/scraper_principal.py
         data/pedidos.db (SQLite · modo WAL)
                 │
                 ▼
-        etl/etl_principal.py   ← normalización de montos + 7 VIEWs analíticas
+        etl/etl_principal.py   ← normalización de montos + 11 VIEWs (7 analíticas + 4 dashboard)
 ```
 
 El pipeline continúa hacia `dashboard/app.py` (Streamlit), que consume `data/pedidos.db` directamente.
@@ -159,7 +159,7 @@ cd dashboard_pedidos
 
 # 2. Crear entorno virtual con Python 3.12 (DEC-015) e instalar dependencias
 py -3.12 -m venv .venv
-.venv\Scriptsctivate
+.venv\Scripts\activate
 pip install -r requirements.txt
 pip install -r requirements-dev.txt   # ruff, mypy, pytest-cov (desarrollo)
 
