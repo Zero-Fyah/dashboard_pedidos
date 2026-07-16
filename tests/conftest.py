@@ -1,4 +1,5 @@
 import pytest_asyncio
+
 from scraper.scraper_principal import init_db
 
 

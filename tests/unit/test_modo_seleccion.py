@@ -1,4 +1,5 @@
 import pytest
+
 from scraper.scraper_principal import determinar_modo
 
 
@@ -67,6 +68,4 @@ def test_modo_completo_si_scraping_incompleto():
     en modo completo aunque ya exista en DB.
     """
     assert determinar_modo(False, [], scraping_completo=0) == "completo"
-    assert determinar_modo(
-        False, [("en alistamiento", 0)], scraping_completo=0
-    ) == "completo"
+    assert determinar_modo(False, [("en alistamiento", 0)], scraping_completo=0) == "completo"

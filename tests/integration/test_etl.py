@@ -1,6 +1,7 @@
-import pytest
 import aiosqlite
-from etl.etl_principal import normalizar_montos, crear_views
+import pytest
+
+from etl.etl_principal import crear_views, normalizar_montos
 
 
 @pytest.mark.integration
@@ -8,37 +9,56 @@ async def test_columnas_num_creadas(db_path):
     """Las 23 columnas _num existen tras normalizar."""
     async with aiosqlite.connect(db_path) as db:
         await normalizar_montos(db)
-        cols_lp = {c[1] for c in await (await db.execute(
-            "PRAGMA table_info(lineas_pedido)"
-        )).fetchall()}
-        cols_em = {c[1] for c in await (await db.execute(
-            "PRAGMA table_info(estadisticas_monto)"
-        )).fetchall()}
-        cols_gd = {c[1] for c in await (await db.execute(
-            "PRAGMA table_info(gestion_diferencias)"
-        )).fetchall()}
-        cols_dd = {c[1] for c in await (await db.execute(
-            "PRAGMA table_info(detalle_diferencias)"
-        )).fetchall()}
+        cols_lp = {
+            c[1] for c in await (await db.execute("PRAGMA table_info(lineas_pedido)")).fetchall()
+        }
+        cols_em = {
+            c[1]
+            for c in await (await db.execute("PRAGMA table_info(estadisticas_monto)")).fetchall()
+        }
+        cols_gd = {
+            c[1]
+            for c in await (await db.execute("PRAGMA table_info(gestion_diferencias)")).fetchall()
+        }
+        cols_dd = {
+            c[1]
+            for c in await (await db.execute("PRAGMA table_info(detalle_diferencias)")).fetchall()
+        }
 
-    for col in ["precio_unitario_num", "descuento_num",
-                "precio_descuento_num", "monto_pagar_num",
-                "monto_final_num", "iva_num", "peso_total_num"]:
+    for col in [
+        "precio_unitario_num",
+        "descuento_num",
+        "precio_descuento_num",
+        "monto_pagar_num",
+        "monto_final_num",
+        "iva_num",
+        "peso_total_num",
+    ]:
         assert col in cols_lp, f"{col} falta en lineas_pedido"
 
-    for col in ["monto_pagar_num", "monto_final_num",
-                "diferencia_num"]:
+    for col in ["monto_pagar_num", "monto_final_num", "diferencia_num"]:
         assert col in cols_em, f"{col} falta en estadisticas_monto"
 
-    for col in ["total_pagar_pedido_num", "monto_final_pagar_num",
-                "monto_pagado_num", "monto_diferencia_num"]:
+    for col in [
+        "total_pagar_pedido_num",
+        "monto_final_pagar_num",
+        "monto_pagado_num",
+        "monto_diferencia_num",
+    ]:
         assert col in cols_gd, f"{col} falta en gestion_diferencias"
 
-    for col in ["precio_unitario_num", "descuento_num",
-                "precio_descuento_num", "cantidad_pedido_num",
-                "cantidad_entregada_num", "diferencia_cantidad_num",
-                "monto_pagar_pedido_num", "monto_final_pagar_num",
-                "iva_num", "monto_diferencia_num"]:
+    for col in [
+        "precio_unitario_num",
+        "descuento_num",
+        "precio_descuento_num",
+        "cantidad_pedido_num",
+        "cantidad_entregada_num",
+        "diferencia_cantidad_num",
+        "monto_pagar_pedido_num",
+        "monto_final_pagar_num",
+        "iva_num",
+        "monto_diferencia_num",
+    ]:
         assert col in cols_dd, f"{col} falta en detalle_diferencias"
 
 
@@ -59,11 +79,9 @@ async def test_views_creadas(db_path):
     gestion_diferencias.
     """
     async with aiosqlite.connect(db_path) as db:
-        await normalizar_montos(db)   # ← obligatorio primero
+        await normalizar_montos(db)  # ← obligatorio primero
         await crear_views(db)
-        cursor = await db.execute(
-            "SELECT name FROM sqlite_master WHERE type='view'"
-        )
+        cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='view'")
         views = {r[0] for r in await cursor.fetchall()}
 
     views_esperadas = {
@@ -81,9 +99,7 @@ async def test_views_creadas(db_path):
         "v_gestion_diferencias_num",
         "v_detalle_diferencias_num",
     }
-    assert views_esperadas.issubset(views), (
-        f"VIEWs faltantes: {views_esperadas - views}"
-    )
+    assert views_esperadas.issubset(views), f"VIEWs faltantes: {views_esperadas - views}"
 
 
 @pytest.mark.integration
@@ -94,16 +110,19 @@ async def test_views_son_idempotentes(db_path):
     esperaba 7 desde antes de que se agregaran las views del dashboard.
     """
     async with aiosqlite.connect(db_path) as db:
-        await normalizar_montos(db)   # ← obligatorio primero
+        await normalizar_montos(db)  # ← obligatorio primero
         await crear_views(db)
         await crear_views(db)
-        count = (await (await db.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='view'"
-        )).fetchone())[0]
+        count = (
+            await (
+                await db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='view'")
+            ).fetchone()
+        )[0]
     assert count == 11
 
 
 # ── FIX C-4 (auditoría 2026-07-01) — COALESCE en cantidad_pendiente ────────────
+
 
 @pytest.mark.integration
 async def test_inventario_pendiente_incluye_entregada_null(db_path):
@@ -143,16 +162,18 @@ async def test_inventario_pendiente_incluye_entregada_null(db_path):
         )
         await db.commit()
 
-        await normalizar_montos(db)   # ← obligatorio primero
+        await normalizar_montos(db)  # ← obligatorio primero
         await crear_views(db)
 
-        row = await (await db.execute(
-            "SELECT cantidad_comprometida_total, cantidad_entregada_total, "
-            "cantidad_pendiente "
-            "FROM v_inventario_comprometido WHERE referencia = 'REF-C4'"
-        )).fetchone()
+        row = await (
+            await db.execute(
+                "SELECT cantidad_comprometida_total, cantidad_entregada_total, "
+                "cantidad_pendiente "
+                "FROM v_inventario_comprometido WHERE referencia = 'REF-C4'"
+            )
+        ).fetchone()
 
     assert row is not None, "la línea no entró a v_inventario_comprometido"
-    assert row[0] == 20.0   # 10 + 10 compradas
-    assert row[1] == 4.0    # solo la entrega registrada
-    assert row[2] == 16.0   # 10 (NULL→0) + 6 — antes del fix daba 6
+    assert row[0] == 20.0  # 10 + 10 compradas
+    assert row[1] == 4.0  # solo la entrega registrada
+    assert row[2] == 16.0  # 10 (NULL→0) + 6 — antes del fix daba 6

@@ -1,9 +1,10 @@
 import pytest
+
 from scraper.scraper_principal import (
     CONFIG,
-    to_num,
-    get_db_path,
     build_arg_parser,
+    get_db_path,
+    to_num,
 )
 
 
@@ -53,22 +54,26 @@ def test_db_path_contiene_data_pedidos():
 def test_db_path_es_absoluto():
     """BUG-007: la ruta es absoluta, no relativa al cwd."""
     from pathlib import Path
+
     path = get_db_path()
     assert Path(path).is_absolute()
 
 
-@pytest.mark.parametrize("entrada,esperado", [
-    ("1.234,56",   1234.56),
-    ("200",        200.0),
-    ("0,50",       0.5),
-    (",50",        0.5),
-    ("-1.000,00",  -1000.0),
-    (" 1.234,56 ", 1234.56),
-    ("",           None),
-    ("N/A",        None),
-    ("—",          None),
-    ("None",       None),
-])
+@pytest.mark.parametrize(
+    "entrada,esperado",
+    [
+        ("1.234,56", 1234.56),
+        ("200", 200.0),
+        ("0,50", 0.5),
+        (",50", 0.5),
+        ("-1.000,00", -1000.0),
+        (" 1.234,56 ", 1234.56),
+        ("", None),
+        ("N/A", None),
+        ("—", None),
+        ("None", None),
+    ],
+)
 @pytest.mark.unit
 def test_to_num(entrada, esperado):
     assert to_num(entrada) == esperado

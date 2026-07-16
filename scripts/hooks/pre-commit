@@ -1,0 +1,26 @@
+#!/bin/sh
+# Gate de calidad pre-commit (DEC-016, Fase 7).
+# Activar una vez por clon:  git config core.hooksPath scripts/hooks
+#
+# Corre con el python del venv del proyecto para no depender del
+# launcher global (DEC-015: el proyecto está clavado a 3.12).
+
+set -e
+cd "$(git rev-parse --show-toplevel)"
+
+PY=".venv/Scripts/python.exe"
+if [ ! -x "$PY" ]; then
+    echo "pre-commit: no existe $PY — crear el venv primero (DEC-015)" >&2
+    exit 1
+fi
+
+echo "pre-commit: ruff check"
+"$PY" -m ruff check .
+
+echo "pre-commit: ruff format --check"
+"$PY" -m ruff format --check .
+
+echo "pre-commit: mypy comun/ (alcance gradual, DEC-016)"
+"$PY" -m mypy comun
+
+echo "pre-commit: OK"

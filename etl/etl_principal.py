@@ -3,6 +3,7 @@ ETL principal — dashboard_pedidos
 Normaliza montos TEXT a REAL y crea VIEWs analíticas
 sobre data/pedidos.db.
 """
+
 import sys
 from pathlib import Path
 
@@ -11,8 +12,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import asyncio
 import json
 import logging
-import aiosqlite
 from datetime import datetime, timezone
+
+import aiosqlite
 
 # AUD-M5 (auditoría 2026-07-01): importar del módulo común — el ETL ya no
 # carga el scraper (ni Playwright, ni sus efectos secundarios de import).
@@ -31,9 +33,7 @@ logger = logging.getLogger("etl")
 # constantes del módulo común — único origen de verdad para
 # "cerrado"/"activo" en las VIEWs. sorted() para SQL determinístico.
 _CERRADOS_SQL = ",".join(f"'{e}'" for e in sorted(ESTADOS_CERRADOS))
-_ACTIVOS_INVENTARIO_SQL = ",".join(
-    f"'{e}'" for e in ESTADOS_ACTIVOS_INVENTARIO
-)
+_ACTIVOS_INVENTARIO_SQL = ",".join(f"'{e}'" for e in ESTADOS_ACTIVOS_INVENTARIO)
 
 
 def _log_event(
@@ -114,9 +114,7 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
         # Paso 1: agregar columnas con ALTER TABLE
         for col_num in columnas:
             try:
-                await db.execute(
-                    f"ALTER TABLE {tabla} ADD COLUMN {col_num} REAL"
-                )
+                await db.execute(f"ALTER TABLE {tabla} ADD COLUMN {col_num} REAL")
                 await db.commit()
             except Exception:
                 # La columna ya existe — continuar
@@ -134,12 +132,14 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
             total_filas = 0
             total_fallidos = 0
             while True:
-                rows = await (await db.execute(
-                    f"SELECT id, {col_src} FROM {tabla} "
-                    f"WHERE id > ? AND {col_num} IS NULL "
-                    f"ORDER BY id LIMIT 500",
-                    (last_id,)
-                )).fetchall()
+                rows = await (
+                    await db.execute(
+                        f"SELECT id, {col_src} FROM {tabla} "
+                        f"WHERE id > ? AND {col_num} IS NULL "
+                        f"ORDER BY id LIMIT 500",
+                        (last_id,),
+                    )
+                ).fetchall()
                 if not rows:
                     _log_event(
                         "etl_columna_ok",
@@ -157,14 +157,10 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
                         _log_event(
                             "etl_conversion_fallida",
                             level="WARNING",
-                            msg=(
-                                f"{tabla}.{col_src} id={row_id} "
-                                f"valor_original={val!r}"
-                            ),
+                            msg=(f"{tabla}.{col_src} id={row_id} valor_original={val!r}"),
                         )
                     await db.execute(
-                        f"UPDATE {tabla} SET {col_num} = ? "
-                        f"WHERE id = ?",
+                        f"UPDATE {tabla} SET {col_num} = ? WHERE id = ?",
                         (valor_num, row_id),
                     )
                 last_id = rows[-1][0]
@@ -341,7 +337,6 @@ async def crear_views(db: aiosqlite.Connection) -> None:
             GROUP BY accion, tipo_usuario
             ORDER BY total_ocurrencias DESC
         """,
-
         # ── VIEWs para el dashboard ────────────────────────────────────
         # Exponen los valores monetarios ya convertidos a REAL con
         # nombres limpios (sin sufijo _num). El dashboard lee estas
@@ -421,16 +416,17 @@ async def crear_views(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
-async def main() -> None:
+async def main() -> int:
     """Punto de entrada del ETL.
 
     Abre la conexión a data/pedidos.db, ejecuta la
     normalización de montos y la creación de VIEWs,
     y cierra la conexión.
 
-    Exits:
+    Returns:
         0: ETL completado sin errores.
         1: Error no recuperable durante la ejecución.
+        (AUD-B7: el sys.exit vive en __main__, no en la corrutina.)
     """
     db_path = get_db_path()
     try:
@@ -440,9 +436,9 @@ async def main() -> None:
             await db.execute("PRAGMA foreign_keys=ON")
             await normalizar_montos(db)
             await crear_views(db)
-            row = await (await db.execute(
-                "SELECT COUNT(*) FROM v_rendimiento_operadores"
-            )).fetchone()
+            row = await (
+                await db.execute("SELECT COUNT(*) FROM v_rendimiento_operadores")
+            ).fetchone()
             if row and row[0] == 0:
                 _log_event(
                     "etl_view_vacia",
@@ -454,13 +450,13 @@ async def main() -> None:
             # DB fuera de las listas del módulo común indica que el sistema
             # origen agregó o renombró estados; las VIEWs podrían estar
             # excluyéndolo en silencio.
-            rows_est = await (await db.execute(
-                "SELECT DISTINCT LOWER(estado) FROM subpedidos "
-                "WHERE estado IS NOT NULL AND estado != ''"
-            )).fetchall()
-            desconocidos = sorted(
-                r[0] for r in rows_est if r[0] not in ESTADOS_CONOCIDOS
-            )
+            rows_est = await (
+                await db.execute(
+                    "SELECT DISTINCT LOWER(estado) FROM subpedidos "
+                    "WHERE estado IS NOT NULL AND estado != ''"
+                )
+            ).fetchall()
+            desconocidos = sorted(r[0] for r in rows_est if r[0] not in ESTADOS_CONOCIDOS)
             if desconocidos:
                 _log_event(
                     "etl_estado_desconocido",
@@ -471,7 +467,7 @@ async def main() -> None:
                     ),
                 )
         _log_event("etl_completado", db_path=db_path)
-        sys.exit(0)
+        return 0
     except Exception as exc:
         _log_event(
             "etl_fallido",
@@ -480,8 +476,9 @@ async def main() -> None:
             error_type=type(exc).__name__,
             db_path=db_path,
         )
-        sys.exit(1)
+        return 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # AUD-B7: main() retorna el exit code; sys.exit() solo vive aquí.
+    sys.exit(asyncio.run(main()))

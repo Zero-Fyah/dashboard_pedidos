@@ -17,6 +17,7 @@ DB_PATH = Path(__file__).parent.parent / "data" / "pedidos.db"
 # sorted() para SQL determinístico (frozenset no garantiza orden).
 _cerr = ",".join(f"'{e}'" for e in sorted(ESTADOS_CERRADOS))
 
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _num_cols_exist() -> bool:
     if not DB_PATH.exists():
@@ -50,9 +51,15 @@ def _view_consolidado_exists() -> bool:
 
 
 COLS_CONSOLIDADO = [
-    "Producto", "Referencia", "Presentación", "Almacén",
-    "Estado subpedido", "Comprometido", "Entregado",
-    "Pendiente", "Pedidos con stock",
+    "Producto",
+    "Referencia",
+    "Presentación",
+    "Almacén",
+    "Estado subpedido",
+    "Comprometido",
+    "Entregado",
+    "Pendiente",
+    "Pedidos con stock",
 ]
 
 
@@ -387,9 +394,9 @@ def get_detalle_operacional(
         params_almacen = list(almacenes)
 
     _use_view = _num_cols_exist()
-    _lineas_src   = "v_lineas_pedido_num" if _use_view else "lineas_pedido"
-    monto_a_pagar = "l.monto_pagar"       if _use_view else "NULL"
-    monto_final   = "l.monto_final"       if _use_view else "NULL"
+    _lineas_src = "v_lineas_pedido_num" if _use_view else "lineas_pedido"
+    monto_a_pagar = "l.monto_pagar" if _use_view else "NULL"
+    monto_final = "l.monto_final" if _use_view else "NULL"
 
     sql = f"""
         SELECT
@@ -452,9 +459,9 @@ def get_detalle_pedido(
         params_alm = list(almacenes)
 
     _use_view = _num_cols_exist()
-    _lineas_src   = "v_lineas_pedido_num" if _use_view else "lineas_pedido"
-    monto_a_pagar = "l.monto_pagar"       if _use_view else "NULL"
-    monto_final   = "l.monto_final"       if _use_view else "NULL"
+    _lineas_src = "v_lineas_pedido_num" if _use_view else "lineas_pedido"
+    monto_a_pagar = "l.monto_pagar" if _use_view else "NULL"
+    monto_final = "l.monto_final" if _use_view else "NULL"
 
     sql = f"""
         SELECT

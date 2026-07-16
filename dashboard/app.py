@@ -1,5 +1,4 @@
 import streamlit as st
-
 from db import (
     _view_consolidado_exists,
     get_consolidado,
@@ -58,14 +57,14 @@ with col4:
 
 # Conversión a tuplas ordenadas para caché
 estados_sub_key = tuple(sorted(estados_sub_sel))
-almacenes_key   = tuple(sorted(almacenes_sel))
-tipos_sub_key   = tuple(sorted(tipos_sub_sel))
+almacenes_key = tuple(sorted(almacenes_sel))
+tipos_sub_key = tuple(sorted(tipos_sub_sel))
 
 # ── Carga de datos ─────────────────────────────────────────────────────────────
 try:
     with st.spinner("Cargando datos..."):
-        df_consolidado    = get_consolidado(estados_sub_key, almacenes_key)
-        df_pedidos        = get_pedidos(estado_pedido_sel, estados_sub_key, almacenes_key)
+        df_consolidado = get_consolidado(estados_sub_key, almacenes_key)
+        df_pedidos = get_pedidos(estado_pedido_sel, estados_sub_key, almacenes_key)
         df_pedidos_activos = get_pedidos_activos(estados_sub_key, almacenes_key, tipos_sub_key)
 except FileNotFoundError as e:
     st.error(str(e))
@@ -98,9 +97,9 @@ else:
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Comprometido":      st.column_config.NumberColumn(format="%g"),
-            "Entregado":         st.column_config.NumberColumn(format="%g"),
-            "Pendiente":         st.column_config.NumberColumn(format="%g"),
+            "Comprometido": st.column_config.NumberColumn(format="%g"),
+            "Entregado": st.column_config.NumberColumn(format="%g"),
+            "Pendiente": st.column_config.NumberColumn(format="%g"),
             "Pedidos con stock": st.column_config.NumberColumn(format="%d"),
         },
     )
@@ -113,19 +112,22 @@ if df_pedidos_activos.empty:
     st.info("Sin pedidos activos para el filtro seleccionado.")
 else:
     dias_abierto_vals = df_pedidos_activos["Días abierto"].dropna()
-    n_con_dif    = int((df_pedidos_activos["⚠ Dif."] == "Sí").sum())
+    n_con_dif = int((df_pedidos_activos["⚠ Dif."] == "Sí").sum())
     # fillna(False) para que NaN (actualizado_en NULL) no se cuente como estancado
-    n_estancados = int(
-        (df_pedidos_activos["Días sin mov."].fillna(0) >= 2).sum()
-    )
+    n_estancados = int((df_pedidos_activos["Días sin mov."].fillna(0) >= 2).sum())
 
     op1, op2, op3, op4 = st.columns(4)
-    op1.metric("Pedidos activos",    f"{len(df_pedidos_activos):,}")
-    op2.metric("Con diferencia",     f"{n_con_dif:,}")
-    op3.metric("Promedio días abierto",
-               f"{dias_abierto_vals.mean():.1f}" if not dias_abierto_vals.empty else "—")
-    op4.metric("Sin mov. ≥ 2 días",  f"{n_estancados:,}",
-               help="Pedidos cuya última actualización fue hace 2 o más días.")
+    op1.metric("Pedidos activos", f"{len(df_pedidos_activos):,}")
+    op2.metric("Con diferencia", f"{n_con_dif:,}")
+    op3.metric(
+        "Promedio días abierto",
+        f"{dias_abierto_vals.mean():.1f}" if not dias_abierto_vals.empty else "—",
+    )
+    op4.metric(
+        "Sin mov. ≥ 2 días",
+        f"{n_estancados:,}",
+        help="Pedidos cuya última actualización fue hace 2 o más días.",
+    )
 
     st.caption(
         f"{len(df_pedidos_activos):,} pedidos activos · "
@@ -141,20 +143,20 @@ else:
         selection_mode="single-row",
         key="tabla_operacional",
         column_config={
-            "⚠ Dif.":       st.column_config.TextColumn(width="small"),
+            "⚠ Dif.": st.column_config.TextColumn(width="small"),
             "Días abierto": st.column_config.NumberColumn(format="%d días", width="small"),
-            "Días sin mov.":st.column_config.NumberColumn(format="%d días", width="small"),
+            "Días sin mov.": st.column_config.NumberColumn(format="%d días", width="small"),
             "Estado estancado": st.column_config.TextColumn(width="medium"),
-            "Subpedidos":   st.column_config.NumberColumn(format="%d",      width="small"),
-            "Sub. abiertos":st.column_config.NumberColumn(format="%d",      width="small"),
+            "Subpedidos": st.column_config.NumberColumn(format="%d", width="small"),
+            "Sub. abiertos": st.column_config.NumberColumn(format="%d", width="small"),
         },
     )
 
     # ── Drill-down operacional ─────────────────────────────────────────────────
     filas_op = evento_op.selection.rows
     if filas_op:
-        fila_op   = df_pedidos_activos.iloc[filas_op[0]]
-        id_op     = str(fila_op["ID Pedido"])
+        fila_op = df_pedidos_activos.iloc[filas_op[0]]
+        id_op = str(fila_op["ID Pedido"])
 
         st.divider()
         izq_op, der_op = st.columns([3, 1])
@@ -171,37 +173,36 @@ else:
         m4.markdown(f"**Forma de pago:** {fila_op['Forma de pago']}")
 
         t1, t2 = st.columns(2)
-        dias_ab  = fila_op['Días abierto']
-        dias_sin = fila_op['Días sin mov.']
+        dias_ab = fila_op["Días abierto"]
+        dias_sin = fila_op["Días sin mov."]
         t1.markdown(f"**Días abierto:** {int(dias_ab) if dias_ab == dias_ab else '—'} días")
-        t2.markdown(f"**Días sin movimiento:** {int(dias_sin) if dias_sin == dias_sin else '—'} días")
-
-        df_det_op = get_detalle_operacional(
-            id_op, estados_sub_key, almacenes_key, tipos_sub_key
+        t2.markdown(
+            f"**Días sin movimiento:** {int(dias_sin) if dias_sin == dias_sin else '—'} días"
         )
+
+        df_det_op = get_detalle_operacional(id_op, estados_sub_key, almacenes_key, tipos_sub_key)
 
         if df_det_op.empty:
             st.info(
-                "Sin líneas para este pedido con el filtro actual. "
-                "Prueba ampliando los filtros."
+                "Sin líneas para este pedido con el filtro actual. Prueba ampliando los filtros."
             )
         else:
             d1, d2, d3, d4 = st.columns(4)
             d1.metric("Subpedidos visibles", df_det_op["Subpedido"].nunique())
-            d2.metric("SKUs",                df_det_op["Producto"].nunique())
-            d3.metric("Comprometido",        f"{int(df_det_op['Comprometido'].sum()):,}")
-            d4.metric("Pendiente",           f"{int(df_det_op['Pendiente'].sum()):,}")
+            d2.metric("SKUs", df_det_op["Producto"].nunique())
+            d3.metric("Comprometido", f"{int(df_det_op['Comprometido'].sum()):,}")
+            d4.metric("Pendiente", f"{int(df_det_op['Pendiente'].sum()):,}")
 
             st.dataframe(
                 df_det_op,
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "Comprometido":  st.column_config.NumberColumn(format="%g"),
-                    "Entregado":     st.column_config.NumberColumn(format="%g"),
-                    "Pendiente":     st.column_config.NumberColumn(format="%g"),
+                    "Comprometido": st.column_config.NumberColumn(format="%g"),
+                    "Entregado": st.column_config.NumberColumn(format="%g"),
+                    "Pendiente": st.column_config.NumberColumn(format="%g"),
                     "Monto a pagar": st.column_config.NumberColumn(format="$%.0f"),
-                    "Monto final":   st.column_config.NumberColumn(format="$%.0f"),
+                    "Monto final": st.column_config.NumberColumn(format="$%.0f"),
                 },
             )
 
@@ -223,7 +224,7 @@ evento = st.dataframe(
     key="tabla_pedidos",
     column_config={
         "⚠ Diferencia": st.column_config.TextColumn(width="small"),
-        "Subpedidos":   st.column_config.NumberColumn(format="%d", width="small"),
+        "Subpedidos": st.column_config.NumberColumn(format="%d", width="small"),
     },
 )
 
@@ -269,10 +270,10 @@ st.dataframe(
     use_container_width=True,
     hide_index=True,
     column_config={
-        "Comprometido":  st.column_config.NumberColumn(format="%g"),
-        "Entregado":     st.column_config.NumberColumn(format="%g"),
-        "Pendiente":     st.column_config.NumberColumn(format="%g"),
+        "Comprometido": st.column_config.NumberColumn(format="%g"),
+        "Entregado": st.column_config.NumberColumn(format="%g"),
+        "Pendiente": st.column_config.NumberColumn(format="%g"),
         "Monto a pagar": st.column_config.NumberColumn(format="$%.0f"),
-        "Monto final":   st.column_config.NumberColumn(format="$%.0f"),
+        "Monto final": st.column_config.NumberColumn(format="$%.0f"),
     },
 )

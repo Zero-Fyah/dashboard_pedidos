@@ -1,0 +1,34 @@
+# Tooling del proyecto (DEC-016, Fase 7). No es un paquete instalable:
+# este archivo solo configura ruff y mypy.
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [
+    "scraper/archive",   # referencia histórica — regla del proyecto: no tocar
+    ".venv",
+]
+
+[tool.ruff.lint]
+# Baseline gradual: errores reales (E4xx import, E7xx statement, E9xx
+# runtime, F pyflakes) + orden de imports (I) + bugbear (B).
+# E501 (línea larga) queda fuera a propósito: SQL y mensajes de log
+# legibles pesan más que el corte duro.
+select = ["E4", "E7", "E9", "F", "I", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["comun", "scraper", "etl", "dashboard"]
+
+[tool.mypy]
+python_version = "3.12"
+# Global laxo: el gate pre-commit solo corre sobre comun/ (DEC-016).
+# La strictness se amplía módulo por módulo.
+ignore_missing_imports = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = "comun.*"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_return_any = true
+strict_equality = true

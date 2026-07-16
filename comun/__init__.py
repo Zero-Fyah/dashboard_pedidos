@@ -26,28 +26,32 @@ from pathlib import Path
 # Un pedido se considera cerrado cuando TODOS sus subpedidos están en
 # alguno de estos estados. Los pedidos cerrados no se vuelven a procesar
 # en modo incremental (regla de negocio #2 de docs/integral.md).
-ESTADOS_CERRADOS: frozenset[str] = frozenset({
-    "completado",
-    "cancelado",
-    "comentado",
-})
+ESTADOS_CERRADOS: frozenset[str] = frozenset(
+    {
+        "completado",
+        "cancelado",
+        "comentado",
+    }
+)
 
 # Referencia histórica: estados del sistema que fijan cantidades en el
 # flujo operacional. Conservado como documentación del dominio.
 # con_cantidades usa ESTADOS_CERRADOS desde la resolución de BUG-005
 # opción B (docs/decisions.md).
-ESTADOS_FIJAN_CANTIDADES: frozenset[str] = frozenset({
-    "pendiente de confirmación",
-    "pendiente de envío (pago inmediato)",
-    "pendiente de envío (crédito)",
-    "pendiente de envío (contra entrega)",
-    "pendiente de entrega",
-    "enviado",
-    "período contable",
-    "completado",
-    "cancelado",
-    "comentado",
-})
+ESTADOS_FIJAN_CANTIDADES: frozenset[str] = frozenset(
+    {
+        "pendiente de confirmación",
+        "pendiente de envío (pago inmediato)",
+        "pendiente de envío (crédito)",
+        "pendiente de envío (contra entrega)",
+        "pendiente de entrega",
+        "enviado",
+        "período contable",
+        "completado",
+        "cancelado",
+        "comentado",
+    }
+)
 
 # Estados considerados "activos" para el inventario comprometido
 # (VIEW v_inventario_comprometido del ETL). Tupla — no frozenset — para
@@ -71,15 +75,14 @@ ESTADOS_ACTIVOS_INVENTARIO: tuple[str, ...] = (
 # agregó o renombró estados: las VIEWs podrían estar excluyéndolo en
 # silencio y hay que actualizar las listas de arriba.
 ESTADOS_CONOCIDOS: frozenset[str] = (
-    ESTADOS_CERRADOS
-    | ESTADOS_FIJAN_CANTIDADES
-    | frozenset(ESTADOS_ACTIVOS_INVENTARIO)
+    ESTADOS_CERRADOS | ESTADOS_FIJAN_CANTIDADES | frozenset(ESTADOS_ACTIVOS_INVENTARIO)
 )
 
 
 # ─────────────────────────────────────────────
 # UTILIDADES PURAS
 # ─────────────────────────────────────────────
+
 
 def to_num(val: str) -> float | None:
     """Convierte un string numérico en formato español a float.

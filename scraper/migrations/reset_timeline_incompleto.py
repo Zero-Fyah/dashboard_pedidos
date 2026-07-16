@@ -15,8 +15,9 @@ solo procesa pedidos con scraping_completo=1 y NO recuperará estos.
 Uso (desde la raíz del proyecto):
     python scraper/migrations/reset_timeline_incompleto.py
 """
-import sys
+
 import sqlite3
+import sys
 from pathlib import Path
 
 # Dos niveles arriba desde scraper/migrations/ llega a la raíz
@@ -41,6 +42,7 @@ QUERY_RESETEAR = """
       )
 """
 
+
 def main() -> None:
     if not DB_PATH.exists():
         print(f"ERROR: DB no encontrada en {DB_PATH.resolve()}", file=sys.stderr)
@@ -55,10 +57,14 @@ def main() -> None:
             print("Nada que hacer — todos los pedidos tienen timeline.")
             sys.exit(0)
 
-        confirmacion = input(
-            f"\n¿Confirmas resetear {afectados:,} pedidos "
-            f"para re-scraping? (escribe 's' para confirmar): "
-        ).strip().lower()
+        confirmacion = (
+            input(
+                f"\n¿Confirmas resetear {afectados:,} pedidos "
+                f"para re-scraping? (escribe 's' para confirmar): "
+            )
+            .strip()
+            .lower()
+        )
 
         if confirmacion != "s":
             print("Cancelado sin cambios.")
@@ -77,6 +83,7 @@ def main() -> None:
         sys.exit(1)
     finally:
         con.close()
+
 
 if __name__ == "__main__":
     main()

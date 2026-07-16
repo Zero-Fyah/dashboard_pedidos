@@ -1,4 +1,4 @@
-![Python](https://img.shields.io/badge/Python-3.14-3776AB?logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/Licencia-MIT-green)
 
 # dashboard_pedidos
@@ -8,7 +8,7 @@
 Scraper asíncrono de pedidos para un sistema administrativo interno (SPA Vue.js + Element Plus)
 de una empresa colombiana que gestiona su propia operación logística. Extrae pedidos, subpedidos,
 líneas de producto, línea de tiempo de alistamiento y registros operacionales; los almacena en
-SQLite en 9 tablas normalizadas y sirve como base de datos para un dashboard de análisis
+SQLite en 10 tablas normalizadas y sirve como base de datos para un dashboard de análisis
 operacional. Los datos recopilados servirán como insumo para un futuro sistema de predicción
 de demanda.
 
@@ -26,7 +26,7 @@ analítica sobre:
 - **Diferencias en envíos:** frecuencia, montos y productos con mayor incidencia.
 - **Rendimiento por operador:** tiempos y volúmenes por alistador e inspector.
 
-Este scraper extrae esa información de forma automatizada, la normaliza en 9 tablas SQLite
+Este scraper extrae esa información de forma automatizada, la normaliza en 10 tablas SQLite
 y la deja lista para análisis y visualización.
 
 ---
@@ -99,26 +99,37 @@ dashboard_pedidos/
 │   ├── __init__.py           # paquete importable por tests/
 │   └── etl_principal.py      # normalización de montos y VIEWs
 ├── logs/                     # Logs de ejecución — gitignored
-├── scraper/                  # Etapa 1 — extracción de datos
+├── scraper/                  # Etapa 1 — extracción de datos (paquete de 6 módulos)
 │   ├── __init__.py           # paquete importable por tests/
 │   ├── archive/              # Versión inicial del scraper — solo referencia
 │   ├── migrations/           # Scripts de migración de única ejecución
 │   │   └── reset_timeline_incompleto.py
 │   ├── actualizar_pedidos.bat
-│   └── scraper_principal.py
+│   ├── config.py             # CONFIG, credenciales, locks, rate limit, logging JSONL
+│   ├── db.py                 # esquema SQLite, migraciones y watermark
+│   ├── extractores.py        # login, listado de pedidos y extractores del detalle
+│   ├── persistencia.py       # persistencia_worker + helpers transaccionales
+│   ├── workers.py            # selección de modo, scraping por pedido, circuit breaker
+│   ├── orquestador.py        # main(): carriles, dead-letter, resumen y CLI
+│   └── scraper_principal.py  # entry point + facade de re-exports
 ├── tests/                    # Suite de tests
 │   ├── conftest.py           # Fixtures y opciones de pytest
 │   ├── unit/                 # Tests unitarios sin I/O externo
 │   ├── integration/          # Tests de integración con SQLite temporal
 │   └── e2e/                  # Tests con browser real — lentos
+├── scripts/
+│   └── hooks/
+│       └── pre-commit        # gate: ruff check + format + mypy comun
 ├── .env                      # Credenciales locales — gitignored
 ├── .env.example              # Plantilla de variables de entorno
 ├── .gitignore
 ├── CLAUDE.md                 # Guía de arranque para Claude Code
 ├── conftest.py               # sys.path para imports de tests/
+├── pyproject.toml            # configuración de ruff y mypy
 ├── pytest.ini                # configuración de pytest y marcadores
 ├── README.md
-└── requirements.txt
+├── requirements.txt          # dependencias de runtime
+└── requirements-dev.txt      # ruff, mypy, pytest-cov
 ```
 
 ---
@@ -146,10 +157,11 @@ dashboard_pedidos/
 git clone https://github.com/Zero-Fyah/dashboard_pedidos.git
 cd dashboard_pedidos
 
-# 2. Crear entorno virtual e instalar dependencias
-python -m venv .venv
+# 2. Crear entorno virtual con Python 3.12 (DEC-015) e instalar dependencias
+py -3.12 -m venv .venv
 .venv\Scriptsctivate
 pip install -r requirements.txt
+pip install -r requirements-dev.txt   # ruff, mypy, pytest-cov (desarrollo)
 
 # 3. Instalar el navegador que usa Playwright
 playwright install chromium
@@ -158,8 +170,12 @@ playwright install chromium
 copy .env.example .env
 # Editar .env con usuario, contraseña y URLs reales
 
-# 5. (Opcional) Programar ejecución incremental automática
+# 5. Activar el gate de calidad pre-commit (una vez por clon, DEC-016)
+git config core.hooksPath scripts/hooks
+
+# 6. (Opcional) Programar ejecución incremental automática
 # Registrar scraper/actualizar_pedidos.bat en Windows Task Scheduler
+# (el .bat invoca .venv\Scripts\python.exe — requiere el paso 2)
 ```
 
 ---
@@ -167,12 +183,14 @@ copy .env.example .env
 ## Uso
 
 ```bash
+# (con el .venv activado — DEC-015)
+
 # Modo completo — procesa todos los pedidos del rango desde cero
-py scraper/scraper_principal.py --desde 2026-05-01
+python scraper/scraper_principal.py --desde 2026-05-01
 
 # Modo incremental — actualiza activos, reintenta errores
-# y captura pedidos nuevos del día
-py scraper/scraper_principal.py --modo incremental
+# y captura pedidos nuevos desde la última corrida OK
+python scraper/scraper_principal.py --modo incremental
 
 # Normalizar montos y crear VIEWs analíticas
 python etl/etl_principal.py
@@ -184,8 +202,11 @@ python scraper/migrations/reset_timeline_incompleto.py
 python -m streamlit run dashboard/app.py
 ```
 
-Al finalizar, el scraper imprime un resumen JSON con tiempo total, pedidos procesados, errores
-y tasa de éxito. Código de salida `0` si la tasa de éxito es ≥ 95 %, `1` si es menor.
+Al finalizar, el scraper imprime un resumen JSON con tiempo total, modo, pedidos procesados,
+errores, tasa de éxito y — en modo incremental — el desglose por carril (activos, reintentos,
+nuevos). Las métricas se miden sobre los resultados del propio run (pedidos persistidos con
+COMMIT exitoso), no sobre el estado acumulado en la DB. Código de salida `0` si la tasa de
+éxito es ≥ 95 %, `1` si es menor.
 
 ---
 
@@ -198,8 +219,10 @@ independientes:
   que tienen al menos un subpedido en estado no cerrado. No abre ninguna página del servidor.
 - **Errores:** lee la tabla `errores` para identificar pedidos que fallaron en ejecuciones
   previas y aún no están completos, y los encola para reintento.
-- **Nuevos:** consulta el servidor solo para el rango ayer-hoy, descarta los IDs ya presentes
-  en la DB y encola únicamente los pedidos nuevos del día.
+- **Nuevos:** consulta el servidor desde el watermark de última corrida exitosa
+  (`meta.ultima_corrida_ok` − 1 día, con tope de 7 días hacia atrás — DEC-012), descarta
+  los IDs ya presentes en la DB y encola únicamente los pedidos nuevos. Un outage del
+  scheduler de varios días se recupera solo en la primera corrida exitosa posterior.
 
 Los tres conjuntos se combinan con `dict.fromkeys()` para eliminar duplicados y se procesan
 en una sola pasada de workers paralelos.
