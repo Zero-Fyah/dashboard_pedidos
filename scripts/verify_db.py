@@ -1,7 +1,8 @@
 import sqlite3
 from pathlib import Path
 
-db = Path("data/pedidos.db")
+# Ruta anclada a la raíz del proyecto, no al CWD (patrón BUG-007)
+db = Path(__file__).parent.parent / "data" / "pedidos.db"
 assert db.exists(), f"DB no encontrada en {db.resolve()}"
 
 con = sqlite3.connect(db)

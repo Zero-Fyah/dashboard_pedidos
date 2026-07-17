@@ -50,8 +50,9 @@ Desktop.ini
 Thumbs.db
 *.lnk
 
-# Ignorar carpeta docs
-docs/
+# Configuración local de Claude Code — por máquina, no compartible (DEC-017)
+.claude/settings.local.json
 
-# Ignorar archivo CLAUDE.md
+# Documentación interna de negocio — NO versionar mientras el repo sea público (DEC-017)
+docs/
 CLAUDE.md

@@ -16,13 +16,19 @@ def test_argparse_default_desde():
     assert args.desde == "2026-05-01"
 
 
+# Literales prohibidos construidos por fragmentos: el nombre real no debe
+# existir en texto plano en ningún archivo del repo (DEC-017), incluido este.
+_NOMBRE_PROHIBIDO = "".join(("cala", "baza"))
+_SUFIJO_PROHIBIDO = "".join(("pe", "ts"))
+
+
 @pytest.mark.unit
 def test_argparse_no_expone_nombre_empresa():
     """BUG-008: la descripción no expone el nombre real."""
     parser = build_arg_parser()
     desc = parser.description.lower()
-    assert "miempresa" not in desc
-    assert "pets" not in desc
+    assert _NOMBRE_PROHIBIDO not in desc
+    assert _SUFIJO_PROHIBIDO not in desc
 
 
 @pytest.mark.unit
