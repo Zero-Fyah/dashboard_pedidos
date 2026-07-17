@@ -81,6 +81,9 @@ El pipeline continúa hacia `dashboard/app.py` (Streamlit), que consume `data/pe
 ```text
 dashboard_pedidos/
 ├── .claude/                  # Configuración Claude Code
+├── .github/
+│   └── workflows/
+│       └── ci.yml            # CI: ruff+mypy, pytest (ubuntu+windows), gitleaks
 ├── data/                     # Datos locales — gitignored
 │   ├── pedidos.db            # Base de datos SQLite
 │   ├── debug/                # HTMLs de debug — pueden contener PII
@@ -118,14 +121,14 @@ dashboard_pedidos/
 │   ├── integration/          # Tests de integración con SQLite temporal
 │   └── e2e/                  # Tests con browser real — lentos
 ├── scripts/
-│   └── hooks/
-│       └── pre-commit        # gate: ruff check + format + mypy comun
+│   ├── hooks/
+│   │   └── pre-commit        # gate: ruff check + format + mypy comun
+│   └── verify_db.py          # utilitario de inspección manual de la DB
 ├── .env                      # Credenciales locales — gitignored
 ├── .env.example              # Plantilla de variables de entorno
 ├── .gitignore
 ├── CLAUDE.md                 # Guía de arranque para Claude Code
-├── conftest.py               # sys.path para imports de tests/
-├── pyproject.toml            # configuración de ruff y mypy
+├── pyproject.toml            # empaquetado editable + configuración de ruff y mypy
 ├── pytest.ini                # configuración de pytest y marcadores
 ├── README.md
 ├── requirements.txt          # dependencias de runtime
@@ -162,6 +165,7 @@ py -3.12 -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 pip install -r requirements-dev.txt   # ruff, mypy, pytest-cov (desarrollo)
+pip install -e .                      # paquete en modo editable — requerido por los tests
 
 # 3. Instalar el navegador que usa Playwright
 playwright install chromium

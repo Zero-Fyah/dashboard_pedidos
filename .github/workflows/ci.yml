@@ -1,0 +1,57 @@
+# CI del proyecto (DEC-018). Espejo del gate pre-commit (DEC-016) + suite
+# completa en ambos SO + escaneo de secretos. El gate local es opcional por
+# clon (core.hooksPath); este workflow es el gate obligatorio.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  calidad:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Instalar tooling
+        run: python -m pip install -r requirements-dev.txt
+      - name: ruff lint
+        run: ruff check .
+      - name: ruff format
+        run: ruff format --check .
+      - name: mypy (alcance gradual, DEC-016)
+        run: mypy comun/
+
+  tests:
+    strategy:
+      matrix:
+        # windows-latest: paridad con el entorno de producción (scheduler);
+        # ubuntu-latest: canario de portabilidad de rutas y asyncio.
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Instalar dependencias
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+      - name: Suite de tests (unit + integration; e2e excluidos, requieren browser)
+        run: python -m pytest -q
+
+  secretos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gitleaks escanea el historial completo
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

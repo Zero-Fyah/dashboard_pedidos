@@ -1,5 +1,22 @@
-# Tooling del proyecto (DEC-016, Fase 7). No es un paquete instalable:
-# este archivo solo configura ruff y mypy.
+# Tooling del proyecto (DEC-016, Fase 7) + empaquetado (DEC-018).
+# Instalable en editable (`pip install -e .`) para que tests y scripts
+# resuelvan los paquetes sin hacks de sys.path. Las dependencias de runtime
+# siguen en requirements.txt a propósito (contrato del scheduler y README);
+# [project] no las duplica.
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dashboard-pedidos"
+version = "0.1.0"
+description = "Pipeline scraper -> ETL -> dashboard de pedidos (miempresa)"
+requires-python = ">=3.12"
+
+[tool.setuptools]
+# Lista explícita: excluye tests/ y scraper/archive/ (sin __init__.py, solo referencia)
+packages = ["comun", "dashboard", "etl", "scraper", "scraper.migrations"]
 
 [tool.ruff]
 target-version = "py312"
