@@ -180,6 +180,11 @@ async def init_db(db_path: str) -> None:
             "ALTER TABLE pedidos ADD COLUMN vehiculo_entrega      TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN entrega_ruta_tag      TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN entrega_descuento_tag TEXT    DEFAULT NULL",
+            # DEC-024: el tipo de descuento (etiquetas de la celda) se separa
+            # del monto; antes se descartaba en lineas_pedido y ocupaba la
+            # columna descuento en detalle_diferencias.
+            "ALTER TABLE lineas_pedido ADD COLUMN descuento_tipo TEXT DEFAULT NULL",
+            "ALTER TABLE detalle_diferencias ADD COLUMN descuento_tipo TEXT DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN hay_diferencia        INTEGER DEFAULT 0",
             "ALTER TABLE subpedidos ADD COLUMN cantidades_definitivas INTEGER DEFAULT 0",
             "ALTER TABLE subpedidos ADD COLUMN estado_cambiado_en TEXT DEFAULT NULL",

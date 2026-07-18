@@ -49,6 +49,51 @@ async def col_text(cols: list, i: int) -> str:
 # to_num() vive en comun/ (AUD-M5) y se importa arriba.
 
 
+async def leer_celda_descuento(celda) -> tuple[str, str]:
+    """Separa la celda de descuento en (monto, tipos) — DEC-024.
+
+    La celda combina una ranura de monto y una o más etiquetas de tipo:
+
+        <span>-</span>
+        <span class="el-tag"><span class="el-tag__content">Tipo de cambio9%</span></span>
+
+    El texto de la ranura solo se considera monto si `to_num()` lo puede
+    convertir o si es un placeholder; cualquier otra cosa (p. ej.
+    "Promoción3%", que en algunas filas ocupa esa posición) es una
+    etiqueta y se acumula con las demás.
+
+    Args:
+        celda: ElementHandle de la celda de descuento.
+
+    Returns:
+        Tupla (monto, tipos). `monto` es "-" cuando no hay valor numérico;
+        `tipos` une las etiquetas con " | " y es "" si no hay ninguna.
+    """
+    etiquetas: list[str] = []
+    for tag in await celda.query_selector_all(".el-tag__content"):
+        texto = (await tag.inner_text()).strip()
+        if texto and texto not in etiquetas:
+            etiquetas.append(texto)
+
+    # Primer span que no forme parte de un el-tag: la ranura del monto.
+    monto = ""
+    for span in await celda.query_selector_all("span"):
+        clases = (await span.get_attribute("class")) or ""
+        if "el-tag" not in clases:
+            monto = (await span.inner_text()).strip()
+            break
+    if not monto:
+        monto = (await celda.inner_text()).strip().split("\n")[0].strip()
+
+    # Si la ranura trae una etiqueta en vez de un monto, se reclasifica.
+    if monto and monto != "-" and to_num(monto) is None:
+        if monto not in etiquetas:
+            etiquetas.insert(0, monto)
+        monto = "-"
+
+    return (monto or "-", " | ".join(etiquetas))
+
+
 # ─────────────────────────────────────────────
 # LOGIN
 # ─────────────────────────────────────────────
@@ -671,8 +716,9 @@ async def extraer_detalle_diferencias(page: Page, id_pedido: str) -> list[dict]:
             tipo_el = await celdas[2].query_selector(".el-tag__content")
             tipo_val = (await tipo_el.inner_text()).strip() if tipo_el else await ct(2)
 
-            dto_el = await celdas[4].query_selector(".el-tag__content")
-            dto_val = (await dto_el.inner_text()).strip() if dto_el else await ct(4)
+            # DEC-024: misma separación monto/tipo que en lineas_pedido —
+            # antes esta celda guardaba el tag (el tipo) dentro de descuento.
+            dto_val, dto_tipo = await leer_celda_descuento(celdas[4])
 
             resultado.append(
                 {
@@ -682,6 +728,7 @@ async def extraer_detalle_diferencias(page: Page, id_pedido: str) -> list[dict]:
                     "tipo": tipo_val,
                     "precio_unitario": await ct(3),
                     "descuento": dto_val,
+                    "descuento_tipo": dto_tipo,
                     "precio_descuento": await ct(5),
                     "cantidad_pedido": await ct(6),
                     "cantidad_entregada": await ct(7),
@@ -893,18 +940,11 @@ async def extraer_subpedidos(page: Page) -> list[dict]:
                     (await tipo_el.inner_text()).strip() if tipo_el else await col_text(cols, 5)
                 )
 
-                # La columna descuento (índice 7) tiene dos hijos:
-                #   <span>-</span>                  ← valor real (guión o %)
-                #   <span class="el-tag">...</span> ← etiqueta "Tipo de cambio3%"
-                # inner_text() los concatena con \n → "-\nTipo de cambio3%".
-                # Extraemos solo el primer <span> para obtener únicamente el valor.
-                descuento_val = ""
-                if len(cols) > 7:
-                    span_desc = await cols[7].query_selector("span:first-child")
-                    if span_desc:
-                        descuento_val = (await span_desc.inner_text()).strip()
-                    else:
-                        descuento_val = await col_text(cols, 7)
+                # DEC-024: la columna descuento (índice 7) combina la ranura
+                # del monto y las etiquetas de tipo; se separan en dos campos.
+                descuento_val, descuento_tipo = (
+                    await leer_celda_descuento(cols[7]) if len(cols) > 7 else ("-", "")
+                )
 
                 subpedidos[-1]["lineas"].append(
                     {
@@ -919,6 +959,7 @@ async def extraer_subpedidos(page: Page) -> list[dict]:
                         "tipo": tipo_val,
                         "precio_unitario": await col_text(cols, 6),
                         "descuento": descuento_val,
+                        "descuento_tipo": descuento_tipo,
                         "precio_descuento": await col_text(cols, 8),
                         "monto_pagar": await col_text(cols, 9),
                         "monto_final": await col_text(cols, 10),

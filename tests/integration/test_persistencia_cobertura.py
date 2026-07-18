@@ -46,6 +46,7 @@ _SATELITES = {
             "tipo": "Normal",
             "precio_unitario": "10.000,00",
             "descuento": "0,00",
+            "descuento_tipo": "Promoción10%",  # DEC-024
             "precio_descuento": "10.000,00",
             "cantidad_pedido": "10",
             "cantidad_entregada": "9",

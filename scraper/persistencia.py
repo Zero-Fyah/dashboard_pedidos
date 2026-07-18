@@ -156,12 +156,12 @@ async def _persistir_secciones_satelite(
         await db.executemany(
             """INSERT INTO detalle_diferencias
                (id_pedido, nombre_producto, especificacion, tipo,
-                precio_unitario, descuento, precio_descuento,
+                precio_unitario, descuento, descuento_tipo, precio_descuento,
                 cantidad_pedido, cantidad_entregada, diferencia_cantidad,
                 monto_pagar_pedido, monto_final_pagar, iva, monto_diferencia)
                VALUES
                (:id_pedido, :nombre_producto, :especificacion, :tipo,
-                :precio_unitario, :descuento, :precio_descuento,
+                :precio_unitario, :descuento, :descuento_tipo, :precio_descuento,
                 :cantidad_pedido, :cantidad_entregada, :diferencia_cantidad,
                 :monto_pagar_pedido, :monto_final_pagar, :iva, :monto_diferencia)""",
             resultado["detalle_dif"],
@@ -286,6 +286,8 @@ async def persistencia_worker(
                                 "cantidad_entregada": linea["cantidad_entregada"],
                                 "precio_unitario": linea["precio_unitario"],
                                 "descuento": linea["descuento"],
+                                # DEC-024: tipo separado del monto
+                                "descuento_tipo": linea.get("descuento_tipo", ""),
                                 "precio_descuento": linea["precio_descuento"],
                                 "monto_pagar": linea["monto_pagar"],
                                 "monto_final": linea["monto_final"],
@@ -403,14 +405,16 @@ async def persistencia_worker(
                                     id_pedido, numero_subpedido, tipo_subpedido,
                                     nombre_producto, referencia, codigo_barras, presentacion,
                                     almacen, cantidad_comprada, cantidad_entregada,
-                                    precio_unitario, descuento, precio_descuento,
+                                    precio_unitario, descuento, descuento_tipo,
+                                    precio_descuento,
                                     monto_pagar, monto_final, iva, peso_total, observaciones,
                                     numero_caja, tipo
                                 ) VALUES (
                                     :id_pedido, :numero_subpedido, :tipo_subpedido,
                                     :nombre_producto, :referencia, :codigo_barras, :presentacion,
                                     :almacen, :cantidad_comprada, :cantidad_entregada,
-                                    :precio_unitario, :descuento, :precio_descuento,
+                                    :precio_unitario, :descuento, :descuento_tipo,
+                                    :precio_descuento,
                                     :monto_pagar, :monto_final, :iva, :peso_total, :observaciones,
                                     :numero_caja, :tipo
                                 )
