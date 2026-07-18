@@ -94,6 +94,32 @@ async def leer_celda_descuento(celda) -> tuple[str, str]:
     return (monto or "-", " | ".join(etiquetas))
 
 
+async def leer_presentacion(info_col) -> str:
+    """Une todos los <span> de .goods-specs — DEC-026.
+
+    Un producto puede traer varios atributos (Tamaño, Color,
+    Presentación...) en spans separados dentro de .goods-specs. Antes se
+    leía con `query_selector` (singular) y se perdía todo menos el
+    primer span.
+
+    Args:
+        info_col: Columna .goods-info-col del producto (puede ser None).
+
+    Returns:
+        Los textos no vacíos unidos con " | " (mismo separador que
+        descuento_tipo, DEC-024), o "" si no hay info_col ni specs.
+    """
+    if not info_col:
+        return ""
+    spans = await info_col.query_selector_all(".goods-specs span")
+    partes = []
+    for span in spans:
+        texto = (await span.inner_text()).strip()
+        if texto:
+            partes.append(texto)
+    return " | ".join(partes)
+
+
 # ─────────────────────────────────────────────
 # LOGIN
 # ─────────────────────────────────────────────
@@ -913,7 +939,7 @@ async def extraer_subpedidos(page: Page) -> list[dict]:
                 referencia = await ic_txt(info_col, ".sn-tag")
                 cod_raw = await ic_txt(info_col, ".goods-barcode")
                 cod_barras = cod_raw.replace("Código de barras:", "").strip()
-                presentac = await ic_txt(info_col, ".goods-specs span")
+                presentac = await leer_presentacion(info_col)
 
                 cant_c_str = await col_text(cols, 3)
                 cant_e_str = await col_text(cols, 4)
