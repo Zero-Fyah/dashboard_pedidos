@@ -78,6 +78,20 @@ ESTADOS_CONOCIDOS: frozenset[str] = (
     ESTADOS_CERRADOS | ESTADOS_FIJAN_CANTIDADES | frozenset(ESTADOS_ACTIVOS_INVENTARIO)
 )
 
+# Acciones de staff que cuentan para el rendimiento de operadores
+# (VIEW v_rendimiento_operadores del ETL — HAL-008, extraídas en Fase 6).
+# Verificadas contra registro_operaciones en DB real el 2026-07-17: son
+# exactamente las 4 acciones existentes. Tupla — no frozenset — para SQL
+# determinístico. Si el sistema origen renombra una acción, el check
+# etl_view_vacia solo detecta el caso "todas desaparecieron": mantener
+# esta lista alineada con el origen.
+ACCIONES_RENDIMIENTO: tuple[str, ...] = (
+    "Alistamiento sin diferencia",
+    "Alistamiento con faltantes",
+    "Inspección sin diferencia",
+    "Inspección con diferencia",
+)
+
 
 # ─────────────────────────────────────────────
 # UTILIDADES PURAS

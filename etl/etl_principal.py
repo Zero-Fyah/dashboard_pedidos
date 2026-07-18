@@ -2,16 +2,18 @@
 ETL principal — dashboard_pedidos
 Normaliza montos TEXT a REAL y crea VIEWs analíticas
 sobre data/pedidos.db.
+
+Ejecutar desde la raíz del proyecto como módulo (E-7, requiere la
+instalación editable de DEC-018):
+
+    python -m etl.etl_principal
 """
-
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import asyncio
 import json
 import logging
+import sqlite3
+import sys
 from datetime import datetime, timezone
 
 import aiosqlite
@@ -19,6 +21,7 @@ import aiosqlite
 # AUD-M5 (auditoría 2026-07-01): importar del módulo común — el ETL ya no
 # carga el scraper (ni Playwright, ni sus efectos secundarios de import).
 from comun import (
+    ACCIONES_RENDIMIENTO,
     ESTADOS_ACTIVOS_INVENTARIO,
     ESTADOS_CERRADOS,
     ESTADOS_CONOCIDOS,
@@ -26,14 +29,38 @@ from comun import (
     to_num,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("etl")
+
+# E-8 (Fase 5): tope de WARNINGs fila a fila por columna y por corrida —
+# un formato masivo nuevo en el origen ya no genera miles de líneas; el
+# excedente lo agrega etl_conversion_resumen con muestra de valores.
+_MAX_DETALLE_FALLIDAS = 10
+_MAX_MUESTRA_FALLIDAS = 10
+
+
+def _sql_literal(texto: str) -> str:
+    """Escapa un texto como literal SQL entre comillas simples.
+
+    E-8: un estado con apóstrofe rompería el SQL generado de las views;
+    la duplicación de comillas ('') es el escape estándar de SQLite.
+
+    Args:
+        texto: Valor a convertir en literal SQL.
+
+    Returns:
+        El literal entre comillas simples con apóstrofes escapados.
+    """
+    return "'" + texto.replace("'", "''") + "'"
+
 
 # AUD-M8 (auditoría 2026-07-01): literales SQL generados desde las
 # constantes del módulo común — único origen de verdad para
 # "cerrado"/"activo" en las VIEWs. sorted() para SQL determinístico.
-_CERRADOS_SQL = ",".join(f"'{e}'" for e in sorted(ESTADOS_CERRADOS))
-_ACTIVOS_INVENTARIO_SQL = ",".join(f"'{e}'" for e in ESTADOS_ACTIVOS_INVENTARIO)
+_CERRADOS_SQL = ",".join(_sql_literal(e) for e in sorted(ESTADOS_CERRADOS))
+_ACTIVOS_INVENTARIO_SQL = ",".join(_sql_literal(e) for e in ESTADOS_ACTIVOS_INVENTARIO)
+# HAL-008 (Fase 6): las acciones de v_rendimiento_operadores también se
+# generan desde comun/ — mismo patrón que los estados.
+_ACCIONES_RENDIMIENTO_SQL = ",".join(_sql_literal(a) for a in ACCIONES_RENDIMIENTO)
 
 
 def _log_event(
@@ -61,6 +88,8 @@ def _log_event(
     line = json.dumps(record, ensure_ascii=False)
     if level == "ERROR":
         logger.error(line)
+    elif level == "WARNING":
+        logger.warning(line)
     else:
         logger.info(line)
 
@@ -68,112 +97,192 @@ def _log_event(
 async def normalizar_montos(db: aiosqlite.Connection) -> None:
     """Agrega columnas _num REAL y las puebla con to_num().
 
-    Usa ALTER TABLE con try/except por columna para
-    idempotencia. Puebla en batches de 500 filas
-    procesando solo las filas donde _num IS NULL.
+    Valida primero que las tablas y columnas fuente existen
+    (E-8: un rename del scraper falla con causa clara, no como
+    OperationalError a mitad del poblado). Usa ALTER TABLE con
+    try/except por columna para idempotencia. Puebla en batches
+    de 500 filas procesando solo las filas donde _num IS NULL y
+    la columna origen no es NULL (E-4/DEC-020). Las filas cuya
+    conversión falla quedan _num NULL sin UPDATE y se re-escanean
+    deliberadamente en cada corrida (política DEC-020).
 
     Args:
         db: Conexión abierta a pedidos.db.
+
+    Raises:
+        RuntimeError: si una tabla o columna fuente esperada
+            no existe en la DB.
     """
-    columnas_por_tabla = {
-        "lineas_pedido": [
-            "precio_unitario_num",
-            "descuento_num",
-            "precio_descuento_num",
-            "monto_pagar_num",
-            "monto_final_num",
-            "iva_num",
-            "peso_total_num",
-        ],
-        "estadisticas_monto": [
-            "monto_pagar_num",
-            "monto_final_num",
-            "diferencia_num",
-        ],
-        "gestion_diferencias": [
-            "total_pagar_pedido_num",
-            "monto_final_pagar_num",
-            "monto_pagado_num",
-            "monto_diferencia_num",
-        ],
-        "detalle_diferencias": [
-            "precio_unitario_num",
-            "descuento_num",
-            "precio_descuento_num",
-            "cantidad_pedido_num",
-            "cantidad_entregada_num",
-            "diferencia_cantidad_num",
-            "monto_pagar_pedido_num",
-            "monto_final_pagar_num",
-            "iva_num",
-            "monto_diferencia_num",
-        ],
+    # E-8: dict explícito columna origen → columna _num destino. Antes se
+    # derivaba con col_num[:-4] — un typo producía un error SQL opaco.
+    columnas_por_tabla: dict[str, dict[str, str]] = {
+        "lineas_pedido": {
+            "precio_unitario": "precio_unitario_num",
+            "descuento": "descuento_num",
+            "precio_descuento": "precio_descuento_num",
+            "monto_pagar": "monto_pagar_num",
+            "monto_final": "monto_final_num",
+            "iva": "iva_num",
+            "peso_total": "peso_total_num",
+        },
+        "estadisticas_monto": {
+            "monto_pagar": "monto_pagar_num",
+            "monto_final": "monto_final_num",
+            "diferencia": "diferencia_num",
+        },
+        "gestion_diferencias": {
+            "total_pagar_pedido": "total_pagar_pedido_num",
+            "monto_final_pagar": "monto_final_pagar_num",
+            "monto_pagado": "monto_pagado_num",
+            "monto_diferencia": "monto_diferencia_num",
+        },
+        "detalle_diferencias": {
+            "precio_unitario": "precio_unitario_num",
+            "descuento": "descuento_num",
+            "precio_descuento": "precio_descuento_num",
+            "cantidad_pedido": "cantidad_pedido_num",
+            "cantidad_entregada": "cantidad_entregada_num",
+            "diferencia_cantidad": "diferencia_cantidad_num",
+            "monto_pagar_pedido": "monto_pagar_pedido_num",
+            "monto_final_pagar": "monto_final_pagar_num",
+            "iva": "iva_num",
+            "monto_diferencia": "monto_diferencia_num",
+        },
     }
+
+    # E-8: validar que tablas y columnas fuente existen ANTES de tocar el
+    # schema — un rename en el scraper debe fallar aquí con causa clara,
+    # no como OperationalError opaco a mitad del poblado.
+    for tabla, columnas in columnas_por_tabla.items():
+        async with db.execute(f"PRAGMA table_info({tabla})") as cur:
+            cols_reales = {row[1] for row in await cur.fetchall()}
+        if not cols_reales:
+            raise RuntimeError(
+                f"ETL: la tabla '{tabla}' no existe en la DB — ¿cambió el schema del scraper?"
+            )
+        faltantes = sorted(set(columnas) - cols_reales)
+        if faltantes:
+            raise RuntimeError(
+                f"ETL: columnas fuente inexistentes en '{tabla}': {faltantes} — "
+                "¿cambió el schema del scraper?"
+            )
 
     for tabla, columnas in columnas_por_tabla.items():
         # Paso 1: agregar columnas con ALTER TABLE
-        for col_num in columnas:
+        for col_num in columnas.values():
             try:
                 await db.execute(f"ALTER TABLE {tabla} ADD COLUMN {col_num} REAL")
                 await db.commit()
-            except Exception:
-                # La columna ya existe — continuar
-                pass
+            except sqlite3.OperationalError as exc:
+                # Solo "duplicate column name" es esperado (idempotencia);
+                # cualquier otro error (no such table, DB locked, corrupta)
+                # debe fallar aquí y no más adelante en el SELECT.
+                if "duplicate column name" not in str(exc):
+                    raise
 
         # Paso 2: poblar en batches de 500 filas.
         # Filtra por col_num IS NULL para procesar únicamente
         # las filas que aún no tienen valor convertido.
         # Esto hace el ETL idempotente y captura correctamente
         # las filas nuevas que deja el scraper en cada ejecución.
-        for col_num in columnas:
-            col_src = col_num[:-4]  # quitar "_num"
+        for col_src, col_num in columnas.items():
             last_id = 0
             batch_count = 0
-            total_filas = 0
-            total_fallidos = 0
+            total_escaneadas = 0
+            total_convertidas = 0
+            total_fallidas = 0
+            muestra_fallidas: set[str] = set()
             while True:
-                rows = await (
-                    await db.execute(
-                        f"SELECT id, {col_src} FROM {tabla} "
-                        f"WHERE id > ? AND {col_num} IS NULL "
-                        f"ORDER BY id LIMIT 500",
-                        (last_id,),
-                    )
-                ).fetchall()
+                # E-4/DEC-020: las filas con fuente NULL se excluyen del
+                # escaneo — no hay nada que convertir; su magnitud se
+                # reporta con un COUNT al cierre de la columna.
+                async with db.execute(
+                    f"SELECT id, {col_src} FROM {tabla} "
+                    f"WHERE id > ? AND {col_num} IS NULL "
+                    f"AND {col_src} IS NOT NULL "
+                    f"ORDER BY id LIMIT 500",
+                    (last_id,),
+                ) as cur:
+                    rows = await cur.fetchall()
                 if not rows:
+                    async with db.execute(
+                        f"SELECT COUNT(*) FROM {tabla} "
+                        f"WHERE {col_num} IS NULL AND {col_src} IS NULL"
+                    ) as cur:
+                        fuente_null = (await cur.fetchone())[0]
+                    # E-8 (Fase 5): resumen agregado de fallidas — el
+                    # detalle fila a fila se limita a _MAX_DETALLE_FALLIDAS;
+                    # la muestra de valores distintos es la telemetría que
+                    # AUD-M1 necesita para auditar formatos reales.
+                    if total_fallidas:
+                        _log_event(
+                            "etl_conversion_resumen",
+                            level="WARNING",
+                            msg=(
+                                f"{tabla}.{col_src} | "
+                                f"{total_fallidas} fallidas "
+                                f"({min(total_fallidas, _MAX_DETALLE_FALLIDAS)} "
+                                f"detalladas) | muestra: "
+                                f"{sorted(muestra_fallidas)}"
+                            ),
+                            tabla=tabla,
+                            columna=col_num,
+                            fallidas=total_fallidas,
+                            detalladas=min(total_fallidas, _MAX_DETALLE_FALLIDAS),
+                            muestra_valores=sorted(muestra_fallidas),
+                        )
+                    # E-3: tres contadores veraces como campos JSON
+                    # (catálogo en docs/structure.md).
                     _log_event(
                         "etl_columna_ok",
                         msg=(
                             f"{tabla}.{col_num} | "
-                            f"{total_filas} filas convertidas | "
-                            f"{total_fallidos} sin valor fuente"
+                            f"{total_convertidas} convertidas | "
+                            f"{total_fallidas} fallidas | "
+                            f"{fuente_null} fuente NULL"
                         ),
+                        tabla=tabla,
+                        columna=col_num,
+                        convertidas=total_convertidas,
+                        fallidas=total_fallidas,
+                        fuente_null=fuente_null,
                     )
                     break
                 for row_id, val in rows:
-                    valor_num = to_num(val) if val is not None else None
-                    if val is not None and valor_num is None:
-                        total_fallidos += 1
-                        _log_event(
-                            "etl_conversion_fallida",
-                            level="WARNING",
-                            msg=(f"{tabla}.{col_src} id={row_id} valor_original={val!r}"),
-                        )
+                    # val nunca es None: el SELECT filtra col_src IS NOT NULL
+                    valor_num = to_num(val)
+                    if valor_num is None:
+                        # DEC-020: sin UPDATE — la fila queda _num NULL y
+                        # se reintenta en la próxima corrida (auto-repara
+                        # cuando to_num cubra el formato, sin churn de WAL).
+                        total_fallidas += 1
+                        if len(muestra_fallidas) < _MAX_MUESTRA_FALLIDAS:
+                            muestra_fallidas.add(repr(val))
+                        # E-8 (Fase 5): detalle fila a fila solo hasta el
+                        # tope; el excedente lo agrega el resumen.
+                        if total_fallidas <= _MAX_DETALLE_FALLIDAS:
+                            _log_event(
+                                "etl_conversion_fallida",
+                                level="WARNING",
+                                msg=(f"{tabla}.{col_src} id={row_id} valor_original={val!r}"),
+                            )
+                        continue
                     await db.execute(
                         f"UPDATE {tabla} SET {col_num} = ? WHERE id = ?",
                         (valor_num, row_id),
                     )
+                    total_convertidas += 1
                 last_id = rows[-1][0]
                 await db.commit()
                 batch_count += 1
-                total_filas += len(rows)
+                total_escaneadas += len(rows)
                 if batch_count % 10 == 0:
                     _log_event(
                         "etl_batch",
                         msg=(
                             f"{tabla}.{col_num} | "
                             f"batch {batch_count} | "
-                            f"{total_filas} filas acumuladas"
+                            f"{total_escaneadas} filas escaneadas"
                         ),
                     )
 
@@ -182,7 +291,10 @@ async def crear_views(db: aiosqlite.Connection) -> None:
     """Crea o reemplaza las VIEWs analíticas y de montos limpios.
 
     Usa DROP VIEW IF EXISTS antes de cada CREATE VIEW
-    para garantizar idempotencia.
+    para garantizar idempotencia. Todo el DROP+CREATE ocurre
+    dentro de una transacción explícita (BEGIN IMMEDIATE,
+    DEC-019): con WAL, los lectores concurrentes ven el
+    snapshot anterior hasta el COMMIT y nunca una view ausente.
 
     VIEWs analíticas (7): v_pedidos_activos, v_pedidos_cerrados,
     v_inventario_comprometido, v_diferencias_resumen,
@@ -215,8 +327,14 @@ async def crear_views(db: aiosqlite.Connection) -> None:
                     ({_CERRADOS_SQL})
                     THEN 1 ELSE 0 END) AS subpedidos_abiertos
             FROM pedidos p
+            -- DEC-021: INNER JOIN deliberado — un pedido sin subpedidos
+            -- (estado anómalo, ver etl_pedido_sin_subpedidos) no entra
+            -- a ninguna de las dos views de pedidos.
             JOIN subpedidos s ON p.id_pedido = s.id_pedido
             WHERE p.scraping_completo = 1
+            -- E-8/DEC-021: columnas desnudas en el SELECT con GROUP BY por
+            -- PK (p.id_pedido) — determinístico en SQLite por dependencia
+            -- funcional; SQL no portable a otros motores, aceptado.
             GROUP BY p.id_pedido
             HAVING subpedidos_abiertos > 0
         """,
@@ -230,8 +348,10 @@ async def crear_views(db: aiosqlite.Connection) -> None:
                 p.actualizado_en,
                 COUNT(s.id) AS total_subpedidos
             FROM pedidos p
+            -- DEC-021: INNER JOIN deliberado (ver v_pedidos_activos)
             JOIN subpedidos s ON p.id_pedido = s.id_pedido
             WHERE p.scraping_completo = 1
+            -- E-8/DEC-021: GROUP BY por PK — ver v_pedidos_activos
             GROUP BY p.id_pedido
             HAVING SUM(CASE WHEN LOWER(s.estado) NOT IN
                 ({_CERRADOS_SQL})
@@ -288,9 +408,11 @@ async def crear_views(db: aiosqlite.Connection) -> None:
             LEFT JOIN detalle_diferencias d
                 ON p.id_pedido = d.id_pedido
             WHERE p.hay_diferencia = 1
+            -- E-8/DEC-021: GROUP BY por PK; las columnas g.* son 1:1 por
+            -- el UNIQUE de AUD-B9 (idx_gestion_dif_unico) — determinístico
             GROUP BY p.id_pedido
         """,
-        "v_rendimiento_operadores": """
+        "v_rendimiento_operadores": f"""
             SELECT
                 o.usuario,
                 o.tipo_usuario,
@@ -301,12 +423,8 @@ async def crear_views(db: aiosqlite.Connection) -> None:
                 MAX(o.momento) AS ultima_operacion
             FROM registro_operaciones o
             WHERE o.tipo_usuario = 'staff'
-            AND o.accion IN (
-                'Alistamiento sin diferencia',
-                'Alistamiento con faltantes',
-                'Inspección sin diferencia',
-                'Inspección con diferencia'
-            )
+            -- HAL-008 (Fase 6): acciones desde comun.ACCIONES_RENDIMIENTO
+            AND o.accion IN ({_ACCIONES_RENDIMIENTO_SQL})
             GROUP BY o.usuario, o.accion, DATE(o.momento)
             ORDER BY fecha DESC, o.usuario
         """,
@@ -410,10 +528,59 @@ async def crear_views(db: aiosqlite.Connection) -> None:
         """,
     }
 
-    for nombre, sql in views.items():
-        await db.execute(f"DROP VIEW IF EXISTS {nombre}")
-        await db.execute(f"CREATE VIEW {nombre} AS {sql}")
+    # DEC-019 (E-2): el DDL ejecuta en autocommit bajo el isolation_level
+    # legacy — sin transacción explícita cada DROP VIEW se materializa al
+    # instante y deja una ventana en la que un lector concurrente recibe
+    # "no such view" (causa raíz de HAL-007/AUD-M6). BEGIN IMMEDIATE toma
+    # el write lock de entrada; con WAL los lectores ven el snapshot
+    # anterior hasta el COMMIT.
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        for nombre, sql in views.items():
+            await db.execute(f"DROP VIEW IF EXISTS {nombre}")
+            await db.execute(f"CREATE VIEW {nombre} AS {sql}")
+    except Exception:
+        await db.rollback()
+        raise
     await db.commit()
+
+
+async def verificar_pedidos_sin_subpedidos(db: aiosqlite.Connection) -> int:
+    """Check defensivo DEC-021: pedidos completos sin subpedidos.
+
+    Un pedido con scraping_completo=1 sin filas en subpedidos es un
+    estado anómalo (FIX C-2 lo impide desde 2026-07-02, pero existen
+    legados): las views de pedidos lo excluyen por diseño y sin este
+    check sería invisible. Emite etl_pedido_sin_subpedidos (WARNING)
+    con conteo y muestra de IDs; el remedio es re-scrapear en modo
+    completo.
+
+    Args:
+        db: Conexión abierta a pedidos.db.
+
+    Returns:
+        Cantidad de pedidos anómalos encontrados.
+    """
+    async with db.execute(
+        "SELECT p.id_pedido FROM pedidos p "
+        "WHERE p.scraping_completo = 1 "
+        "AND NOT EXISTS (SELECT 1 FROM subpedidos s WHERE s.id_pedido = p.id_pedido) "
+        "ORDER BY p.id_pedido"
+    ) as cur:
+        ids = [r[0] for r in await cur.fetchall()]
+    if ids:
+        _log_event(
+            "etl_pedido_sin_subpedidos",
+            level="WARNING",
+            msg=(
+                f"{len(ids)} pedidos con scraping_completo=1 sin subpedidos — "
+                "invisibles en v_pedidos_activos/cerrados (DEC-021); "
+                "re-scrapear en modo completo"
+            ),
+            total=len(ids),
+            muestra_ids=ids[:10],
+        )
+    return len(ids)
 
 
 async def main() -> int:
@@ -436,9 +603,8 @@ async def main() -> int:
             await db.execute("PRAGMA foreign_keys=ON")
             await normalizar_montos(db)
             await crear_views(db)
-            row = await (
-                await db.execute("SELECT COUNT(*) FROM v_rendimiento_operadores")
-            ).fetchone()
+            async with db.execute("SELECT COUNT(*) FROM v_rendimiento_operadores") as cur:
+                row = await cur.fetchone()
             if row and row[0] == 0:
                 _log_event(
                     "etl_view_vacia",
@@ -450,12 +616,11 @@ async def main() -> int:
             # DB fuera de las listas del módulo común indica que el sistema
             # origen agregó o renombró estados; las VIEWs podrían estar
             # excluyéndolo en silencio.
-            rows_est = await (
-                await db.execute(
-                    "SELECT DISTINCT LOWER(estado) FROM subpedidos "
-                    "WHERE estado IS NOT NULL AND estado != ''"
-                )
-            ).fetchall()
+            async with db.execute(
+                "SELECT DISTINCT LOWER(estado) FROM subpedidos "
+                "WHERE estado IS NOT NULL AND estado != ''"
+            ) as cur:
+                rows_est = await cur.fetchall()
             desconocidos = sorted(r[0] for r in rows_est if r[0] not in ESTADOS_CONOCIDOS)
             if desconocidos:
                 _log_event(
@@ -466,6 +631,10 @@ async def main() -> int:
                         f"del módulo común: {desconocidos}"
                     ),
                 )
+
+            # DEC-021 (Fase 6): pedidos completos sin subpedidos — anómalos
+            # e invisibles en las views de pedidos; hacerlos visibles.
+            await verificar_pedidos_sin_subpedidos(db)
         _log_event("etl_completado", db_path=db_path)
         return 0
     except Exception as exc:
@@ -480,5 +649,8 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
+    # E-6: basicConfig solo al ejecutar como script — importar este módulo
+    # (tests, dashboard) no debe reconfigurar el root logger del proceso.
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     # AUD-B7: main() retorna el exit code; sys.exit() solo vive aquí.
     sys.exit(asyncio.run(main()))

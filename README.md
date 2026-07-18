@@ -74,6 +74,15 @@ scraper/scraper_principal.py
 
 El pipeline continúa hacia `dashboard/app.py` (Streamlit), que consume `data/pedidos.db` directamente.
 
+### Principios de diseño
+
+El proyecto se rige por **SOLID, DRY, KISS, YAGNI y bajo acoplamiento**,
+aplicados de forma verificable, no declarativa: las etapas se comunican
+solo por contratos de datos (SQLite + VIEWs, nunca imports cruzados), el
+dominio compartido vive una única vez en `comun/`, y las optimizaciones
+requieren medición previa que las justifique. Cada decisión de diseño no
+trivial queda registrada con su trade-off antes de implementarse.
+
 ---
 
 ## Estructura del repositorio
@@ -196,8 +205,8 @@ python scraper/scraper_principal.py --desde 2026-05-01
 # y captura pedidos nuevos desde la última corrida OK
 python scraper/scraper_principal.py --modo incremental
 
-# Normalizar montos y crear VIEWs analíticas
-python etl/etl_principal.py
+# Normalizar montos y crear VIEWs analíticas (como módulo — E-7)
+python -m etl.etl_principal
 
 # Migración puntual: resetear pedidos sin timeline para re-scraping (ver BUG-012)
 python scraper/migrations/reset_timeline_incompleto.py
