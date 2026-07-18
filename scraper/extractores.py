@@ -409,24 +409,51 @@ async def extraer_info_general(page: Page) -> dict:
     return datos
 
 
+# DEC-023: mapeo etiqueta de la SPA → clave del dict de resultado. La
+# tabla de entrega cambia de layout según el método (Ruta agrega Conductor
+# y Vehículo de entrega), así que se lee por etiqueta, nunca por posición.
+_ETIQUETAS_ENTREGA: dict[str, str] = {
+    "Método de entrega": "entrega_metodo_texto",
+    "Despachador": "despachador",
+    "Conductor": "conductor",
+    "Hora de entrega": "hora_entrega",
+    "Vehículo de entrega": "vehiculo_entrega",
+    "Observaciones": "obs_entrega",
+}
+
+# Etiquetas presentes en la tabla que no se extraen a propósito (su valor
+# es un botón que abre un modal, no un dato).
+_ETIQUETAS_ENTREGA_IGNORADAS: frozenset[str] = frozenset({"Número de estante de inspección"})
+
+
 async def extraer_info_entrega(page: Page, id_pedido: str) -> dict:
     """Extrae el card 'Información de entrega' (tabla el-descriptions).
 
-    Estructura del HTML:
-      Fila 0: Método de entrega (texto + tag ruta opcional + tag descuento)
-              | Despachador
-      Fila 1: Hora de entrega | Número de estante (se omite)
-      Fila 2: Observaciones (colspan 3)
+    Lee **por etiqueta** (DEC-023): empareja cada celda
+    `el-descriptions__label` con la celda `el-descriptions__content`
+    siguiente. El layout de la tabla depende del método de entrega —
+    'Ruta' agrega las filas Conductor y Vehículo de entrega — por lo que
+    el indexado posicional anterior guardaba el conductor en
+    `hora_entrega` y el vehículo en `obs_entrega` (BUG-019).
+
+    Una etiqueta desconocida emite `entrega_etiqueta_desconocida`
+    (WARNING) en lugar de perderse en silencio.
+
+    Args:
+        page: Página Playwright con el detalle del pedido ya cargado.
+        id_pedido: ID del pedido, solo para los logs.
 
     Returns:
-        Dict con 6 claves. Todas vacías si el card no existe.
+        Dict con 8 claves. Todas vacías si el card no existe.
     """
     resultado = {
         "entrega_metodo_texto": "",
         "entrega_ruta_tag": "",
         "entrega_descuento_tag": "",
         "despachador": "",
+        "conductor": "",
         "hora_entrega": "",
+        "vehiculo_entrega": "",
         "obs_entrega": "",
     }
     try:
@@ -434,38 +461,55 @@ async def extraer_info_entrega(page: Page, id_pedido: str) -> dict:
         if not tabla:
             return resultado
 
-        filas = await tabla.query_selector_all("tbody tr")
+        celdas = await tabla.query_selector_all("td")
+        desconocidas: list[str] = []
 
-        if len(filas) > 0:
-            celdas = await filas[0].query_selector_all("td")
-            if len(celdas) >= 4:
-                celda_metodo = celdas[1]
+        for i, celda in enumerate(celdas):
+            clases = (await celda.get_attribute("class")) or ""
+            if "el-descriptions__label" not in clases:
+                continue
+            etiqueta = (await celda.inner_text()).strip()
+            if etiqueta in _ETIQUETAS_ENTREGA_IGNORADAS:
+                continue
+            clave = _ETIQUETAS_ENTREGA.get(etiqueta)
+            if clave is None:
+                if etiqueta:
+                    desconocidas.append(etiqueta)
+                continue
+            if i + 1 >= len(celdas):
+                continue
+            celda_valor = celdas[i + 1]
 
-                texto_raw = (await celda_metodo.inner_text()).strip()
-                for tag_el in await celda_metodo.query_selector_all(".el-tag"):
+            if clave == "entrega_metodo_texto":
+                # La celda del método incluye tags (ruta/descuento) que se
+                # extraen aparte y se quitan del texto plano.
+                texto_raw = (await celda_valor.inner_text()).strip()
+                for tag_el in await celda_valor.query_selector_all(".el-tag"):
                     tag_txt = (await tag_el.inner_text()).strip()
                     texto_raw = texto_raw.replace(tag_txt, "").strip()
                 resultado["entrega_metodo_texto"] = texto_raw
 
-                tag_ruta = await celda_metodo.query_selector(".el-tag--primary .el-tag__content")
+                tag_ruta = await celda_valor.query_selector(".el-tag--primary .el-tag__content")
                 if tag_ruta:
                     resultado["entrega_ruta_tag"] = (await tag_ruta.inner_text()).strip()
 
-                tag_dto = await celda_metodo.query_selector(".el-tag--warning .el-tag__content")
+                tag_dto = await celda_valor.query_selector(".el-tag--warning .el-tag__content")
                 if tag_dto:
                     resultado["entrega_descuento_tag"] = (await tag_dto.inner_text()).strip()
+            else:
+                resultado[clave] = (await celda_valor.inner_text()).strip()
 
-                resultado["despachador"] = (await celdas[3].inner_text()).strip()
-
-        if len(filas) > 1:
-            celdas = await filas[1].query_selector_all("td")
-            if len(celdas) >= 2:
-                resultado["hora_entrega"] = (await celdas[1].inner_text()).strip()
-
-        if len(filas) > 2:
-            celdas = await filas[2].query_selector_all("td")
-            if len(celdas) >= 2:
-                resultado["obs_entrega"] = (await celdas[1].inner_text()).strip()
+        if desconocidas:
+            log_event(
+                "entrega_etiqueta_desconocida",
+                id_pedido=id_pedido,
+                level="WARNING",
+                msg=(
+                    "Etiquetas nuevas en la tabla de entrega — campo no "
+                    f"capturado (DEC-023): {sorted(set(desconocidas))}"
+                ),
+                etiquetas=sorted(set(desconocidas)),
+            )
 
     except Exception as exc:
         log_event(

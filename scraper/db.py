@@ -173,6 +173,11 @@ async def init_db(db_path: str) -> None:
             "ALTER TABLE pedidos ADD COLUMN despachador           TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN hora_entrega          TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN obs_entrega           TEXT    DEFAULT NULL",
+            # DEC-023: la SPA solo renderiza estos dos campos con
+            # metodo_entrega='Ruta'; antes se guardaban por error en
+            # hora_entrega y obs_entrega (BUG-019).
+            "ALTER TABLE pedidos ADD COLUMN conductor             TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN vehiculo_entrega      TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN entrega_ruta_tag      TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN entrega_descuento_tag TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN hay_diferencia        INTEGER DEFAULT 0",

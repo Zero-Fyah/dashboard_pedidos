@@ -471,7 +471,9 @@ async def persistencia_worker(
                             inspector_pedido      = :ip,
                             movil_cliente         = :mc,
                             despachador           = :desp,
+                            conductor             = :cond,
                             hora_entrega          = :he,
+                            vehiculo_entrega      = :veh,
                             obs_entrega           = :oe,
                             entrega_ruta_tag      = :ert,
                             entrega_descuento_tag = :edt
@@ -482,7 +484,11 @@ async def persistencia_worker(
                             "ip": info_g.get("inspector_pedido", ""),
                             "mc": info_g.get("movil_cliente", ""),
                             "desp": info_e.get("despachador", ""),
+                            # DEC-023: conductor y vehículo solo vienen con
+                            # metodo_entrega='Ruta'; vacíos en el resto.
+                            "cond": info_e.get("conductor", ""),
                             "he": info_e.get("hora_entrega", ""),
+                            "veh": info_e.get("vehiculo_entrega", ""),
                             "oe": info_e.get("obs_entrega", ""),
                             "ert": info_e.get("entrega_ruta_tag", ""),
                             "edt": info_e.get("entrega_descuento_tag", ""),
