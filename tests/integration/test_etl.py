@@ -245,6 +245,68 @@ async def test_sin_pedidos_anomalos_no_emite_warning(db_path, caplog):
     assert eventos == []
 
 
+# ── DEC-025 — placeholders: '-' es cero solo en descuento ─────────────────────
+
+
+@pytest.mark.integration
+async def test_placeholders_guion_cero_solo_en_descuento(db_path, caplog):
+    """DEC-025: en `descuento` el guion vale 0; en `precio_descuento`
+    (misma tabla, misma fila) queda NULL porque significa 'sin descuento'.
+
+    Convertirlo a 0 ahí pondría el precio en cero — el error que la
+    decisión evita explícitamente.
+    """
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO pedidos (id_pedido, fecha, scraping_completo) "
+            "VALUES ('TEST-PH', '2026-06-01', 1)"
+        )
+        await db.execute(
+            "INSERT INTO subpedidos (id_pedido, numero_subpedido, tipo_subpedido, estado) "
+            "VALUES ('TEST-PH', 'SUB-PH', 'Normal', 'enviado')"
+        )
+        await db.execute(
+            "INSERT INTO lineas_pedido "
+            "(id_pedido, numero_subpedido, nombre_producto, precio_unitario, "
+            " descuento, precio_descuento, peso_total) "
+            "VALUES ('TEST-PH', 'SUB-PH', 'Producto PH', 'COP 7.200', "
+            "'-', '-', 'g')"
+        )
+        await db.commit()
+
+        with caplog.at_level(logging.INFO, logger="etl"):
+            await normalizar_montos(db)
+
+        async with db.execute(
+            "SELECT descuento_num, precio_descuento_num, precio_unitario_num, peso_total_num "
+            "FROM lineas_pedido WHERE id_pedido = 'TEST-PH'"
+        ) as cur:
+            desc, precio_desc, precio_unit, peso = await cur.fetchone()
+
+    assert desc == 0.0, "descuento '-' debe ser 0 (regla de negocio)"
+    assert precio_desc is None, "precio_descuento '-' NO es cero: es 'sin descuento'"
+    assert precio_unit == 7200.0, "los valores reales se convierten igual"
+    assert peso is None, "peso 'g' es ausencia (el cero real sería '0g')"
+
+    eventos = _eventos_etl(caplog)
+    # El placeholder no genera WARNING de conversión fallida.
+    fallidas = [
+        e
+        for e in eventos
+        if e["event"] == "etl_conversion_fallida" and "TEST-PH" not in e.get("msg", "")
+    ]
+    evento = next(
+        e
+        for e in eventos
+        if e["event"] == "etl_columna_ok"
+        and e.get("tabla") == "lineas_pedido"
+        and e.get("columna") == "precio_descuento_num"
+    )
+    assert evento["placeholders"] == 1
+    assert evento["fallidas"] == 0
+    assert fallidas == []
+
+
 # ── E-8 Fase 5 — tope de WARNINGs por columna + resumen agregado ───────────────
 
 

@@ -22,11 +22,13 @@ import aiosqlite
 # carga el scraper (ni Playwright, ni sus efectos secundarios de import).
 from comun import (
     ACCIONES_RENDIMIENTO,
+    COLUMNAS_GUION_ES_CERO,
     ESTADOS_ACTIVOS_INVENTARIO,
     ESTADOS_CERRADOS,
     ESTADOS_CONOCIDOS,
+    es_placeholder,
     get_db_path,
-    to_num,
+    normalizar_numerico,
 )
 
 logger = logging.getLogger("etl")
@@ -186,11 +188,14 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
         # Esto hace el ETL idempotente y captura correctamente
         # las filas nuevas que deja el scraper en cada ejecución.
         for col_src, col_num in columnas.items():
+            # DEC-025: el guion solo significa cero en columnas concretas.
+            guion_es_cero = col_src in COLUMNAS_GUION_ES_CERO
             last_id = 0
             batch_count = 0
             total_escaneadas = 0
             total_convertidas = 0
             total_fallidas = 0
+            total_placeholders = 0
             muestra_fallidas: set[str] = set()
             while True:
                 # E-4/DEC-020: las filas con fuente NULL se excluyen del
@@ -238,23 +243,30 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
                         msg=(
                             f"{tabla}.{col_num} | "
                             f"{total_convertidas} convertidas | "
+                            f"{total_placeholders} placeholders | "
                             f"{total_fallidas} fallidas | "
                             f"{fuente_null} fuente NULL"
                         ),
                         tabla=tabla,
                         columna=col_num,
                         convertidas=total_convertidas,
+                        placeholders=total_placeholders,
                         fallidas=total_fallidas,
                         fuente_null=fuente_null,
                     )
                     break
                 for row_id, val in rows:
                     # val nunca es None: el SELECT filtra col_src IS NOT NULL
-                    valor_num = to_num(val)
+                    valor_num = normalizar_numerico(val, guion_es_cero=guion_es_cero)
                     if valor_num is None:
                         # DEC-020: sin UPDATE — la fila queda _num NULL y
                         # se reintenta en la próxima corrida (auto-repara
                         # cuando to_num cubra el formato, sin churn de WAL).
+                        if es_placeholder(val):
+                            # DEC-025: ausencia esperada del origen, no un
+                            # fallo — no ensucia el WARNING ni la muestra.
+                            total_placeholders += 1
+                            continue
                         total_fallidas += 1
                         if len(muestra_fallidas) < _MAX_MUESTRA_FALLIDAS:
                             muestra_fallidas.add(repr(val))

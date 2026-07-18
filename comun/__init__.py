@@ -98,6 +98,69 @@ ACCIONES_RENDIMIENTO: tuple[str, ...] = (
 # ─────────────────────────────────────────────
 
 
+# ─────────────────────────────────────────────
+# PLACEHOLDERS DEL SISTEMA ORIGEN (DEC-025)
+# ─────────────────────────────────────────────
+# La SPA usa texto en vez de dejar la celda vacía. La semántica depende
+# de la columna: en `descuento` el guion significa "descuento de cero";
+# en el resto significa "no aplica" (p. ej. precio_descuento='-' es "sin
+# descuento aplicado", no "precio cero" — ver DEC-025).
+
+PLACEHOLDER_GUION: frozenset[str] = frozenset({"-", "--"})
+
+# Ausencia de dato sin ambigüedad: '' (celda vacía) y 'g' (la unidad de
+# peso renderizada sin número; el cero real se escribe '0g').
+PLACEHOLDER_SIN_DATO: frozenset[str] = frozenset({"", "g"})
+
+# Únicas columnas donde el guion se interpreta como cero (regla de
+# negocio 2026-07-18). En las demás, NULL.
+COLUMNAS_GUION_ES_CERO: frozenset[str] = frozenset({"descuento"})
+
+
+def es_placeholder(val: str | None) -> bool:
+    """Indica si el texto es un placeholder conocido del sistema origen.
+
+    Permite al ETL distinguir una ausencia esperada de un formato
+    inesperado, y no emitir WARNING por la primera (DEC-025).
+
+    Args:
+        val: Texto crudo leído de la DB.
+
+    Returns:
+        True si es None o uno de los placeholders conocidos.
+    """
+    if val is None:
+        return True
+    texto = str(val).strip()
+    return texto in PLACEHOLDER_GUION or texto in PLACEHOLDER_SIN_DATO
+
+
+def normalizar_numerico(val: str | None, *, guion_es_cero: bool = False) -> float | None:
+    """Convierte a float aplicando la semántica de placeholders (DEC-025).
+
+    Se distingue de `to_num()` en que aplica **reglas de negocio**, no
+    solo formato: `to_num` sigue siendo el parser puro que usa el scraper
+    para cantidades.
+
+    Args:
+        val: Texto a convertir.
+        guion_es_cero: True solo para las columnas de
+            `COLUMNAS_GUION_ES_CERO`, donde '-' significa cero.
+
+    Returns:
+        Valor float, 0.0 si el guion representa cero en esa columna, o
+        None si el dato está ausente o no es convertible.
+    """
+    if val is None:
+        return None
+    texto = str(val).strip()
+    if texto in PLACEHOLDER_GUION:
+        return 0.0 if guion_es_cero else None
+    if texto in PLACEHOLDER_SIN_DATO:
+        return None
+    return to_num(texto)
+
+
 def to_num(val: str) -> float | None:
     """Convierte un string numérico en formato español a float.
 
