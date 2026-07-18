@@ -11,7 +11,7 @@ orquestador.py. Este archivo conserva dos responsabilidades:
      no cambia:
 
         # Carga histórica completa (primera vez)
-        py scraper/scraper_principal.py --desde 2026-05-01 --hasta 2026-05-21 --modo completo
+        py scraper/scraper_principal.py --desde 2026-01-01 --hasta 2026-05-21 --modo completo
 
         # Actualización incremental (uso normal, cada 2 horas)
         py scraper/scraper_principal.py --modo incremental

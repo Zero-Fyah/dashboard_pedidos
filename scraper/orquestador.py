@@ -581,7 +581,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--desde",
-        default="2026-05-01",
+        default="2026-01-01",
         type=_fecha_iso,
         help="Fecha inicio YYYY-MM-DD",
     )

@@ -67,7 +67,7 @@ def _check_db() -> None:
     if not DB_PATH.exists():
         raise FileNotFoundError(
             f"Base de datos no encontrada: {DB_PATH.resolve()}\n"
-            "Ejecuta el scraper primero: py scraper/scraper_principal.py --desde 2026-05-01"
+            "Ejecuta el scraper primero: py scraper/scraper_principal.py --desde 2026-01-01"
         )
 
 

@@ -10,10 +10,10 @@ from scraper.scraper_principal import (
 
 @pytest.mark.unit
 def test_argparse_default_desde():
-    """BUG-002: el default de --desde debe ser 2026-05-01."""
+    """BUG-002: el default de --desde debe ser 2026-01-01."""
     parser = build_arg_parser()
     args = parser.parse_args([])
-    assert args.desde == "2026-05-01"
+    assert args.desde == "2026-01-01"
 
 
 # Literales prohibidos construidos por fragmentos: el nombre real no debe

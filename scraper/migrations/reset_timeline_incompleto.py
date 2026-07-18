@@ -74,7 +74,7 @@ def main() -> None:
         con.commit()
         print(f"\nHecho. {afectados:,} pedidos marcados para re-scraping.")
         print("\nPróximo paso OBLIGATORIO:")
-        print("  python scraper/scraper_principal.py --desde 2026-05-01")
+        print("  python scraper/scraper_principal.py --desde 2026-01-01")
         sys.exit(0)
 
     except Exception as exc:

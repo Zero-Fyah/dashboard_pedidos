@@ -549,11 +549,14 @@ async def verificar_pedidos_sin_subpedidos(db: aiosqlite.Connection) -> int:
     """Check defensivo DEC-021: pedidos completos sin subpedidos.
 
     Un pedido con scraping_completo=1 sin filas en subpedidos es un
-    estado anómalo (FIX C-2 lo impide desde 2026-07-02, pero existen
-    legados): las views de pedidos lo excluyen por diseño y sin este
-    check sería invisible. Emite etl_pedido_sin_subpedidos (WARNING)
-    con conteo y muestra de IDs; el remedio es re-scrapear en modo
-    completo.
+    estado anómalo: las views de pedidos lo excluyen por diseño y sin
+    este check sería invisible. Emite etl_pedido_sin_subpedidos
+    (WARNING) con conteo y muestra de IDs.
+
+    Dos causas posibles, indistinguibles desde el ETL (ver DEC-021):
+    el pedido está legítimamente vacío en el sistema origen ("Total 0
+    subpedidos"), o su extracción fue incompleta. Verificar en el
+    origen antes de re-scrapear; un re-scrape no repara el primer caso.
 
     Args:
         db: Conexión abierta a pedidos.db.
@@ -575,7 +578,7 @@ async def verificar_pedidos_sin_subpedidos(db: aiosqlite.Connection) -> int:
             msg=(
                 f"{len(ids)} pedidos con scraping_completo=1 sin subpedidos — "
                 "invisibles en v_pedidos_activos/cerrados (DEC-021); "
-                "re-scrapear en modo completo"
+                "verificar en el origen si están legítimamente vacíos"
             ),
             total=len(ids),
             muestra_ids=ids[:10],

@@ -199,7 +199,7 @@ git config core.hooksPath scripts/hooks
 # (con el .venv activado — DEC-015)
 
 # Modo completo — procesa todos los pedidos del rango desde cero
-python scraper/scraper_principal.py --desde 2026-05-01
+python scraper/scraper_principal.py --desde 2026-01-01
 
 # Modo incremental — actualiza activos, reintenta errores
 # y captura pedidos nuevos desde la última corrida OK
