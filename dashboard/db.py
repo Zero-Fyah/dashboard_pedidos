@@ -23,7 +23,11 @@ def _num_cols_exist() -> bool:
     if not DB_PATH.exists():
         return False
     try:
-        con = sqlite3.connect(DB_PATH)
+        # AUD-M6 (defensa secundaria): timeout=5 — la causa raíz de la
+        # ventana "no such view" quedó resuelta en el ETL (DEC-019); esto
+        # cubre residuales tipo "database is locked" por contención normal
+        # con el ETL/scraper escribiendo, en vez de fallar de inmediato.
+        con = sqlite3.connect(DB_PATH, timeout=5)
         cols = [r[1] for r in con.execute("PRAGMA table_info(lineas_pedido)")]
         con.close()
         return "monto_pagar_num" in cols
@@ -36,7 +40,7 @@ def _view_consolidado_exists() -> bool:
     if not DB_PATH.exists():
         return False
     try:
-        con = sqlite3.connect(DB_PATH)
+        con = sqlite3.connect(DB_PATH, timeout=5)
         exists = (
             con.execute(
                 "SELECT COUNT(*) FROM sqlite_master "
@@ -73,7 +77,12 @@ def _check_db() -> None:
 
 def _conn() -> sqlite3.Connection:
     _check_db()
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    # AUD-M6 (defensa secundaria): timeout=5 — espera hasta 5s si la DB
+    # está momentáneamente bloqueada (ETL/scraper escribiendo) en vez de
+    # lanzar "database is locked" de inmediato. La causa raíz de la
+    # ventana "no such view" ya quedó resuelta en el ETL (DEC-019); esto
+    # cubre el residual de contención normal entre lector y escritor.
+    return sqlite3.connect(DB_PATH, check_same_thread=False, timeout=5)
 
 
 @st.cache_data(ttl=7200, show_spinner=False)

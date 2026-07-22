@@ -1,3 +1,5 @@
+import sqlite3
+
 import streamlit as st
 from db import (
     _view_consolidado_exists,
@@ -23,6 +25,15 @@ try:
     opciones_pedido, opciones_sub, opciones_almacen, opciones_tipo = get_opciones_filtro()
 except FileNotFoundError as e:
     st.error(str(e))
+    st.stop()
+except sqlite3.OperationalError as e:
+    # AUD-M6 (defensa secundaria): la causa raíz de "no such view" quedó
+    # resuelta en el ETL (DEC-019); esto cubre residuales de contención
+    # (p. ej. "database is locked") con un mensaje claro en vez de un
+    # traceback sin contexto.
+    st.error(
+        f"La base de datos está ocupada momentáneamente ({e}). Recarga la página en unos segundos."
+    )
     st.stop()
 
 col1, col2, col3, col4 = st.columns(4)
@@ -68,6 +79,11 @@ try:
         df_pedidos_activos = get_pedidos_activos(estados_sub_key, almacenes_key, tipos_sub_key)
 except FileNotFoundError as e:
     st.error(str(e))
+    st.stop()
+except sqlite3.OperationalError as e:
+    st.error(
+        f"La base de datos está ocupada momentáneamente ({e}). Recarga la página en unos segundos."
+    )
     st.stop()
 
 # ── KPIs ───────────────────────────────────────────────────────────────────────
