@@ -141,7 +141,7 @@ async def test_entrega_etiqueta_desconocida_emite_warning(monkeypatch):
     assert res["entrega_metodo_texto"] == "Ruta"
     desconocidas = [e for e in eventos if e[0] == "entrega_etiqueta_desconocida"]
     assert len(desconocidas) == 1
-    assert desconocidas[0][1]["etiquetas"] == ["Campo Nuevo De La SPA"]
+    assert "Campo Nuevo De La SPA" in desconocidas[0][1]["msg"]
     assert desconocidas[0][1]["level"] == "WARNING"
 
 

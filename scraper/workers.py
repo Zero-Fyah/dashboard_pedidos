@@ -143,10 +143,14 @@ async def procesar_pedido(
     scraping_completo = row[0] if row is not None else 1
     modo = determinar_modo(es_nuevo, subs_db, scraping_completo)
 
-    nav_kwargs: dict = {} if modo == "completo" else {"wait_until": "domcontentloaded"}
+    # DEC-029: domcontentloaded unificado en los tres modos (antes solo
+    # con_cantidades/solo_estado lo usaban, N-2) — el modo completo ya no
+    # espera al evento 'load' completo (imágenes incluidas, DEC-029).
+    nav_kwargs: dict = {"wait_until": "domcontentloaded"}
 
     for intento in range(1, max_reintentos + 1):
         try:
+            t_nav_ini = time.monotonic()
             await page.goto(
                 CONFIG["url_detalle"] + id_pedido,
                 timeout=CONFIG["NAV_TIMEOUT_MS"],
@@ -167,9 +171,14 @@ async def procesar_pedido(
                     timeout=CONFIG["NAV_TIMEOUT_MS"],
                     **nav_kwargs,
                 )
+            nav_ms = int((time.monotonic() - t_nav_ini) * 1000)
+            # DEC-030 Fase 0: t_render_ini/t_extract_ini separan cuánto cuesta
+            # esperar el render de Vue vs. extraer el DOM ya renderizado — los
+            # dos componentes que nav_ms (DEC-029) demostró que dominan el
+            # tiempo total, sin poder distinguirlos hasta ahora.
+            t_render_ini = time.monotonic()
 
             if modo == "completo":
-                await page.wait_for_load_state("domcontentloaded")
                 await page.wait_for_selector("div.info-item", timeout=CONFIG["ELEM_TIMEOUT_MS"])
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 try:
@@ -182,6 +191,8 @@ async def procesar_pedido(
                     # El selector no apareció en el tiempo esperado.
                     # La extracción retornará [] — los Cambios 2/3 lo manejan.
                     pass
+                render_ms = int((time.monotonic() - t_render_ini) * 1000)
+                t_extract_ini = time.monotonic()
 
                 info_general = await extraer_info_general(page)
                 subpedidos = await extraer_subpedidos(page)
@@ -227,6 +238,8 @@ async def procesar_pedido(
                         id_pedido=id_pedido,
                         msg="Tabla de subpedidos no renderizada — cantidades no actualizadas en esta pasada",
                     )
+                render_ms = int((time.monotonic() - t_render_ini) * 1000)
+                t_extract_ini = time.monotonic()
                 subpedidos = await extraer_subpedidos(page)
                 timeline = await extraer_timeline(page, id_pedido)
                 info_entrega = await extraer_info_entrega(page, id_pedido)
@@ -264,6 +277,8 @@ async def procesar_pedido(
                         id_pedido=id_pedido,
                         msg="Tabla de subpedidos no renderizada — estados no actualizados en esta pasada",
                     )
+                render_ms = int((time.monotonic() - t_render_ini) * 1000)
+                t_extract_ini = time.monotonic()
                 filas = await page.query_selector_all(
                     "div.el-scrollbar__wrap--hidden-default table tbody tr"
                 )
@@ -282,10 +297,16 @@ async def procesar_pedido(
                         estado = ""
                     subs_estado.append({"numero_subpedido": num_sub, "estado": estado})
 
+                # DEC-030 Fase 2 (fix, no optimización a negociar — integral.md
+                # ya documentaba "fase activa: solo se actualiza su estado";
+                # timeline y registro_ops son la excepción confirmada por el
+                # Arquitecto: se consideran parte de "el estado" y sí se
+                # actualizan en cada ciclo). estadísticas/gestión/detalle de
+                # diferencias solo tienen sentido con cantidades definitivas
+                # — se capturan al cerrar cada subpedido (con_cantidades), no
+                # aquí. Antes, solo_estado las volvía a leer y persistir en
+                # cada ciclo incremental sin que el diseño lo pidiera.
                 timeline = await extraer_timeline(page, id_pedido)
-                estadisticas, hay_dif = await extraer_estadisticas_monto(page, id_pedido)
-                gestion_dif = await extraer_gestion_diferencias(page, id_pedido)
-                detalle_dif = await extraer_detalle_diferencias(page, id_pedido)
                 registro_ops = await extraer_registro_operaciones(page, id_pedido)
                 resultado = {
                     "tipo": "solo_estado",
@@ -293,23 +314,27 @@ async def procesar_pedido(
                     "subpedidos": subs_estado,
                     "timeline": timeline,
                     "info_entrega": None,
-                    "estadisticas": estadisticas,
-                    # FIX C-3: None se propaga como "no verificado"
-                    "hay_diferencia": None if hay_dif is None else (1 if hay_dif else 0),
-                    "gestion_dif": gestion_dif,
-                    "detalle_dif": detalle_dif,
+                    "estadisticas": [],
+                    # No se verifica esta pasada — FIX C-3: None = "no verificado".
+                    "hay_diferencia": None,
+                    "gestion_dif": None,
+                    "detalle_dif": None,
                     "registro_ops": registro_ops,
                 }
                 n_subs = len(subs_estado)
 
             duracion_ms = int((time.monotonic() - t_inicio) * 1000)
+            extract_ms = int((time.monotonic() - t_extract_ini) * 1000)
             await resultados_queue.put(resultado)
             log_event(
                 "pedido_ok",
                 worker_id=worker_id,
                 id_pedido=id_pedido,
                 duracion_ms=duracion_ms,
-                msg=f"modo={modo} | {n_subs} subpedidos | intento {intento}",
+                msg=(
+                    f"modo={modo} | {n_subs} subpedidos | intento {intento} | "
+                    f"nav_ms={nav_ms} | render_ms={render_ms} | extract_ms={extract_ms}"
+                ),
             )
             await asyncio.sleep(CONFIG["PAUSA_ENTRE_PEDIDOS_S"])
             return True

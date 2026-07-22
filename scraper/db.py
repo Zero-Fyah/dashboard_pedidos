@@ -190,6 +190,23 @@ async def init_db(db_path: str) -> None:
             "ALTER TABLE subpedidos ADD COLUMN estado_cambiado_en TEXT DEFAULT NULL",
             "ALTER TABLE lineas_pedido ADD COLUMN numero_caja     TEXT    DEFAULT NULL",
             "ALTER TABLE lineas_pedido ADD COLUMN tipo            TEXT    DEFAULT NULL",
+            # DEC-032: con metodo_entrega='Almacen' (autorrecogida), la SPA
+            # reemplaza "Destinatario"/"Teléfono de contacto" por "Persona
+            # de recogida"/"Móvil de recogida" — antes se perdían en
+            # silencio porque extraer_info_general() no tenía aviso de
+            # etiqueta desconocida (a diferencia de extraer_info_entrega,
+            # DEC-023). Columnas dedicadas, no se reusan destinatario/
+            # telefono, para no mezclar dos roles distintos en el mismo dato.
+            "ALTER TABLE pedidos ADD COLUMN persona_recogida     TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN movil_recogida       TEXT    DEFAULT NULL",
+            # DEC-033: con forma_pago='Pago a crédito', la SPA agrega
+            # "Días de crédito"/"Inicio de crédito"/"Vencimiento de
+            # crédito" al card de información general — detectado por el
+            # aviso de etiqueta desconocida de DEC-032 durante el backfill
+            # (bloque01, 20 pedidos). Antes se perdían en silencio.
+            "ALTER TABLE pedidos ADD COLUMN dias_credito         TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN inicio_credito       TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN vencimiento_credito  TEXT    DEFAULT NULL",
         ):
             try:
                 await db.execute(ddl)

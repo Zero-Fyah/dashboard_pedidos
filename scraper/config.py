@@ -11,6 +11,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import TypedDict
 
@@ -111,8 +112,11 @@ CONFIG: ConfigDict = {
     # incremental. Acota el lookback cuando el watermark quedó atrás;
     # outages mayores requieren recuperación manual con --desde.
     "INCREMENTAL_LOOKBACK_MAX_DIAS": 7,
-    # Paralelismo
-    "NUM_WORKERS": 5,
+    # Paralelismo. DEC-030 Fase 4: configurable via .env (mismo patrón
+    # AUD-M11 que HEADLESS/SLOW_MO) para poder correr el experimento de
+    # contención con NUM_WORKERS reducido sin editar código. Default 5
+    # preserva el comportamiento histórico.
+    "NUM_WORKERS": _env_int("SCRAPER_NUM_WORKERS", 5),
     # FIX C-1 (auditoría 2026-07-01): timeout global del run como red de
     # seguridad de última instancia. Debe superar el peor caso legítimo:
     # la carga histórica más larga registrada tomó ~5.5h (DEC-010) y el
@@ -201,7 +205,23 @@ _logger = logging.getLogger(__name__)
 # doble bootstrap) no debe duplicar el handler: los loggers de `logging`
 # son globales al proceso y sobreviven al reload del módulo.
 if not _logger.handlers:
-    _file_handler = logging.FileHandler(CONFIG["LOG_FILE"], encoding="utf-8", mode="a")
+    # Retención de logs (2026-07-19, a pedido del Arquitecto): scraper.log
+    # crecía sin límite (llegó a 280 MB) porque era un solo FileHandler sin
+    # rotación — ya estaba anotado como pendiente en DEC-028. Con
+    # TimedRotatingFileHandler, cada medianoche local se renombra a
+    # "scraper.log.YYYY-MM-DD" y se purgan automáticamente los que superan
+    # backupCount=30 (30 días de retención, sin excepción, mismo criterio
+    # que el purgado de scraper_scheduler_*.log en actualizar_pedidos.bat).
+    # Los archivos rotados no terminan en ".log", así que el purgado de
+    # forfiles del .bat no los toca — cada uno gestiona su propia retención,
+    # sin lógica duplicada.
+    _file_handler = TimedRotatingFileHandler(
+        CONFIG["LOG_FILE"],
+        when="midnight",
+        interval=1,
+        backupCount=30,
+        encoding="utf-8",
+    )
     _file_handler.setFormatter(logging.Formatter("%(message)s"))
     _logger.setLevel(logging.DEBUG)
     _logger.addHandler(_file_handler)

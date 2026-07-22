@@ -49,6 +49,44 @@ async def col_text(cols: list, i: int) -> str:
 # to_num() vive en comun/ (AUD-M5) y se importa arriba.
 
 
+def _reclasificar_descuento(
+    etiquetas: list[str], monto_crudo: str, texto_completo: str
+) -> tuple[str, str]:
+    """Lógica pura de DEC-024 — separa (monto, tipos) a partir de piezas ya leídas.
+
+    Extraída de `leer_celda_descuento()` (DRY, DEC-022) para que tanto la
+    lectura por ElementHandle como el batch de `page.evaluate()` (DEC-030
+    Fase 3, `extraer_subpedidos`) compartan un único origen de verdad —
+    ninguna lógica de negocio se duplica en JS.
+
+    Args:
+        etiquetas: Textos de `.el-tag__content` en la celda, en orden.
+        monto_crudo: Texto del primer `<span>` que no es un el-tag
+            (ranura de monto), o "" si no hay ninguno.
+        texto_completo: `inner_text`/`textContent` completo de la celda,
+            usado como fallback cuando no hay ningún span.
+
+    Returns:
+        Tupla (monto, tipos) — ver `leer_celda_descuento()`.
+    """
+    etiquetas = [e for e in etiquetas if e]
+    # de-duplicar preservando orden
+    vistas: set[str] = set()
+    etiquetas = [e for e in etiquetas if not (e in vistas or vistas.add(e))]
+
+    monto = monto_crudo
+    if not monto:
+        monto = texto_completo.split("\n")[0].strip()
+
+    # Si la ranura trae una etiqueta en vez de un monto, se reclasifica.
+    if monto and monto != "-" and to_num(monto) is None:
+        if monto not in etiquetas:
+            etiquetas.insert(0, monto)
+        monto = "-"
+
+    return (monto or "-", " | ".join(etiquetas))
+
+
 async def leer_celda_descuento(celda) -> tuple[str, str]:
     """Separa la celda de descuento en (monto, tipos) — DEC-024.
 
@@ -72,26 +110,27 @@ async def leer_celda_descuento(celda) -> tuple[str, str]:
     etiquetas: list[str] = []
     for tag in await celda.query_selector_all(".el-tag__content"):
         texto = (await tag.inner_text()).strip()
-        if texto and texto not in etiquetas:
-            etiquetas.append(texto)
+        etiquetas.append(texto)
 
     # Primer span que no forme parte de un el-tag: la ranura del monto.
-    monto = ""
+    monto_crudo = ""
     for span in await celda.query_selector_all("span"):
         clases = (await span.get_attribute("class")) or ""
         if "el-tag" not in clases:
-            monto = (await span.inner_text()).strip()
+            monto_crudo = (await span.inner_text()).strip()
             break
-    if not monto:
-        monto = (await celda.inner_text()).strip().split("\n")[0].strip()
 
-    # Si la ranura trae una etiqueta en vez de un monto, se reclasifica.
-    if monto and monto != "-" and to_num(monto) is None:
-        if monto not in etiquetas:
-            etiquetas.insert(0, monto)
-        monto = "-"
+    texto_completo = (await celda.inner_text()).strip()
+    return _reclasificar_descuento(etiquetas, monto_crudo, texto_completo)
 
-    return (monto or "-", " | ".join(etiquetas))
+
+def _unir_presentacion(specs: list[str]) -> str:
+    """Lógica pura de DEC-026 — une textos no vacíos con " | ".
+
+    Extraída de `leer_presentacion()` (DRY, DEC-022) por el mismo motivo
+    que `_reclasificar_descuento()`.
+    """
+    return " | ".join(t for t in specs if t)
 
 
 async def leer_presentacion(info_col) -> str:
@@ -112,12 +151,8 @@ async def leer_presentacion(info_col) -> str:
     if not info_col:
         return ""
     spans = await info_col.query_selector_all(".goods-specs span")
-    partes = []
-    for span in spans:
-        texto = (await span.inner_text()).strip()
-        if texto:
-            partes.append(texto)
-    return " | ".join(partes)
+    textos = [(await span.inner_text()).strip() for span in spans]
+    return _unir_presentacion(textos)
 
 
 # ─────────────────────────────────────────────
@@ -204,6 +239,18 @@ SEL_BTN_BUSCAR = "div.hq-search-form button.el-button--primary"
 SEL_PAGER_ACTIVO = ".el-pager li.is-active, .el-pager li.active"
 
 
+# DEC-030 Fase 1: recolección cruda en un solo page.evaluate — con páginas de
+# 100 filas, el par query_selector+inner_text por fila costaba ~200 round-trips
+# Playwright↔browser por página. El JS solo recolecta (texto o null por fila);
+# la normalización queda en Python, donde los tests unitarios la cubren.
+_JS_LEER_IDS = """([selFilas, selId]) =>
+    Array.from(document.querySelectorAll(selFilas)).map((fila) => {
+        const el = fila.querySelector(selId);
+        return el ? el.textContent : null;
+    })
+"""
+
+
 async def _leer_ids_pagina(page: Page) -> list[str]:
     """Extrae los IDs de pedido de las filas visibles de la página actual.
 
@@ -217,29 +264,96 @@ async def _leer_ids_pagina(page: Page) -> list[str]:
         Lista de IDs (strings) de la página visible; vacía si la tabla no
         tiene filas o aún no renderizó.
     """
-    ids: list[str] = []
-    for fila in await page.query_selector_all(SEL_LISTA_FILAS):
-        el = await fila.query_selector(SEL_LISTA_ID)
-        if el:
-            ids.append((await el.inner_text()).strip())
-    return ids
+    crudos: list[str | None] = await page.evaluate(_JS_LEER_IDS, [SEL_LISTA_FILAS, SEL_LISTA_ID])
+    return [t.strip() for t in crudos if t and t.strip()]
 
 
-async def obtener_lista_pedidos(
-    page: Page,
-    fecha_desde: str,
-    fecha_hasta: str,
-) -> list[str]:
-    """Navega a la lista de pedidos, aplica filtro de fechas y extrae todos los IDs.
+async def _leer_total_listado(page: Page) -> int | None:
+    """Lee el conteo real del rango filtrado desde `.el-pagination__total`.
 
-    Recorre todas las páginas de resultados hasta detectar la última por la
-    presencia de la clase 'disabled' o el atributo disabled en el botón
-    de siguiente página.
+    DEC-030 Fase 1: el listado expone "Total N registros" tras aplicar el
+    filtro. Ese N permite loggear progreso real ("página 3 de 21"), cortar
+    el loop sin depender solo del botón next, y validar al final que la
+    cantidad de IDs recogidos coincide con lo que el servidor declaró.
 
-    Usa esperas semánticas con timeout explícito en lugar de networkidle
-    (N-2): con una SPA Vue.js de polling continuo, networkidle resolvía antes
-    del re-renderizado de la tabla (causa raíz de BUG-016) o tardaba de más.
-    Para reintentos con re-login usar obtener_lista_pedidos_con_retry().
+    Returns:
+        El total como entero, o None si el elemento no está o no parsea —
+        None nunca es error: el paginado funciona igual que antes sin él.
+    """
+    try:
+        el = await page.query_selector(".el-pagination__total")
+        if not el:
+            return None
+        m = re.search(r"(\d[\d.,]*)", (await el.inner_text()).strip())
+        return int(re.sub(r"[.,]", "", m.group(1))) if m else None
+    except Exception:
+        return None
+
+
+async def _seleccionar_max_page_size(page: Page) -> int:
+    """Selecciona la mayor opción del dropdown de tamaño de página del listado.
+
+    DEC-030 Fase 1: el listado pagina de a 10 (el mínimo de Element Plus).
+    Este helper abre el dropdown `.el-pagination__sizes` y elige la opción
+    numérica más alta disponible (p. ej. "100/página"), reduciendo ~10× la
+    cantidad de páginas a recorrer.
+
+    Best-effort deliberado: cualquier fallo (dropdown ausente, opciones con
+    otro formato, click fallido) se loggea y retorna 10 — el paginado sigue
+    con el tamaño default, nunca se rompe por esta optimización.
+
+    Returns:
+        El tamaño de página efectivo tras el intento (10 si no se cambió).
+    """
+    try:
+        trigger = page.locator(".el-pagination__sizes .el-select__wrapper")
+        if await trigger.count() == 0:
+            log_event(
+                "pagesize_no_disponible",
+                level="WARNING",
+                msg="Dropdown de tamaño de página no encontrado — se pagina de a 10",
+            )
+            return 10
+        await trigger.click()
+        opciones = page.locator(".el-select-dropdown__item:visible")
+        await opciones.first.wait_for(state="visible", timeout=CONFIG["ELEM_TIMEOUT_MS"])
+        textos = await opciones.all_inner_texts()
+
+        tams: list[tuple[int, int]] = []  # (tamaño, índice de la opción)
+        for i, t in enumerate(textos):
+            m = re.match(r"\s*(\d+)", t)
+            if m:
+                tams.append((int(m.group(1)), i))
+        if not tams:
+            log_event(
+                "pagesize_no_disponible",
+                level="WARNING",
+                msg=f"Opciones de tamaño sin número reconocible: {textos!r} — se pagina de a 10",
+            )
+            return 10
+
+        mejor, idx = max(tams)
+        await opciones.nth(idx).click()
+        log_event(
+            "pagesize_seleccionado",
+            msg=f"Tamaño de página: {mejor} (opciones: {[t for t, _ in tams]})",
+        )
+        return mejor
+    except Exception as exc:
+        log_event(
+            "pagesize_no_disponible",
+            level="WARNING",
+            msg=f"No se pudo cambiar el tamaño de página ({type(exc).__name__}: {exc}) — se pagina de a 10",
+        )
+        return 10
+
+
+async def _configurar_listado(page: Page, fecha_desde: str, fecha_hasta: str) -> int:
+    """Navega al listado, aplica el filtro de fechas y fija el tamaño de página.
+
+    DEC-030 Fase 1b: extraído de obtener_lista_pedidos() para poder repetir
+    la misma secuencia de setup en cada refresco periódico, sin duplicar
+    lógica (ver _REFRESH_CADA_N_PAGINAS más abajo).
 
     Args:
         page: Página Playwright autenticada y activa.
@@ -247,7 +361,7 @@ async def obtener_lista_pedidos(
         fecha_hasta: Fecha de fin del filtro en formato YYYY-MM-DD.
 
     Returns:
-        Lista de IDs de pedido (strings) en el orden devuelto por el servidor.
+        El tamaño de página efectivo tras el intento (10 si no se pudo cambiar).
     """
     await page.goto(CONFIG["url_pedidos"], timeout=CONFIG["NAV_TIMEOUT_MS"])
     # N-2: la señal de página lista es el propio botón que se va a clickear.
@@ -277,8 +391,118 @@ async def obtener_lista_pedidos(
     # adicional, nunca como única espera).
     await asyncio.sleep(CONFIG["PAUSA_PAGINACION_S"])
 
+    # DEC-030 Fase 1: máximo tamaño de página disponible. El cambio de
+    # tamaño re-consulta la página 1; la pausa cubre ese re-fetch.
+    tam_pagina = await _seleccionar_max_page_size(page)
+    if tam_pagina != 10:
+        await asyncio.sleep(CONFIG["PAUSA_PAGINACION_S"])
+    return tam_pagina
+
+
+async def _esperar_cambio_primer_id(
+    page: Page, anterior: str | None, evento_timeout: str, contexto: str
+) -> None:
+    """Espera a que el primer ID visible de la tabla cambie respecto a `anterior`.
+
+    Señal semántica compartida por el avance normal (click "siguiente") y el
+    salto directo de página (DEC-030 Fase 1b) — Element Plus actualiza el
+    número del paginador antes de que lleguen las filas nuevas del servidor,
+    así que el número activo no sirve como confirmación real (ver DEC-030).
+    """
+    try:
+        await page.wait_for_function(
+            """([selFilas, selId, anterior]) => {
+                const fila = document.querySelector(selFilas);
+                const el = fila && fila.querySelector(selId);
+                const id = el ? el.textContent.trim() : null;
+                return id !== null && id !== anterior;
+            }""",
+            arg=[SEL_LISTA_FILAS, SEL_LISTA_ID, anterior],
+            timeout=CONFIG["ELEM_TIMEOUT_MS"],
+        )
+    except PlaywrightTimeoutError:
+        log_event(
+            evento_timeout,
+            level="WARNING",
+            msg=f"La tabla no cambió de contenido {contexto} en {CONFIG['ELEM_TIMEOUT_MS']}ms",
+        )
+    # Settle corto para el patch reactivo de Vue — la relectura BUG-016
+    # sigue cubriendo cualquier render tardío residual.
+    await asyncio.sleep(0.25)
+
+
+async def _saltar_a_pagina(page: Page, num_pagina: int) -> None:
+    """Salta directamente a `num_pagina` con el input "Ir a" del paginador.
+
+    DEC-030 Fase 1b: se usa tras cada refresco periódico para retomar en la
+    página correcta sin re-clickear "siguiente" num_pagina-1 veces.
+    """
+    ids_antes = await _leer_ids_pagina(page)
+    anterior = ids_antes[0] if ids_antes else None
+    campo = page.locator(".el-pagination__jump .el-pagination__editor input")
+    await campo.click()
+    await campo.fill(str(num_pagina))
+    await campo.press("Enter")
+    await _esperar_cambio_primer_id(
+        page, anterior, "paginador_salto_timeout", f"tras saltar a la página {num_pagina}"
+    )
+
+
+# DEC-030 Fase 1b: refrescar la sesión del listado cada N páginas. Medido
+# 2026-07-19: sin refresco, el paginado degrada progresivamente y puede
+# colgarse sin que ningún timeout lo capture — visto tras ~50 páginas de
+# 100 filas (~5.000 filas acumuladas en la misma página del navegador).
+# N=30 validado limpio en un piloto de exactamente 30 páginas (incluyó y
+# se recuperó de un pico transitorio en las páginas 18-21).
+_REFRESH_CADA_N_PAGINAS = 30
+
+
+async def obtener_lista_pedidos(
+    page: Page,
+    fecha_desde: str,
+    fecha_hasta: str,
+) -> list[str]:
+    """Navega a la lista de pedidos, aplica filtro de fechas y extrae todos los IDs.
+
+    Recorre todas las páginas de resultados hasta detectar la última por la
+    presencia de la clase 'disabled' o el atributo disabled en el botón
+    de siguiente página, con un freno de seguridad adicional por el total
+    declarado del listado (DEC-030 Fase 1). Cada _REFRESH_CADA_N_PAGINAS
+    páginas, refresca la sesión del listado (Fase 1b) en vez de clickear
+    "siguiente", para evitar la degradación por estado acumulado en una
+    sesión de página continua. Antes de recorrer, selecciona el mayor
+    tamaño de página disponible y valida al final el conteo de IDs únicos
+    contra el total declarado.
+
+    Usa esperas semánticas con timeout explícito en lugar de networkidle
+    (N-2): con una SPA Vue.js de polling continuo, networkidle resolvía antes
+    del re-renderizado de la tabla (causa raíz de BUG-016) o tardaba de más.
+    Para reintentos con re-login usar obtener_lista_pedidos_con_retry().
+
+    Args:
+        page: Página Playwright autenticada y activa.
+        fecha_desde: Fecha de inicio del filtro en formato YYYY-MM-DD.
+        fecha_hasta: Fecha de fin del filtro en formato YYYY-MM-DD.
+
+    Returns:
+        Lista de IDs de pedido (strings) en el orden devuelto por el servidor.
+    """
+    tam_pagina = await _configurar_listado(page, fecha_desde, fecha_hasta)
+    total_declarado = await _leer_total_listado(page)
+    paginas_estimadas: int | None = None
+    if total_declarado is not None:
+        paginas_estimadas = max(1, -(-total_declarado // tam_pagina))
+        log_event(
+            "lista_total_declarado",
+            msg=(
+                f"Total declarado por el listado: {total_declarado} — "
+                f"~{paginas_estimadas} páginas de {tam_pagina}"
+            ),
+        )
+
     todos_los_ids: list[str] = []
     pagina_actual = 1
+    t_pagina = time.monotonic()
 
     while True:
         try:
@@ -309,43 +533,83 @@ async def obtener_lista_pedidos(
 
         todos_los_ids.extend(ids_pagina)
 
+        _progreso = f" de ~{paginas_estimadas}" if paginas_estimadas else ""
         log_event(
             "pagina_extraida",
-            msg=f"Página {pagina_actual} — {len(ids_pagina)} pedidos",
+            duracion_ms=int((time.monotonic() - t_pagina) * 1000),
+            msg=f"Página {pagina_actual}{_progreso} — {len(ids_pagina)} pedidos",
         )
+
+        # DEC-030 Fase 1: freno de seguridad por total declarado — si el
+        # botón next nunca se deshabilita (DOM cambiado), el loop no puede
+        # superar las páginas esperadas por más de un margen de cortesía.
+        if paginas_estimadas is not None and pagina_actual >= paginas_estimadas + 2:
+            log_event(
+                "lista_paginas_excedidas",
+                level="WARNING",
+                msg=(
+                    f"Página {pagina_actual} supera las ~{paginas_estimadas} "
+                    "esperadas — se corta el paginado (revisar botón next/total)"
+                ),
+            )
+            break
 
         btn_next = await page.query_selector("button.btn-next")
         if btn_next:
             aria_disabled = await btn_next.get_attribute("aria-disabled")
             if aria_disabled == "true":
                 break
-            await btn_next.click()
-            # N-2: espera semántica del cambio de página — el número activo
-            # del paginador debe ser el siguiente. Si el timeout expira
-            # (paginador con clases distintas o render lento) se continúa:
-            # la relectura de BUG-016 sigue cubriendo el render tardío.
-            try:
-                await page.wait_for_function(
-                    """([sel, esperada]) => {
-                        const activo = document.querySelector(sel);
-                        return activo && activo.textContent.trim() === String(esperada);
-                    }""",
-                    arg=[SEL_PAGER_ACTIVO, pagina_actual + 1],
-                    timeout=CONFIG["ELEM_TIMEOUT_MS"],
-                )
-            except PlaywrightTimeoutError:
+            t_pagina = time.monotonic()
+
+            if pagina_actual % _REFRESH_CADA_N_PAGINAS == 0:
+                # DEC-030 Fase 1b: en vez de clickear "siguiente", refrescar
+                # la sesión del listado y saltar a la página correcta.
                 log_event(
-                    "paginador_espera_timeout",
-                    level="WARNING",
-                    msg=(
-                        f"El paginador no confirmó el paso a la página "
-                        f"{pagina_actual + 1} tras {CONFIG['ELEM_TIMEOUT_MS']}ms"
-                    ),
+                    "paginado_refresco",
+                    msg=f"Refrescando la sesión del listado tras la página {pagina_actual}",
                 )
-            await asyncio.sleep(CONFIG["PAUSA_PAGINACION_S"])
+                tam_refrescado = await _configurar_listado(page, fecha_desde, fecha_hasta)
+                if tam_refrescado != tam_pagina:
+                    log_event(
+                        "paginado_refresco_tam_distinto",
+                        level="WARNING",
+                        msg=(
+                            f"Tamaño de página tras refresco ({tam_refrescado}) "
+                            f"distinto del original ({tam_pagina}) — la numeración "
+                            "de páginas puede desalinearse; el dedupe de IDs cubre el residual"
+                        ),
+                    )
+                await _saltar_a_pagina(page, pagina_actual + 1)
+            else:
+                primer_id = ids_pagina[0] if ids_pagina else None
+                await btn_next.click()
+                # DEC-030 Fase 1: espera semántica real — el primer ID visible
+                # de la tabla debe cambiar. La espera anterior (número activo
+                # del paginador) confirmaba algo que Element Plus actualiza
+                # antes de que lleguen las filas nuevas del servidor, y por eso
+                # convivía con un sleep fijo de 2 s por página que era el 60%
+                # del tiempo de paginado medido (DEC-030).
+                await _esperar_cambio_primer_id(
+                    page,
+                    primer_id,
+                    "paginador_espera_timeout",
+                    f"tras el click a la página {pagina_actual + 1}",
+                )
             pagina_actual += 1
         else:
             break
+
+    if total_declarado is not None:
+        unicos = len(dict.fromkeys(todos_los_ids))
+        if unicos != total_declarado:
+            log_event(
+                "lista_total_discrepancia",
+                level="WARNING",
+                msg=(
+                    f"IDs únicos recogidos: {unicos} vs total declarado: "
+                    f"{total_declarado} — revisar si el listado cambió durante el escaneo"
+                ),
+            )
 
     log_event("lista_completa", msg=f"Total IDs obtenidos: {len(todos_los_ids)}")
     return todos_los_ids
@@ -405,6 +669,25 @@ async def obtener_lista_pedidos_con_retry(
 # ─────────────────────────────────────────────
 
 
+# DEC-030 Fase 3: un solo evaluate en vez de hasta 4 round-trips por
+# info-item (~16 items → hasta 64 llamadas). El JS solo recolecta
+# etiqueta→valor en bruto; el mapeo etiqueta→columna (`mapa`) y la
+# validación de id_pedido se quedan en Python, sin cambios.
+_JS_INFO_GENERAL = """
+() => {
+    const out = {};
+    document.querySelectorAll('div.info-item').forEach((item) => {
+        const l = item.querySelector('.info-label');
+        const v = item.querySelector('.info-value');
+        if (!l || !v) return;
+        const label = l.textContent.trim().toLowerCase().replace(/[：:]+$/, '');
+        out[label] = v.textContent.trim();
+    });
+    return out;
+}
+"""
+
+
 async def extraer_info_general(page: Page) -> dict:
     """Extrae los campos del card de información general del pedido.
 
@@ -438,6 +721,14 @@ async def extraer_info_general(page: Page) -> dict:
         "alistador_pedido": "",
         "inspector_pedido": "",
         "movil_cliente": "",
+        # DEC-032: solo se renderizan con metodo_entrega='Almacen'
+        # (autorrecogida) — reemplazan destinatario/teléfono en ese caso.
+        "persona_recogida": "",
+        "movil_recogida": "",
+        # DEC-033: solo se renderizan con forma_pago='Pago a crédito'.
+        "dias_credito": "",
+        "inicio_credito": "",
+        "vencimiento_credito": "",
     }
 
     mapa: dict[str, str] = {
@@ -457,18 +748,32 @@ async def extraer_info_general(page: Page) -> dict:
         "alistador": "alistador_pedido",
         "inspector": "inspector_pedido",
         "móvil del cliente": "movil_cliente",
+        "persona de recogida": "persona_recogida",
+        "móvil de recogida": "movil_recogida",
+        "días de crédito": "dias_credito",
+        "inicio de crédito": "inicio_credito",
+        "vencimiento de crédito": "vencimiento_credito",
     }
 
-    items = await page.query_selector_all("div.info-item")
-    for item in items:
-        label_el = await item.query_selector(".info-label")
-        value_el = await item.query_selector(".info-value")
-        if not label_el or not value_el:
-            continue
-        label = (await label_el.inner_text()).strip().lower().rstrip("：:")
-        value = (await value_el.inner_text()).strip()
+    crudo = await page.evaluate(_JS_INFO_GENERAL)
+    # DEC-032: aviso de etiquetas no mapeadas — mismo criterio que
+    # extraer_info_entrega() (DEC-023). "Persona de recogida"/"Móvil de
+    # recogida" se perdían en silencio antes de esta entrada porque acá
+    # no existía ningún mecanismo de aviso.
+    desconocidas = [label for label in crudo if label and label not in mapa]
+    for label, value in crudo.items():
         if label in mapa:
             datos[mapa[label]] = value
+    if desconocidas:
+        log_event(
+            "info_general_etiqueta_desconocida",
+            id_pedido=crudo.get("número de pedido", ""),
+            level="WARNING",
+            msg=(
+                "Etiquetas nuevas en información básica del pedido — campo "
+                f"no capturado (DEC-032): {sorted(set(desconocidas))}"
+            ),
+        )
 
     if not datos["id_pedido"]:
         raise ValueError("id_pedido vacío — la página de detalle no cargó correctamente")
@@ -579,7 +884,6 @@ async def extraer_info_entrega(page: Page, id_pedido: str) -> dict:
                     "Etiquetas nuevas en la tabla de entrega — campo no "
                     f"capturado (DEC-023): {sorted(set(desconocidas))}"
                 ),
-                etiquetas=sorted(set(desconocidas)),
             )
 
     except Exception as exc:
@@ -590,6 +894,45 @@ async def extraer_info_entrega(page: Page, id_pedido: str) -> dict:
             msg=str(exc),
         )
     return resultado
+
+
+# DEC-030 Fase 3: un solo evaluate en vez de hasta ~5 round-trips por
+# fila (~10 filas → hasta 50 llamadas). Misma lógica exacta: primer
+# <span> de la celda de concepto que NO sea un el-tag; JS solo recolecta,
+# ninguna decisión de negocio se mueve de Python.
+_JS_ESTADISTICAS = """
+() => {
+    const card = document.querySelector('.amount-statistics-card');
+    if (!card) return null;
+    const tagDif = card.querySelector(
+        '.statistics-header .el-tag--warning, .statistics-header .el-tag--dark'
+    );
+    const filas = Array.from(card.querySelectorAll('.amount-statistics-table tbody tr'))
+        .map((fila) => {
+            const celdas = Array.from(fila.querySelectorAll('td'));
+            if (celdas.length === 0) return null;
+            const celdaConcepto = celdas[0];
+            let conceptoTxt = '';
+            for (const span of celdaConcepto.querySelectorAll('.cell > span')) {
+                if (!(span.className || '').includes('el-tag')) {
+                    conceptoTxt = span.textContent.trim();
+                    break;
+                }
+            }
+            if (!conceptoTxt) conceptoTxt = celdaConcepto.textContent.trim();
+            const tagEl = celdaConcepto.querySelector('.el-tag .el-tag__content');
+            return {
+                concepto: conceptoTxt,
+                concepto_tag: tagEl ? tagEl.textContent.trim() : '',
+                monto_pagar: celdas.length > 1 ? celdas[1].textContent.trim() : '',
+                monto_final: celdas.length > 2 ? celdas[2].textContent.trim() : '',
+                diferencia: celdas.length > 3 ? celdas[3].textContent.trim() : '',
+            };
+        })
+        .filter((f) => f !== null);
+    return { hay_diferencia: tagDif !== null, filas };
+}
+"""
 
 
 async def extraer_estadisticas_monto(page: Page, id_pedido: str) -> tuple[list[dict], bool | None]:
@@ -609,48 +952,23 @@ async def extraer_estadisticas_monto(page: Page, id_pedido: str) -> tuple[list[d
     # o excepción). Distingue "sin diferencia" de "no se pudo comprobar".
     hay_diferencia: bool | None = None
     try:
-        card = await page.query_selector(".amount-statistics-card")
-        if not card:
+        r = await page.evaluate(_JS_ESTADISTICAS)
+        if r is None:
             return filas_data, hay_diferencia
 
-        tag_dif = await card.query_selector(
-            ".statistics-header .el-tag--warning, .statistics-header .el-tag--dark"
-        )
         # FIX C-3: card presente → estado verificado (True o False)
-        hay_diferencia = tag_dif is not None
+        hay_diferencia = r["hay_diferencia"]
 
-        filas = await card.query_selector_all(".amount-statistics-table tbody tr")
-        for orden, fila in enumerate(filas, start=1):
-            celdas = await fila.query_selector_all("td")
-            if not celdas:
-                continue
-
-            celda_concepto = celdas[0]
-            concepto_txt = ""
-            for span in await celda_concepto.query_selector_all(".cell > span"):
-                clases_span = (await span.get_attribute("class")) or ""
-                if "el-tag" not in clases_span:
-                    concepto_txt = (await span.inner_text()).strip()
-                    break
-            if not concepto_txt:
-                concepto_txt = (await celda_concepto.inner_text()).strip()
-
-            concepto_tag_el = await celda_concepto.query_selector(".el-tag .el-tag__content")
-            concepto_tag = (await concepto_tag_el.inner_text()).strip() if concepto_tag_el else ""
-
-            monto_pagar = (await celdas[1].inner_text()).strip() if len(celdas) > 1 else ""
-            monto_final = (await celdas[2].inner_text()).strip() if len(celdas) > 2 else ""
-            diferencia = (await celdas[3].inner_text()).strip() if len(celdas) > 3 else ""
-
+        for orden, f in enumerate(r["filas"], start=1):
             filas_data.append(
                 {
                     "id_pedido": id_pedido,
                     "orden": orden,
-                    "concepto": concepto_txt,
-                    "concepto_tag": concepto_tag,
-                    "monto_pagar": monto_pagar,
-                    "monto_final": monto_final,
-                    "diferencia": diferencia,
+                    "concepto": f["concepto"],
+                    "concepto_tag": f["concepto_tag"],
+                    "monto_pagar": f["monto_pagar"],
+                    "monto_final": f["monto_final"],
+                    "diferencia": f["diferencia"],
                 }
             )
 
@@ -665,6 +983,21 @@ async def extraer_estadisticas_monto(page: Page, id_pedido: str) -> tuple[list[d
     return filas_data, hay_diferencia
 
 
+# DEC-030 Fase 3: un solo evaluate en vez de hasta 8 round-trips (4 items
+# × label+valor). Card condicional (26% de los pedidos), pero cuando
+# existe, la lectura ahora es de un solo golpe.
+_JS_GESTION_DIF = """
+() => {
+    const card = document.querySelector('.difference-card-wrapper');
+    if (!card) return null;
+    return Array.from(card.querySelectorAll('.difference-content .difference-item')).map((item) => {
+        const v = item.querySelector('.item-value');
+        return v ? v.textContent.trim() : '';
+    });
+}
+"""
+
+
 async def extraer_gestion_diferencias(page: Page, id_pedido: str) -> dict | None:
     """Extrae el card 'Gestión de diferencias en el envío'.
 
@@ -677,15 +1010,9 @@ async def extraer_gestion_diferencias(page: Page, id_pedido: str) -> dict | None
         Dict con los 4 valores, o None si el card no existe.
     """
     try:
-        card = await page.query_selector(".difference-card-wrapper")
-        if not card:
+        valores = await page.evaluate(_JS_GESTION_DIF)
+        if valores is None:
             return None
-
-        items = await card.query_selector_all(".difference-content .difference-item")
-        valores: list[str] = []
-        for item in items:
-            val_el = await item.query_selector(".item-value")
-            valores.append((await val_el.inner_text()).strip() if val_el else "")
 
         return {
             "id_pedido": id_pedido,
@@ -703,6 +1030,39 @@ async def extraer_gestion_diferencias(page: Page, id_pedido: str) -> dict | None
             msg=str(exc),
         )
     return None
+
+
+# DEC-030 Fase 3 (híbrido): batch de 12 de las 13 columnas en un solo
+# evaluate. La celda de descuento (índice 4) se queda FUERA de este JS a
+# propósito — sigue pasando por leer_celda_descuento(), que ya tiene su
+# propia suite de tests (DEC-024) y no vale la pena duplicar en JS. El
+# array conserva `null` para filas con <13 celdas (sin filtrar) para que
+# el índice siga alineado 1:1 con los ElementHandle de fila en Python.
+_JS_DETALLE_DIF = """
+() => {
+    const card = document.querySelector('.diff-items-card');
+    if (!card) return null;
+    return Array.from(card.querySelectorAll('tbody tr')).map((fila) => {
+        const celdas = Array.from(fila.querySelectorAll('td'));
+        if (celdas.length < 13) return null;
+        const tipoEl = celdas[2].querySelector('.el-tag__content');
+        return {
+            nombre_producto: celdas[0].textContent.trim(),
+            especificacion: celdas[1].textContent.trim(),
+            tipo: tipoEl ? tipoEl.textContent.trim() : celdas[2].textContent.trim(),
+            precio_unitario: celdas[3].textContent.trim(),
+            precio_descuento: celdas[5].textContent.trim(),
+            cantidad_pedido: celdas[6].textContent.trim(),
+            cantidad_entregada: celdas[7].textContent.trim(),
+            diferencia_cantidad: celdas[8].textContent.trim(),
+            monto_pagar_pedido: celdas[9].textContent.trim(),
+            monto_final_pagar: celdas[10].textContent.trim(),
+            iva: celdas[11].textContent.trim(),
+            monto_diferencia: celdas[12].textContent.trim(),
+        };
+    });
+}
+"""
 
 
 async def extraer_detalle_diferencias(page: Page, id_pedido: str) -> list[dict]:
@@ -727,20 +1087,17 @@ async def extraer_detalle_diferencias(page: Page, id_pedido: str) -> list[dict]:
         if not card:
             return resultado
 
+        datos_bulk = await page.evaluate(_JS_DETALLE_DIF)
+        if datos_bulk is None:
+            return resultado
         filas = await card.query_selector_all("tbody tr")
-        for fila in filas:
+
+        for fila, datos in zip(filas, datos_bulk, strict=False):
+            if datos is None:
+                continue
             celdas = await fila.query_selector_all("td")
             if len(celdas) < 13:
                 continue
-
-            # B023: celdas se liga como default — el cierre se usa solo en
-            # esta iteración, pero el binding explícito lo hace inmune a
-            # refactors que difieran la llamada.
-            async def ct(idx: int, _celdas: list = celdas) -> str:
-                return (await _celdas[idx].inner_text()).strip()
-
-            tipo_el = await celdas[2].query_selector(".el-tag__content")
-            tipo_val = (await tipo_el.inner_text()).strip() if tipo_el else await ct(2)
 
             # DEC-024: misma separación monto/tipo que en lineas_pedido —
             # antes esta celda guardaba el tag (el tipo) dentro de descuento.
@@ -749,20 +1106,9 @@ async def extraer_detalle_diferencias(page: Page, id_pedido: str) -> list[dict]:
             resultado.append(
                 {
                     "id_pedido": id_pedido,
-                    "nombre_producto": await ct(0),
-                    "especificacion": await ct(1),
-                    "tipo": tipo_val,
-                    "precio_unitario": await ct(3),
                     "descuento": dto_val,
                     "descuento_tipo": dto_tipo,
-                    "precio_descuento": await ct(5),
-                    "cantidad_pedido": await ct(6),
-                    "cantidad_entregada": await ct(7),
-                    "diferencia_cantidad": await ct(8),
-                    "monto_pagar_pedido": await ct(9),
-                    "monto_final_pagar": await ct(10),
-                    "iva": await ct(11),
-                    "monto_diferencia": await ct(12),
+                    **datos,
                 }
             )
 
@@ -774,6 +1120,34 @@ async def extraer_detalle_diferencias(page: Page, id_pedido: str) -> list[dict]:
             msg=str(exc),
         )
     return resultado
+
+
+# DEC-030 Fase 3: mismo patrón que timeline — un solo evaluate en vez de
+# hasta 3 round-trips por item (tiempo/usuario/contenido). El split de
+# "accion - referencia" y el mapeo de clase→tipo_usuario son texto crudo
+# desde JS; la interpretación (accion/referencia) se queda en Python.
+_JS_REGISTRO_OPS = """
+() => {
+    return Array.from(document.querySelectorAll('.operate-log-content .log-item')).map((item) => {
+        const t = item.querySelector('.log-time');
+        const u = item.querySelector('.log-user');
+        const c = item.querySelector('.log-content');
+        let tipo_usuario = '';
+        if (u) {
+            const cls = u.className || '';
+            if (cls.includes('user-type-member')) tipo_usuario = 'member';
+            else if (cls.includes('user-type-staff')) tipo_usuario = 'staff';
+            else if (cls.includes('user-type-system')) tipo_usuario = 'system';
+        }
+        return {
+            momento: t ? t.textContent.trim() : '',
+            usuario: u ? u.textContent.trim() : '',
+            tipo_usuario: tipo_usuario,
+            contenido: c ? c.textContent.trim() : '',
+        };
+    });
+}
+"""
 
 
 async def extraer_registro_operaciones(page: Page, id_pedido: str) -> list[dict]:
@@ -790,38 +1164,17 @@ async def extraer_registro_operaciones(page: Page, id_pedido: str) -> list[dict]
     """
     resultado: list[dict] = []
     try:
-        items = await page.query_selector_all(".operate-log-content .log-item")
+        items = await page.evaluate(_JS_REGISTRO_OPS)
         for item in items:
-            tiempo_el = await item.query_selector(".log-time")
-            usuario_el = await item.query_selector(".log-user")
-            contenido_el = await item.query_selector(".log-content")
-
-            momento = (await tiempo_el.inner_text()).strip() if tiempo_el else ""
-            usuario = (await usuario_el.inner_text()).strip() if usuario_el else ""
-
-            tipo_usuario = ""
-            if usuario_el:
-                clases = (await usuario_el.get_attribute("class")) or ""
-                if "user-type-member" in clases:
-                    tipo_usuario = "member"
-                elif "user-type-staff" in clases:
-                    tipo_usuario = "staff"
-                elif "user-type-system" in clases:
-                    tipo_usuario = "system"
-
-            contenido_txt = ""
-            if contenido_el:
-                contenido_txt = (await contenido_el.inner_text()).strip()
-            partes = contenido_txt.split(" - ", 1)
+            partes = item["contenido"].split(" - ", 1)
             accion = partes[0].strip()
             referencia = partes[1].strip() if len(partes) > 1 else ""
-
             resultado.append(
                 {
                     "id_pedido": id_pedido,
-                    "momento": momento,
-                    "usuario": usuario,
-                    "tipo_usuario": tipo_usuario,
+                    "momento": item["momento"],
+                    "usuario": item["usuario"],
+                    "tipo_usuario": item["tipo_usuario"],
                     "accion": accion,
                     "referencia": referencia,
                 }
@@ -835,6 +1188,111 @@ async def extraer_registro_operaciones(page: Page, id_pedido: str) -> list[dict]
             msg=str(exc),
         )
     return resultado
+
+
+# DEC-030 Fase 3 (híbrido): la lectura de filas + líneas de producto se
+# colapsa a un solo evaluate — antes era el mayor contribuyente de
+# round-trips del scraper (hasta 15-20 llamadas por línea de producto).
+# Descuento y presentación quedan FUERA del JS a propósito: el JS solo
+# recolecta las piezas crudas (etiquetas, candidato a monto, texto
+# completo / lista de specs) y Python las procesa con
+# _reclasificar_descuento()/_unir_presentacion() — el mismo origen de
+# verdad que usan leer_celda_descuento()/leer_presentacion() y sus tests
+# (DEC-022, DRY). cantidad_comprada/entregada se quedan como texto crudo:
+# to_num() y el WARNING de "no numérica" siguen en Python, sin cambios.
+_JS_SUBPEDIDOS = """
+() => {
+    const filas = Array.from(document.querySelectorAll(
+        'div.el-scrollbar__wrap--hidden-default table tbody tr'
+    ));
+    const subpedidos = [];
+    for (const fila of filas) {
+        const expandCol = fila.querySelector('td.el-table__expand-column');
+        if (expandCol) {
+            const rawEl = fila.querySelector('span.child-order-id');
+            const raw = rawEl ? rawEl.textContent.trim() : '';
+            const celdas = Array.from(fila.querySelectorAll('td'));
+            const txt = (i, sel) => {
+                if (i >= celdas.length) return '';
+                if (sel) {
+                    const el = celdas[i].querySelector(sel);
+                    return el ? el.textContent.trim() : '';
+                }
+                return celdas[i].textContent.trim();
+            };
+            subpedidos.push({
+                raw_child_order_id: raw,
+                estado: txt(3, '.el-tag__content'),
+                inicio_alistamiento: txt(4),
+                alistamiento_completado: txt(5),
+                alistador: txt(6),
+                inicio_inspeccion: txt(7),
+                inspeccion_completada: txt(8),
+                inspector: txt(9),
+                lineas: [],
+            });
+        } else if (fila.querySelector('td.el-table__expanded-cell') && subpedidos.length > 0) {
+            const prodRows = Array.from(fila.querySelectorAll('div.goods-table-row'));
+            for (const prodRow of prodRows) {
+                const cols = Array.from(prodRow.querySelectorAll('div.goods-col'));
+                const colTxt = (i) => (i < cols.length ? cols[i].textContent.trim() : '');
+                const infoCol = cols.length > 1 ? cols[1] : null;
+                let nombre = '', referencia = '', codRaw = '', specs = [];
+                if (infoCol) {
+                    const n = infoCol.querySelector('.goods-name');
+                    nombre = n ? n.textContent.trim() : '';
+                    const r = infoCol.querySelector('.sn-tag');
+                    referencia = r ? r.textContent.trim() : '';
+                    const b = infoCol.querySelector('.goods-barcode');
+                    codRaw = b ? b.textContent.trim() : '';
+                    specs = Array.from(infoCol.querySelectorAll('.goods-specs span'))
+                        .map((s) => s.textContent.trim());
+                }
+                let tipoVal = colTxt(5);
+                if (cols.length > 5) {
+                    const tEl = cols[5].querySelector('.el-tag__content');
+                    if (tEl) tipoVal = tEl.textContent.trim();
+                }
+                let dtoEtiquetas = [], dtoMontoCrudo = '', dtoTextoCompleto = '';
+                if (cols.length > 7) {
+                    const celdaDto = cols[7];
+                    dtoEtiquetas = Array.from(celdaDto.querySelectorAll('.el-tag__content'))
+                        .map((t) => t.textContent.trim());
+                    for (const span of celdaDto.querySelectorAll('span')) {
+                        if (!(span.className || '').includes('el-tag')) {
+                            dtoMontoCrudo = span.textContent.trim();
+                            break;
+                        }
+                    }
+                    dtoTextoCompleto = celdaDto.textContent.trim();
+                }
+                subpedidos[subpedidos.length - 1].lineas.push({
+                    numero_caja: colTxt(0),
+                    nombre_producto: nombre,
+                    referencia: referencia,
+                    codigo_barras_raw: codRaw,
+                    presentacion_specs: specs,
+                    almacen: colTxt(2),
+                    cantidad_comprada_raw: colTxt(3),
+                    cantidad_entregada_raw: colTxt(4),
+                    tipo: tipoVal,
+                    precio_unitario: colTxt(6),
+                    descuento_etiquetas: dtoEtiquetas,
+                    descuento_monto_crudo: dtoMontoCrudo,
+                    descuento_texto_completo: dtoTextoCompleto,
+                    precio_descuento: colTxt(8),
+                    monto_pagar: colTxt(9),
+                    monto_final: colTxt(10),
+                    iva: colTxt(11),
+                    peso_total: colTxt(12),
+                    observaciones: colTxt(13),
+                });
+            }
+        }
+    }
+    return subpedidos;
+}
+"""
 
 
 async def extraer_subpedidos(page: Page) -> list[dict]:
@@ -856,24 +1314,8 @@ async def extraer_subpedidos(page: Page) -> list[dict]:
         Lista de dicts de subpedido. Cada dict incluye la clave 'lineas'
         con la lista de productos del subpedido.
     """
-
-    async def td_txt(cells: list, i: int, sel: str | None = None) -> str:
-        """Texto de una celda td por índice, con sub-selector opcional."""
-        if i >= len(cells):
-            return ""
-        if sel:
-            el = await cells[i].query_selector(sel)
-            return (await el.inner_text()).strip() if el else ""
-        return (await cells[i].inner_text()).strip()
-
-    async def ic_txt(info_col, sel: str) -> str:
-        """Texto de un sub-elemento dentro del bloque info de producto."""
-        if not info_col:
-            return ""
-        el = await info_col.query_selector(sel)
-        return (await el.inner_text()).strip() if el else ""
-
-    # 1 — Expandir subpedidos que aún no están expandidos
+    # 1 — Expandir subpedidos que aún no están expandidos. Interacción de
+    # UI real (click + espera de render) — no se puede batchear.
     iconos = await page.query_selector_all("div.el-table__expand-icon")
     for icono in iconos:
         clases = (await icono.get_attribute("class")) or ""
@@ -894,108 +1336,111 @@ async def extraer_subpedidos(page: Page) -> list[dict]:
                 )
             await asyncio.sleep(0.5)
 
-    # 2 — Leer filas DESPUÉS de haber expandido todo
-    filas = await page.query_selector_all("div.el-scrollbar__wrap--hidden-default table tbody tr")
+    # 2 — Leer filas DESPUÉS de haber expandido todo (DEC-030 Fase 3)
+    crudo = await page.evaluate(_JS_SUBPEDIDOS)
 
     subpedidos: list[dict] = []
+    for sp in crudo:
+        raw = sp["raw_child_order_id"]
+        if " + " in raw:
+            partes = raw.split(" + ", 1)
+            tipo_sub = partes[0].strip()
+            num_sub = partes[1].strip()
+        else:
+            tipo_sub = "desconocido"
+            num_sub = raw
 
-    for fila in filas:
-        # — Fila cabecera de subpedido (contiene celda expand) —
-        if await fila.query_selector("td.el-table__expand-column"):
-            raw_el = await fila.query_selector("span.child-order-id")
-            raw = (await raw_el.inner_text()).strip() if raw_el else ""
+        lineas: list[dict] = []
+        for ln in sp["lineas"]:
+            cod_barras = ln["codigo_barras_raw"].replace("Código de barras:", "").strip()
+            presentac = _unir_presentacion(ln["presentacion_specs"])
 
-            if " + " in raw:
-                partes = raw.split(" + ", 1)
-                tipo_sub = partes[0].strip()
-                num_sub = partes[1].strip()
-            else:
-                tipo_sub = "desconocido"
-                num_sub = raw
+            cant_c_str = ln["cantidad_comprada_raw"]
+            cant_e_str = ln["cantidad_entregada_raw"]
+            cant_c = to_num(cant_c_str)
+            cant_e = to_num(cant_e_str)
 
-            celdas = await fila.query_selector_all("td")
-            subpedidos.append(
+            if cant_c is None and cant_c_str:
+                log_event(
+                    "cantidad_no_numerica",
+                    level="WARNING",
+                    msg=f"cantidad_comprada no numérica: '{cant_c_str}'",
+                )
+            if cant_e is None and cant_e_str:
+                log_event(
+                    "cantidad_no_numerica",
+                    level="WARNING",
+                    msg=f"cantidad_entregada no numérica: '{cant_e_str}'",
+                )
+
+            # DEC-024: la columna descuento combina la ranura del monto y
+            # las etiquetas de tipo; se separan en dos campos.
+            descuento_val, descuento_tipo = _reclasificar_descuento(
+                ln["descuento_etiquetas"],
+                ln["descuento_monto_crudo"],
+                ln["descuento_texto_completo"],
+            )
+
+            lineas.append(
                 {
-                    "numero_subpedido": num_sub,
-                    "tipo_subpedido": tipo_sub,
-                    "estado": await td_txt(celdas, 3, ".el-tag__content"),
-                    "inicio_alistamiento": await td_txt(celdas, 4),
-                    "alistamiento_completado": await td_txt(celdas, 5),
-                    "alistador": await td_txt(celdas, 6),
-                    "inicio_inspeccion": await td_txt(celdas, 7),
-                    "inspeccion_completada": await td_txt(celdas, 8),
-                    "inspector": await td_txt(celdas, 9),
-                    "lineas": [],
+                    "numero_caja": ln["numero_caja"],
+                    "nombre_producto": ln["nombre_producto"],
+                    "referencia": ln["referencia"],
+                    "codigo_barras": cod_barras,
+                    "presentacion": presentac,
+                    "almacen": ln["almacen"],
+                    "cantidad_comprada": cant_c,
+                    "cantidad_entregada": cant_e,
+                    "tipo": ln["tipo"],
+                    "precio_unitario": ln["precio_unitario"],
+                    "descuento": descuento_val,
+                    "descuento_tipo": descuento_tipo,
+                    "precio_descuento": ln["precio_descuento"],
+                    "monto_pagar": ln["monto_pagar"],
+                    "monto_final": ln["monto_final"],
+                    "iva": ln["iva"],
+                    "peso_total": ln["peso_total"],
+                    "observaciones": ln["observaciones"],
                 }
             )
 
-        # — Fila de contenido expandido —
-        elif await fila.query_selector("td.el-table__expanded-cell") and subpedidos:
-            for prod_row in await fila.query_selector_all("div.goods-table-row"):
-                cols = await prod_row.query_selector_all("div.goods-col")
-                info_col = cols[1] if len(cols) > 1 else None
-
-                nombre = await ic_txt(info_col, ".goods-name")
-                referencia = await ic_txt(info_col, ".sn-tag")
-                cod_raw = await ic_txt(info_col, ".goods-barcode")
-                cod_barras = cod_raw.replace("Código de barras:", "").strip()
-                presentac = await leer_presentacion(info_col)
-
-                cant_c_str = await col_text(cols, 3)
-                cant_e_str = await col_text(cols, 4)
-                cant_c = to_num(cant_c_str)
-                cant_e = to_num(cant_e_str)
-
-                if cant_c is None and cant_c_str:
-                    log_event(
-                        "cantidad_no_numerica",
-                        level="WARNING",
-                        msg=f"cantidad_comprada no numérica: '{cant_c_str}'",
-                    )
-                if cant_e is None and cant_e_str:
-                    log_event(
-                        "cantidad_no_numerica",
-                        level="WARNING",
-                        msg=f"cantidad_entregada no numérica: '{cant_e_str}'",
-                    )
-
-                tipo_el = (
-                    await cols[5].query_selector(".el-tag__content") if len(cols) > 5 else None
-                )
-                tipo_val = (
-                    (await tipo_el.inner_text()).strip() if tipo_el else await col_text(cols, 5)
-                )
-
-                # DEC-024: la columna descuento (índice 7) combina la ranura
-                # del monto y las etiquetas de tipo; se separan en dos campos.
-                descuento_val, descuento_tipo = (
-                    await leer_celda_descuento(cols[7]) if len(cols) > 7 else ("-", "")
-                )
-
-                subpedidos[-1]["lineas"].append(
-                    {
-                        "numero_caja": await col_text(cols, 0),
-                        "nombre_producto": nombre,
-                        "referencia": referencia,
-                        "codigo_barras": cod_barras,
-                        "presentacion": presentac,
-                        "almacen": await col_text(cols, 2),
-                        "cantidad_comprada": cant_c,
-                        "cantidad_entregada": cant_e,
-                        "tipo": tipo_val,
-                        "precio_unitario": await col_text(cols, 6),
-                        "descuento": descuento_val,
-                        "descuento_tipo": descuento_tipo,
-                        "precio_descuento": await col_text(cols, 8),
-                        "monto_pagar": await col_text(cols, 9),
-                        "monto_final": await col_text(cols, 10),
-                        "iva": await col_text(cols, 11),
-                        "peso_total": await col_text(cols, 12),
-                        "observaciones": await col_text(cols, 13),
-                    }
-                )
+        subpedidos.append(
+            {
+                "numero_subpedido": num_sub,
+                "tipo_subpedido": tipo_sub,
+                "estado": sp["estado"],
+                "inicio_alistamiento": sp["inicio_alistamiento"],
+                "alistamiento_completado": sp["alistamiento_completado"],
+                "alistador": sp["alistador"],
+                "inicio_inspeccion": sp["inicio_inspeccion"],
+                "inspeccion_completada": sp["inspeccion_completada"],
+                "inspector": sp["inspector"],
+                "lineas": lineas,
+            }
+        )
 
     return subpedidos
+
+
+# DEC-030 Fase 3: la lectura del timeline se colapsa a un solo
+# page.evaluate() — antes eran hasta 2 round-trips Playwright↔navegador
+# por paso (título + fecha). Sin lógica de negocio en el JS: solo
+# recolecta texto/clase crudos, igual que antes.
+_JS_TIMELINE = """
+() => {
+    const wrapper = document.querySelector('div.order-steps-wrapper');
+    if (!wrapper) return null;
+    return Array.from(wrapper.querySelectorAll('div.step-item')).map((paso) => {
+        const t = paso.querySelector('div.step-title');
+        const f = paso.querySelector('div.step-time');
+        return {
+            titulo: t ? t.textContent.trim() : '',
+            fecha_hora: f ? f.textContent.trim() : '',
+            completado: (paso.className || '').includes('is-completed') ? 1 : 0,
+        };
+    });
+}
+"""
 
 
 async def extraer_timeline(page: Page, id_pedido: str) -> list[dict]:
@@ -1013,24 +1458,17 @@ async def extraer_timeline(page: Page, id_pedido: str) -> list[dict]:
     """
     timeline: list[dict] = []
     try:
-        wrapper = await page.query_selector("div.order-steps-wrapper")
-        if not wrapper:
+        pasos = await page.evaluate(_JS_TIMELINE)
+        if pasos is None:
             return []
-        pasos = await wrapper.query_selector_all("div.step-item")
         for i, paso in enumerate(pasos):
-            titulo_el = await paso.query_selector("div.step-title")
-            fecha_el = await paso.query_selector("div.step-time")
-            clases = (await paso.get_attribute("class")) or ""
-            completado = 1 if "is-completed" in clases else 0
-            titulo = (await titulo_el.inner_text()).strip() if titulo_el else ""
-            fecha_hora = (await fecha_el.inner_text()).strip() if fecha_el else ""
             timeline.append(
                 {
                     "id_pedido": id_pedido,
                     "paso": i + 1,
-                    "titulo": titulo,
-                    "fecha_hora": fecha_hora,
-                    "completado": completado,
+                    "titulo": paso["titulo"],
+                    "fecha_hora": paso["fecha_hora"],
+                    "completado": paso["completado"],
                 }
             )
     except Exception as exc:

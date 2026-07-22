@@ -21,48 +21,39 @@ from scraper.scraper_principal import (
     obtener_lista_pedidos_con_retry,
 )
 
-# ── Fakes mínimos del árbol DOM que _leer_ids_pagina consulta ──────────────────
-
-
-class _FakeEl:
-    def __init__(self, texto: str):
-        self._texto = texto
-
-    async def inner_text(self) -> str:
-        return self._texto
-
-
-class _FakeFila:
-    """Fila de tabla; texto None simula una fila sin celda de ID."""
-
-    def __init__(self, texto: str | None):
-        self._texto = texto
-
-    async def query_selector(self, sel: str):
-        assert sel == SEL_LISTA_ID
-        return _FakeEl(self._texto) if self._texto is not None else None
+# ── Fake mínimo de Page para _leer_ids_pagina ──────────────────────────────────
+# DEC-030 Fase 1: la recolección cruda vive en un page.evaluate (un solo
+# round-trip); el fake devuelve la lista cruda (texto o None por fila) y los
+# tests verifican la normalización, que sigue en Python.
 
 
 class _FakePage:
-    def __init__(self, filas: list[_FakeFila]):
-        self._filas = filas
+    def __init__(self, crudos: list[str | None]):
+        self._crudos = crudos
 
-    async def query_selector_all(self, sel: str):
-        assert sel == SEL_LISTA_FILAS
-        return self._filas
+    async def evaluate(self, js: str, arg):
+        assert arg == [SEL_LISTA_FILAS, SEL_LISTA_ID]
+        return self._crudos
 
 
 @pytest.mark.unit
 async def test_leer_ids_pagina_extrae_y_normaliza():
     """N-5: extrae los IDs de las filas y hace strip del texto."""
-    page = _FakePage([_FakeFila(" TEST-001 "), _FakeFila("TEST-002")])
+    page = _FakePage([" TEST-001 ", "TEST-002"])
     assert await _leer_ids_pagina(page) == ["TEST-001", "TEST-002"]
 
 
 @pytest.mark.unit
 async def test_leer_ids_pagina_omite_filas_sin_id():
-    """Filas sin celda de ID (placeholder de tabla vacía) no aportan."""
-    page = _FakePage([_FakeFila("TEST-001"), _FakeFila(None)])
+    """Filas sin celda de ID (None del evaluate) no aportan."""
+    page = _FakePage(["TEST-001", None])
+    assert await _leer_ids_pagina(page) == ["TEST-001"]
+
+
+@pytest.mark.unit
+async def test_leer_ids_pagina_omite_textos_vacios():
+    """Texto en blanco (celda renderizada vacía) tampoco aporta un ID."""
+    page = _FakePage(["TEST-001", "   ", ""])
     assert await _leer_ids_pagina(page) == ["TEST-001"]
 
 

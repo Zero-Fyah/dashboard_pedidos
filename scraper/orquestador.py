@@ -19,6 +19,7 @@ import aiosqlite
 from playwright.async_api import (
     Browser,
     BrowserContext,
+    Route,
     async_playwright,
 )
 
@@ -58,7 +59,68 @@ _USER_AGENTS: list[str] = [
 ]
 
 
+# DEC-029: ninguna extracción lee imágenes de producto (goods-image) —
+# bloquearlas a nivel de contexto ahorra la espera al evento 'load'
+# completo en modo completo y el ancho de banda compartido entre workers.
+# No se bloquea 'font': puede afectar layout/visibilidad y el ahorro es
+# marginal frente al peso real (fotos de varios MB).
+_RECURSOS_BLOQUEADOS = frozenset({"image", "media"})
+
+
+async def _bloquear_recursos_pesados(context: BrowserContext) -> None:
+    """Aborta descargas de imagen/media en todas las páginas del contexto.
+
+    Se registra una sola vez por contexto (no por página): Playwright
+    aplica la ruta a cualquier page.new_page() posterior del mismo context.
+    """
+
+    async def _handler(route: Route) -> None:
+        if route.request.resource_type in _RECURSOS_BLOQUEADOS:
+            await route.abort()
+        else:
+            await route.continue_()
+
+    await context.route("**/*", _handler)
+
+
 # get_db_path() vive en comun/ (AUD-M5) y se importa arriba.
+
+
+async def obtener_ids_activos(db_path: str) -> list[str]:
+    """IDs de pedidos que necesitan una pasada más en el incremental.
+
+    BUG-024: un subpedido necesita atención si está abierto, o si ya cerró
+    pero `cantidades_definitivas` sigue en 0 (con_cantidades todavía no lo
+    visitó). La versión original solo miraba "abierto" — un pedido cuyos
+    subpedidos cierran todos en el mismo incremento (el caso común, no el
+    de varios subpedidos cerrando en momentos distintos) se quedaba sin
+    ningún subpedido abierto y desaparecía de este carril para siempre,
+    sin que con_cantidades llegara a fijar la cantidad definitiva.
+
+    Args:
+        db_path: Ruta a la base de datos SQLite.
+
+    Returns:
+        Lista de id_pedido distintos que requieren revisión.
+    """
+    _cerr_ph = ",".join("?" * len(ESTADOS_CERRADOS))
+    async with aiosqlite.connect(db_path) as db:
+        rows = await (
+            await db.execute(
+                f"""
+                SELECT DISTINCT p.id_pedido
+                FROM pedidos p
+                JOIN subpedidos s ON p.id_pedido = s.id_pedido
+                WHERE p.scraping_completo = 1
+                  AND (
+                    LOWER(s.estado) NOT IN ({_cerr_ph})
+                    OR s.cantidades_definitivas = 0
+                  )
+            """,
+                tuple(ESTADOS_CERRADOS),
+            )
+        ).fetchall()
+    return [r[0] for r in rows]
 
 
 def calcular_desde_nuevos(
@@ -183,22 +245,13 @@ async def main(args: argparse.Namespace) -> int:
             _cerr_ph = ",".join("?" * len(ESTADOS_CERRADOS))
 
             # Proceso 1 — Actualizar pedidos activos (sin recorrer páginas)
-            async with aiosqlite.connect(db_path) as db_r:
-                rows = await (
-                    await db_r.execute(
-                        f"""
-                    SELECT DISTINCT p.id_pedido
-                    FROM pedidos p
-                    JOIN subpedidos s ON p.id_pedido = s.id_pedido
-                    WHERE p.scraping_completo = 1
-                      AND LOWER(s.estado) NOT IN ({_cerr_ph})
-                """,
-                        tuple(ESTADOS_CERRADOS),
-                    )
-                ).fetchall()
-            ids_activos = [r[0] for r in rows]
+            # BUG-024: ver obtener_ids_activos().
+            ids_activos = await obtener_ids_activos(db_path)
 
             # Proceso 2 — Reintentar pedidos con error
+            # BUG-024: mismo criterio de "necesita atención" que Proceso 1,
+            # para no excluir de los reintentos un pedido que ya cerró pero
+            # aún no tiene cantidades_definitivas.
             async with aiosqlite.connect(db_path) as db_r:
                 rows = await (
                     await db_r.execute(
@@ -210,6 +263,7 @@ async def main(args: argparse.Namespace) -> int:
                           AND id_pedido NOT IN (
                             SELECT DISTINCT id_pedido FROM subpedidos
                             WHERE LOWER(estado) NOT IN ({_cerr_ph})
+                               OR cantidades_definitivas = 0
                           )
                     )
                 """,
@@ -232,6 +286,7 @@ async def main(args: argparse.Namespace) -> int:
             fecha_cobertura = fecha_hoy
 
             ctx_0 = await browser.new_context(viewport=_VIEWPORTS[0], locale="es-CO")
+            await _bloquear_recursos_pesados(ctx_0)
             page_0 = await ctx_0.new_page()
             try:
                 await login(page_0, USUARIO, CLAVE)
@@ -269,6 +324,7 @@ async def main(args: argparse.Namespace) -> int:
         else:
             # Modo completo — recorre todas las páginas del rango dado
             ctx_0 = await browser.new_context(viewport=_VIEWPORTS[0], locale="es-CO")
+            await _bloquear_recursos_pesados(ctx_0)
             page_0 = await ctx_0.new_page()
             try:
                 await login(page_0, USUARIO, CLAVE)
@@ -324,6 +380,7 @@ async def main(args: argparse.Namespace) -> int:
                 user_agent=_USER_AGENTS[wid % len(_USER_AGENTS)],
                 locale="es-CO",
             )
+            await _bloquear_recursos_pesados(ctx)
             p = await ctx.new_page()
             await login(p, USUARIO, CLAVE)
             await p.close()
@@ -455,6 +512,7 @@ async def main(args: argparse.Namespace) -> int:
                 user_agent=_USER_AGENTS[0],
                 locale="es-CO",
             )
+            await _bloquear_recursos_pesados(ctx_dl)
             _p_dl = await ctx_dl.new_page()
             await login(_p_dl, USUARIO, CLAVE)
             await _p_dl.close()

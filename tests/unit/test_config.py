@@ -6,6 +6,7 @@ evento por un AttributeError del nivel).
 """
 
 import logging
+from logging.handlers import TimedRotatingFileHandler
 
 import pytest
 
@@ -91,12 +92,15 @@ def test_log_event_nivel_invalido_no_revienta(nivel):
 def test_logger_tiene_un_solo_handler():
     """N-4: el guard de handlers evita duplicados ante re-imports.
 
-    Se cuentan solo los FileHandler exactos del módulo: el plugin de
-    logging de pytest >= 9.1 agrega sus propios handlers de captura a los
-    loggers con propagate=False (incluido un _FileHandler que SUBCLASEA
-    FileHandler — por eso `type(...) is` y no isinstance).
+    Se cuenta solo el TimedRotatingFileHandler exacto del módulo (retención
+    de logs, 2026-07-19): el plugin de logging de pytest >= 9.1 agrega sus
+    propios handlers de captura a los loggers con propagate=False (incluido
+    un _FileHandler que SUBCLASEA FileHandler — por eso `type(...) is` y no
+    isinstance).
     """
     propios = [
-        h for h in logging.getLogger("scraper.config").handlers if type(h) is logging.FileHandler
+        h
+        for h in logging.getLogger("scraper.config").handlers
+        if type(h) is TimedRotatingFileHandler
     ]
     assert len(propios) == 1

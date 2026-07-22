@@ -125,6 +125,31 @@ async def test_modo_completo_es_idempotente(db_path, pedido_sin_diferencias):
 
 
 @pytest.mark.integration
+async def test_persiste_persona_movil_recogida_y_campos_credito(db_path, pedido_sin_diferencias):
+    """DEC-032/DEC-033: extraer_info_general() los devuelve, pero el UPDATE de
+    persistencia.py no los incluía -- se perdían en silencio pese a estar
+    correctamente extraídos y mapeados. Regresión encontrada durante el
+    backfill DEC-027 (bloque01, 5 campos con 0% de persistencia real)."""
+    pedido_sin_diferencias["info_general"]["metodo_entrega"] = "Almacen"
+    pedido_sin_diferencias["info_general"]["persona_recogida"] = "Fernando Abad"
+    pedido_sin_diferencias["info_general"]["movil_recogida"] = "3001234567"
+    pedido_sin_diferencias["info_general"]["forma_pago"] = "Pago a crédito"
+    pedido_sin_diferencias["info_general"]["dias_credito"] = "30"
+    pedido_sin_diferencias["info_general"]["inicio_credito"] = "2026-07-16"
+    pedido_sin_diferencias["info_general"]["vencimiento_credito"] = "2026-08-15"
+    await persistir_uno(pedido_sin_diferencias, db_path)
+    async with aiosqlite.connect(db_path) as db:
+        row = await (
+            await db.execute(
+                """SELECT persona_recogida, movil_recogida, dias_credito,
+                          inicio_credito, vencimiento_credito
+                   FROM pedidos WHERE id_pedido = 'TEST-001'"""
+            )
+        ).fetchone()
+    assert row == ("Fernando Abad", "3001234567", "30", "2026-07-16", "2026-08-15")
+
+
+@pytest.mark.integration
 async def test_modo_solo_estado_no_modifica_lineas(db_path, pedido_sin_diferencias):
     """solo_estado actualiza estado del subpedido pero no toca lineas_pedido."""
     await persistir_uno(pedido_sin_diferencias, db_path)

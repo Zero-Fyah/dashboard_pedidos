@@ -144,9 +144,11 @@ async def _persistir_secciones_satelite(
             ),
         )
     elif warn:
+        # DEC-030 Fase 0: INFO, no WARNING — el 74% de los pedidos no tiene
+        # diferencias; la ausencia del card es el caso normal, no una anomalía.
         log_event(
             "gestion_dif_vacio",
-            level="WARNING",
+            level="INFO",
             msg="gestion_diferencias retornó vacío — datos existentes preservados",
             id_pedido=id_pedido,
         )
@@ -167,9 +169,10 @@ async def _persistir_secciones_satelite(
             resultado["detalle_dif"],
         )
     elif warn:
+        # DEC-030 Fase 0: mismo criterio que gestion_dif_vacio.
         log_event(
             "detalle_dif_vacio",
-            level="WARNING",
+            level="INFO",
             msg="detalle_diferencias retornó vacío — datos existentes preservados",
             id_pedido=id_pedido,
         )
@@ -480,7 +483,12 @@ async def persistencia_worker(
                             vehiculo_entrega      = :veh,
                             obs_entrega           = :oe,
                             entrega_ruta_tag      = :ert,
-                            entrega_descuento_tag = :edt
+                            entrega_descuento_tag = :edt,
+                            persona_recogida      = :pr,
+                            movil_recogida        = :mr,
+                            dias_credito          = :dc,
+                            inicio_credito        = :ic,
+                            vencimiento_credito   = :vc
                         WHERE id_pedido = :pid
                         """,
                         {
@@ -496,6 +504,13 @@ async def persistencia_worker(
                             "oe": info_e.get("obs_entrega", ""),
                             "ert": info_e.get("entrega_ruta_tag", ""),
                             "edt": info_e.get("entrega_descuento_tag", ""),
+                            # DEC-032: solo vienen con metodo_entrega='Almacen'.
+                            "pr": info_g.get("persona_recogida", ""),
+                            "mr": info_g.get("movil_recogida", ""),
+                            # DEC-033: solo vienen con forma_pago='Pago a crédito'.
+                            "dc": info_g.get("dias_credito", ""),
+                            "ic": info_g.get("inicio_credito", ""),
+                            "vc": info_g.get("vencimiento_credito", ""),
                             "pid": id_pedido,
                         },
                     )
