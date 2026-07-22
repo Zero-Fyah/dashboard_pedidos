@@ -17,6 +17,17 @@ DB_PATH = Path(__file__).parent.parent / "data" / "pedidos.db"
 # sorted() para SQL determinístico (frozenset no garantiza orden).
 _cerr = ",".join(f"'{e}'" for e in sorted(ESTADOS_CERRADOS))
 
+# AUD-B6: Colombia opera en UTC-5 sin horario de verano desde 1993 — un
+# offset fijo es correcto todo el año y no depende de la zona horaria
+# configurada en el SO donde corre el dashboard (a diferencia del
+# modificador 'localtime' de SQLite). `pedidos.fecha` es la fecha que
+# muestra la SPA (hora local Colombia, sin TZ explícita) mientras que
+# `estado_cambiado_en` se guarda en UTC (persistencia.py) — antes
+# `JULIANDAY(DATE('now'))` (UTC) se restaba contra `p.fecha` (local),
+# desviando "Días abierto"/"Días sin mov." hasta 1 día durante la ventana
+# diaria de 5h en que la fecha UTC ya cambió y la de Colombia todavía no.
+_HOY_CO = "DATE('now', '-5 hours')"
+
 # AUD-M12: único TTL para todo el módulo — antes 7200s en las queries y
 # 300s en los checks de esquema, una inconsistencia sin motivo (el peor
 # caso de datos viejos llegaba a ~4h: caché + ciclo del scheduler). Con el
@@ -328,17 +339,18 @@ def get_pedidos_activos(
             p.destinatario                                      AS "Destinatario",
             p.hay_diferencia                                    AS _hay_diferencia,
             CAST(
-                JULIANDAY(DATE('now')) - JULIANDAY(p.fecha)
+                JULIANDAY({_HOY_CO}) - JULIANDAY(p.fecha)
                 AS INTEGER
             )                                                   AS "Días abierto",
             CAST(
-                JULIANDAY(DATE('now'))
+                JULIANDAY({_HOY_CO})
                 - JULIANDAY(DATE(
                     MIN(CASE
                         WHEN LOWER(s.estado) NOT IN ({_cerr})
                         THEN s.estado_cambiado_en
                         ELSE NULL
-                    END)
+                    END),
+                    '-5 hours'
                 ))
                 AS INTEGER
             )                                                   AS "Días sin mov.",
@@ -369,7 +381,7 @@ def get_pedidos_activos(
           {filtro_almacen}
         GROUP BY p.id_pedido
         ORDER BY CAST(
-            JULIANDAY(DATE('now')) - JULIANDAY(p.fecha) AS INTEGER
+            JULIANDAY({_HOY_CO}) - JULIANDAY(p.fecha) AS INTEGER
         ) DESC, p.id_pedido DESC
     """
 
