@@ -36,7 +36,7 @@ from scraper.db import (
     init_db,
     limpiar_errores_resueltos,
 )
-from scraper.extractores import login, obtener_lista_pedidos_con_retry
+from scraper.extractores import login, obtener_lista_pedidos_con_watchdog
 from scraper.persistencia import persistencia_worker
 from scraper.workers import scraper_worker
 
@@ -290,7 +290,7 @@ async def main(args: argparse.Namespace) -> int:
             page_0 = await ctx_0.new_page()
             try:
                 await login(page_0, USUARIO, CLAVE)
-                ids_nuevos_servidor = await obtener_lista_pedidos_con_retry(
+                ids_nuevos_servidor = await obtener_lista_pedidos_con_watchdog(
                     page_0, fecha_desde_nuevos, fecha_hoy, USUARIO, CLAVE
                 )
             finally:
@@ -328,7 +328,7 @@ async def main(args: argparse.Namespace) -> int:
             page_0 = await ctx_0.new_page()
             try:
                 await login(page_0, USUARIO, CLAVE)
-                todos_ids = await obtener_lista_pedidos_con_retry(
+                todos_ids = await obtener_lista_pedidos_con_watchdog(
                     page_0, args.desde, args.hasta, USUARIO, CLAVE
                 )
             finally:

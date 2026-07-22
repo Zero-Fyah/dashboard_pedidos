@@ -69,3 +69,10 @@ def test_modo_completo_si_scraping_incompleto():
     """
     assert determinar_modo(False, [], scraping_completo=0) == "completo"
     assert determinar_modo(False, [("en alistamiento", 0)], scraping_completo=0) == "completo"
+
+
+@pytest.mark.unit
+def test_modo_estado_null_no_revienta_cae_a_solo_estado():
+    """AUD-M9: un estado NULL (registro legado) no debe tumbar
+    determinar_modo() con AttributeError — None no matchea ESTADOS_CERRADOS."""
+    assert determinar_modo(False, [(None, 0)]) == "solo_estado"

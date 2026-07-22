@@ -138,3 +138,47 @@ async def test_worker_duerme_ante_rate_limit_activo(monkeypatch, sleeps):
     assert len(sleeps) == 1
     assert 29 <= sleeps[0] <= 30
     assert procesados == ["P1"]  # procesó después de la pausa
+
+
+# ── AUD-M9: red de seguridad ante excepción no controlada ──────────────────
+
+
+@pytest.mark.unit
+async def test_worker_sobrevive_excepcion_no_controlada_de_procesar_pedido(monkeypatch):
+    """AUD-M9: antes de este fix, una excepción escapada de procesar_pedido()
+    (fuera de su propio try/except) mataba la task del worker para siempre —
+    sin log, sin resultado en la cola, y el resto de la cola sin consumir."""
+    llamadas: list[str] = []
+
+    async def _revienta_en_P2(worker_id, page, pid, rq, db, max_reintentos=None):
+        llamadas.append(pid)
+        if pid == "P2":
+            raise RuntimeError("bug no previsto simulado")
+        return True
+
+    monkeypatch.setattr(sw, "procesar_pedido", _revienta_en_P2)
+
+    eventos: list[tuple] = []
+    monkeypatch.setattr(sw, "log_event", lambda evento, **kw: eventos.append((evento, kw)))
+
+    resultados: asyncio.Queue = asyncio.Queue()
+    cola: asyncio.Queue = asyncio.Queue()
+    for pid in ["P1", "P2", "P3"]:
+        await cola.put(pid)
+    await cola.put(None)
+
+    await sw.scraper_worker(0, _FakeContext(), cola, resultados, "db-fake")
+
+    # El worker sobrevivió y consumió TODA la cola, no solo hasta P2.
+    assert llamadas == ["P1", "P2", "P3"]
+    # P2 dejó un resultado de error publicado — no se pierde en silencio.
+    publicados = []
+    while not resultados.empty():
+        publicados.append(resultados.get_nowait())
+    ids_error = [r["id_pedido"] for r in publicados if r.get("_error")]
+    assert ids_error == ["P2"]
+    # Y quedó logueado como ERROR, no solo al final del run.
+    errores_loggeados = [e for e in eventos if e[0] == "worker_excepcion_no_controlada"]
+    assert len(errores_loggeados) == 1
+    assert errores_loggeados[0][1]["level"] == "ERROR"
+    assert errores_loggeados[0][1]["id_pedido"] == "P2"

@@ -82,6 +82,29 @@ async def test_config_no_se_muta_con_parametro(db_path):
     assert CONFIG["MAX_REINTENTOS"] == original
 
 
+# ── AUD-M9: excepción en la determinación de modo no mata el worker ────────
+
+
+@pytest.mark.integration
+async def test_error_de_db_en_determinar_modo_no_revienta_devuelve_error(tmp_path):
+    """AUD-M9: antes de este fix, un OperationalError en la consulta previa
+    al loop de reintentos (DB sin tablas — sesión no inicializada, DB
+    bloqueada, etc.) se escapaba de procesar_pedido() sin control. Ahora
+    respeta el mismo contrato de salida que el resto de la función: False +
+    resultado "_error" en la cola, nunca una excepción sin capturar."""
+    db_sin_init = str(tmp_path / "sin_tablas.db")  # aiosqlite la crea vacía,
+    # sin correr init_db() — las SELECT de determinar_modo fallan con
+    # "no such table: pedidos" (OperationalError real, no simulado).
+    queue: asyncio.Queue = asyncio.Queue()
+
+    exito = await procesar_pedido(0, _PageRota(), "TEST-M9", queue, db_sin_init)
+
+    assert exito is False
+    resultado = queue.get_nowait()
+    assert resultado["_error"] is True
+    assert "Determinación de modo falló" in resultado["detalle"]
+
+
 # ── AUD-B8b: init_db re-ejecutable con catch específico ─────────────────────
 
 

@@ -74,6 +74,7 @@ class ConfigDict(TypedDict):
     INCREMENTAL_LOOKBACK_MAX_DIAS: int
     NUM_WORKERS: int
     RUN_TIMEOUT_S: int
+    LISTADO_TIMEOUT_S: int
     MAX_SCREENSHOTS: int
     MAX_HTML_DEBUG: int
     LOG_FILE: str
@@ -122,6 +123,13 @@ CONFIG: ConfigDict = {
     # la carga histórica más larga registrada tomó ~5.5h (DEC-010) y el
     # incremental estimado es 3-5h.
     "RUN_TIMEOUT_S": 8 * 3600,
+    # DEC-034: red de seguridad del listado — ningún timeout local (click,
+    # wait_for_selector) protege contra un navegador congelado a nivel de
+    # protocolo DevTools, donde Playwright no tiene nada que reportar
+    # porque la comunicación misma está colgada. 10 min es generoso frente
+    # al peor caso legítimo medido (~30 páginas, minutos, no horas) y muy
+    # por debajo de los cuelgues reales observados (8-17 min de silencio).
+    "LISTADO_TIMEOUT_S": 600,
     # Observabilidad
     "MAX_SCREENSHOTS": 50,
     "MAX_HTML_DEBUG": 50,

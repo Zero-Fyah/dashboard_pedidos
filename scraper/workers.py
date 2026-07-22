@@ -75,7 +75,10 @@ def determinar_modo(
         return "completo"
     if es_nuevo:
         return "completo"
-    if any(cd == 0 and estado.lower() in ESTADOS_CERRADOS for estado, cd in subs_db):
+    # AUD-M9: (estado or "") — un estado NULL en un registro legado no debe
+    # tumbar determinar_modo() con AttributeError; "" nunca matchea
+    # ESTADOS_CERRADOS, así que el pedido cae a solo_estado, correcto.
+    if any(cd == 0 and (estado or "").lower() in ESTADOS_CERRADOS for estado, cd in subs_db):
         return "con_cantidades"
     return "solo_estado"
 
@@ -122,26 +125,43 @@ async def procesar_pedido(
         max_reintentos = CONFIG["MAX_REINTENTOS"]
 
     # ── Determinar modo antes del loop de reintentos ──────────────────────
-    async with aiosqlite.connect(db_path) as db_r:
-        row = await (
-            await db_r.execute(
-                "SELECT scraping_completo FROM pedidos WHERE id_pedido = ?", (id_pedido,)
-            )
-        ).fetchone()
-        es_nuevo = row is None
-
-        if not es_nuevo:
-            subs_db = await (
+    # AUD-M9: esta sección vivía fuera del try del loop de reintentos — un
+    # OperationalError (DB bloqueada) u otra excepción acá mataba la task
+    # del worker sin dejar rastro en `errores` ni en el log hasta el
+    # resumen final del run. Mismo contrato de salida que el loop: log
+    # ERROR + resultado "_error" en la cola + return False.
+    try:
+        async with aiosqlite.connect(db_path) as db_r:
+            row = await (
                 await db_r.execute(
-                    "SELECT estado, cantidades_definitivas FROM subpedidos WHERE id_pedido = ?",
-                    (id_pedido,),
+                    "SELECT scraping_completo FROM pedidos WHERE id_pedido = ?", (id_pedido,)
                 )
-            ).fetchall()
-        else:
-            subs_db = []
+            ).fetchone()
+            es_nuevo = row is None
 
-    scraping_completo = row[0] if row is not None else 1
-    modo = determinar_modo(es_nuevo, subs_db, scraping_completo)
+            if not es_nuevo:
+                subs_db = await (
+                    await db_r.execute(
+                        "SELECT estado, cantidades_definitivas FROM subpedidos WHERE id_pedido = ?",
+                        (id_pedido,),
+                    )
+                ).fetchall()
+            else:
+                subs_db = []
+
+        scraping_completo = row[0] if row is not None else 1
+        modo = determinar_modo(es_nuevo, subs_db, scraping_completo)
+    except Exception as exc:
+        detalle = f"Determinación de modo falló: {exc}"
+        log_event(
+            "pedido_error",
+            level="ERROR",
+            worker_id=worker_id,
+            id_pedido=id_pedido,
+            msg=detalle,
+        )
+        await resultados_queue.put({"id_pedido": id_pedido, "_error": True, "detalle": detalle})
+        return False
 
     # DEC-029: domcontentloaded unificado en los tres modos (antes solo
     # con_cantidades/solo_estado lo usaban, N-2) — el modo completo ya no
@@ -456,6 +476,24 @@ async def scraper_worker(
                 db_path,
                 max_reintentos=max_reintentos,
             )
+        except Exception as exc:
+            # AUD-M9: red de seguridad final — procesar_pedido() ya cubre su
+            # propio contrato de salida (True/False + resultado en la cola),
+            # pero cualquier excepción que igual se escape (bug futuro, caso
+            # no previsto) no debe matar la task del worker: sin este except
+            # el worker dejaba de consumir la cola para siempre, sin log
+            # visible hasta el resumen final del run.
+            log_event(
+                "worker_excepcion_no_controlada",
+                level="ERROR",
+                worker_id=worker_id,
+                id_pedido=id_pedido,
+                msg=f"Excepción no controlada procesando el pedido — el worker sigue vivo: {exc}",
+            )
+            await resultados_queue.put(
+                {"id_pedido": id_pedido, "_error": True, "detalle": str(exc)}
+            )
+            exito = False
         finally:
             await page.close()
 

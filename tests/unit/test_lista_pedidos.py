@@ -10,6 +10,8 @@ re-exporta). Las esperas semánticas de N-2 solo son verificables E2E
 contra la SPA real.
 """
 
+import asyncio
+
 import pytest
 
 import scraper.extractores as sp
@@ -19,6 +21,7 @@ from scraper.scraper_principal import (
     SEL_LISTA_ID,
     _leer_ids_pagina,
     obtener_lista_pedidos_con_retry,
+    obtener_lista_pedidos_con_watchdog,
 )
 
 # ── Fake mínimo de Page para _leer_ids_pagina ──────────────────────────────────
@@ -152,3 +155,39 @@ async def test_retry_max_intentos_uno_no_reintenta(monkeypatch):
     with pytest.raises(ValueError):
         await obtener_lista_pedidos_con_retry(None, "a", "b", "u", "c", max_intentos=1)
     assert llamadas == {"lista": 1, "login": 0}
+
+
+# ── Watchdog global del listado (DEC-034) ──────────────────────────────────────
+
+
+@pytest.mark.unit
+async def test_watchdog_pasa_el_resultado_sin_alterarlo(monkeypatch):
+    async def retry_rapido(page, desde, hasta, usuario, clave, max_intentos=2):
+        return ["TEST-001", "TEST-002"]
+
+    monkeypatch.setattr(sp, "obtener_lista_pedidos_con_retry", retry_rapido)
+
+    ids = await obtener_lista_pedidos_con_watchdog(None, "a", "b", "u", "c")
+    assert ids == ["TEST-001", "TEST-002"]
+
+
+@pytest.mark.unit
+async def test_watchdog_corta_un_listado_colgado_y_loguea_error(monkeypatch):
+    """DEC-034: un listado que nunca vuelve (navegador congelado a nivel de
+    protocolo) no debe colgar la corrida — el watchdog debe cortarlo."""
+    eventos = []
+    monkeypatch.setattr(sp, "log_event", lambda evento, **kw: eventos.append((evento, kw)))
+    monkeypatch.setitem(sp.CONFIG, "LISTADO_TIMEOUT_S", 0.05)
+
+    async def retry_colgado(page, desde, hasta, usuario, clave, max_intentos=2):
+        await asyncio.sleep(10)
+        return ["nunca llega"]
+
+    monkeypatch.setattr(sp, "obtener_lista_pedidos_con_retry", retry_colgado)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await obtener_lista_pedidos_con_watchdog(None, "a", "b", "u", "c")
+
+    assert len(eventos) == 1
+    assert eventos[0][0] == "listado_watchdog_timeout"
+    assert eventos[0][1]["level"] == "ERROR"

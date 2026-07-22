@@ -664,6 +664,55 @@ async def obtener_lista_pedidos_con_retry(
     raise RuntimeError("unreachable")  # pragma: no cover
 
 
+async def obtener_lista_pedidos_con_watchdog(
+    page: Page,
+    fecha_desde: str,
+    fecha_hasta: str,
+    usuario: str,
+    clave: str,
+) -> list[str]:
+    """Envuelve obtener_lista_pedidos_con_retry() con un timeout global (DEC-034).
+
+    Ningún timeout local (click, wait_for_selector) protege contra un
+    navegador que se congela a nivel de protocolo DevTools — si el proceso
+    del navegador deja de responder, Playwright no tiene nada que reportar
+    y la corrida queda colgada en silencio indefinidamente. Observado 2
+    veces durante el backfill DEC-027 (rangos de ~20+ páginas, 8-17 min de
+    silencio total, proceso vivo pero sin progreso); causa raíz exacta no
+    confirmada a nivel de código, mitigado aquí con un límite de tiempo
+    duro (mismo patrón que FIX C-1 para la fase de workers).
+
+    Args:
+        page, fecha_desde, fecha_hasta, usuario, clave: pasados tal cual a
+            obtener_lista_pedidos_con_retry().
+
+    Returns:
+        Lista de IDs de pedido.
+
+    Raises:
+        asyncio.TimeoutError: si el listado no termina dentro de
+            CONFIG["LISTADO_TIMEOUT_S"] — la corrida termina en error en
+            vez de quedar colgada.
+    """
+    try:
+        return await asyncio.wait_for(
+            obtener_lista_pedidos_con_retry(page, fecha_desde, fecha_hasta, usuario, clave),
+            timeout=CONFIG["LISTADO_TIMEOUT_S"],
+        )
+    except asyncio.TimeoutError:
+        log_event(
+            "listado_watchdog_timeout",
+            level="ERROR",
+            msg=(
+                f"El listado de pedidos no terminó en "
+                f"{CONFIG['LISTADO_TIMEOUT_S']}s — posible cuelgue del "
+                "navegador a nivel de protocolo (DEC-034); la corrida "
+                "termina en error en vez de quedar colgada indefinidamente"
+            ),
+        )
+        raise
+
+
 # ─────────────────────────────────────────────
 # EXTRACCIÓN — DETALLE DE PEDIDO
 # ─────────────────────────────────────────────

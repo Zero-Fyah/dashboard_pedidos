@@ -83,6 +83,7 @@ from scraper.extractores import (
     login,
     obtener_lista_pedidos,
     obtener_lista_pedidos_con_retry,
+    obtener_lista_pedidos_con_watchdog,
 )
 from scraper.orquestador import (
     _USER_AGENTS,
@@ -147,6 +148,7 @@ __all__ = [
     "login",
     "obtener_lista_pedidos",
     "obtener_lista_pedidos_con_retry",
+    "obtener_lista_pedidos_con_watchdog",
     # persistencia
     "_actualizar_estado_subpedido",
     "_persistir_secciones_satelite",
