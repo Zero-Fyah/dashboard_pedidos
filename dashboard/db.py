@@ -17,8 +17,15 @@ DB_PATH = Path(__file__).parent.parent / "data" / "pedidos.db"
 # sorted() para SQL determinístico (frozenset no garantiza orden).
 _cerr = ",".join(f"'{e}'" for e in sorted(ESTADOS_CERRADOS))
 
+# AUD-M12: único TTL para todo el módulo — antes 7200s en las queries y
+# 300s en los checks de esquema, una inconsistencia sin motivo (el peor
+# caso de datos viejos llegaba a ~4h: caché + ciclo del scheduler). Con el
+# scheduler corriendo cada 1h (DEC-030), 600s deja los datos del
+# dashboard a lo sumo ~70 min desactualizados en el peor caso.
+_CACHE_TTL_S = 600
 
-@st.cache_data(ttl=300, show_spinner=False)
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def _num_cols_exist() -> bool:
     if not DB_PATH.exists():
         return False
@@ -35,7 +42,7 @@ def _num_cols_exist() -> bool:
         return False
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def _view_consolidado_exists() -> bool:
     if not DB_PATH.exists():
         return False
@@ -85,7 +92,20 @@ def _conn() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH, check_same_thread=False, timeout=5)
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_ultima_actualizacion() -> str | None:
+    """MAX(actualizado_en) de pedidos — AUD-M12: indicador de frescura de
+    datos para el header del dashboard, dado que no hay botón de refresco
+    manual y el caché puede mostrar datos de hasta ~70 min de antigüedad."""
+    con = _conn()
+    try:
+        row = con.execute("SELECT MAX(actualizado_en) FROM pedidos").fetchone()
+    finally:
+        con.close()
+    return row[0] if row else None
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def get_opciones_filtro() -> tuple[list[str], list[str], list[str], list[str]]:
     con = _conn()
     try:
@@ -116,7 +136,7 @@ def get_opciones_filtro() -> tuple[list[str], list[str], list[str], list[str]]:
     return ["Todos", "Abiertos", "Cerrados"], estados, almacenes, tipos
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def get_consolidado(
     estados_sub: tuple[str, ...],
     almacenes: tuple[str, ...],
@@ -171,7 +191,7 @@ def get_consolidado(
         con.close()
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def get_pedidos(
     estado_pedido: str,
     estados_sub: tuple[str, ...],
@@ -240,7 +260,7 @@ def get_pedidos(
     return df
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def get_pedidos_activos(
     estados_sub: tuple[str, ...],
     almacenes: tuple[str, ...],
@@ -362,7 +382,7 @@ def get_pedidos_activos(
     return df
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def get_detalle_operacional(
     id_pedido: str,
     estados_sub: tuple[str, ...],
@@ -447,7 +467,7 @@ def get_detalle_operacional(
     return df
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def get_detalle_pedido(
     id_pedido: str,
     estados_sub: tuple[str, ...],

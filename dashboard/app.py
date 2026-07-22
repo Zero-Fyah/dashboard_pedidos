@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime
 
 import streamlit as st
 from db import (
@@ -9,6 +10,7 @@ from db import (
     get_opciones_filtro,
     get_pedidos,
     get_pedidos_activos,
+    get_ultima_actualizacion,
 )
 
 st.set_page_config(
@@ -23,6 +25,7 @@ st.title("📦 Dashboard de Pedidos")
 # ── Filtros ────────────────────────────────────────────────────────────────────
 try:
     opciones_pedido, opciones_sub, opciones_almacen, opciones_tipo = get_opciones_filtro()
+    _ultima = get_ultima_actualizacion()
 except FileNotFoundError as e:
     st.error(str(e))
     st.stop()
@@ -35,6 +38,15 @@ except sqlite3.OperationalError as e:
         f"La base de datos está ocupada momentáneamente ({e}). Recarga la página en unos segundos."
     )
     st.stop()
+
+# AUD-M12: indicador de frescura — no hay botón de refresco manual y el
+# caché puede mostrar datos de hasta ~70 min de antigüedad (ver db.py).
+if _ultima:
+    try:
+        _ultima_fmt = datetime.fromisoformat(_ultima).strftime("%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        _ultima_fmt = _ultima
+    st.caption(f"📅 Datos al: {_ultima_fmt}")
 
 col1, col2, col3, col4 = st.columns(4)
 with col1:
