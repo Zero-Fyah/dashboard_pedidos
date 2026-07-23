@@ -45,7 +45,7 @@ async def _db_con_pedido_activo(tmp_path, fecha_pedido: str) -> str:
     return db_file
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 async def test_dias_abierto_cero_para_pedido_de_hoy_colombia(monkeypatch, tmp_path):
     ddb.st.cache_data.clear()
     hoy_co = (datetime.now(timezone.utc) - timedelta(hours=5)).date().isoformat()

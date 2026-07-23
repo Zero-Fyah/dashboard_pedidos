@@ -30,7 +30,7 @@ def _espiar_connect(monkeypatch):
     return llamadas
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_conn_pasa_timeout_5(monkeypatch, tmp_path):
     db_file = tmp_path / "existe.db"
     db_file.touch()
@@ -43,14 +43,14 @@ def test_conn_pasa_timeout_5(monkeypatch, tmp_path):
     assert llamadas.get("timeout") == 5
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_conn_sigue_lanzando_filenotfound_si_no_existe_la_db(monkeypatch, tmp_path):
     monkeypatch.setattr(ddb, "DB_PATH", tmp_path / "no_existe.db")
     with pytest.raises(FileNotFoundError):
         ddb._conn()
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_num_cols_exist_pasa_timeout_5(monkeypatch, tmp_path):
     ddb.st.cache_data.clear()
     db_file = tmp_path / "cols.db"
@@ -66,7 +66,7 @@ def test_num_cols_exist_pasa_timeout_5(monkeypatch, tmp_path):
     ddb.st.cache_data.clear()
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_view_consolidado_exists_pasa_timeout_5(monkeypatch, tmp_path):
     ddb.st.cache_data.clear()
     db_file = tmp_path / "view.db"
@@ -82,7 +82,7 @@ def test_view_consolidado_exists_pasa_timeout_5(monkeypatch, tmp_path):
 # ── AUD-M12: TTL único + indicador de frescura ──────────────────────────────
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_ttl_unico_y_razonable():
     """AUD-M12: un solo TTL para todo el módulo (antes 7200s en queries y
     300s en checks de esquema, inconsistente) y lo bastante corto para no
@@ -90,7 +90,7 @@ def test_ttl_unico_y_razonable():
     assert ddb._CACHE_TTL_S <= 1200
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_ultima_actualizacion_devuelve_max(monkeypatch, tmp_path):
     ddb.st.cache_data.clear()
     db_file = tmp_path / "fresco.db"
@@ -108,7 +108,7 @@ def test_ultima_actualizacion_devuelve_max(monkeypatch, tmp_path):
     ddb.st.cache_data.clear()
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_ultima_actualizacion_none_si_tabla_vacia(monkeypatch, tmp_path):
     ddb.st.cache_data.clear()
     db_file = tmp_path / "vacio.db"
