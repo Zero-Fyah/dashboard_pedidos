@@ -85,11 +85,11 @@ async def test_normalizacion_es_idempotente(db_path):
 
 @pytest.mark.integration
 async def test_views_creadas(db_path):
-    """Las 11 VIEWs existen tras normalizar y crear_views.
+    """Las 12 VIEWs existen tras normalizar y crear_views.
 
     normalizar_montos debe ejecutarse primero porque
-    v_diferencias_resumen referencia columnas _num de
-    gestion_diferencias.
+    v_diferencias_resumen y v_descuentos_lineas referencian columnas
+    _num de gestion_diferencias/lineas_pedido.
     """
     async with aiosqlite.connect(db_path) as db:
         await normalizar_montos(db)  # ← obligatorio primero
@@ -98,7 +98,7 @@ async def test_views_creadas(db_path):
         views = {r[0] for r in await cursor.fetchall()}
 
     views_esperadas = {
-        # 7 VIEWs analíticas
+        # 8 VIEWs analíticas
         "v_pedidos_activos",
         "v_pedidos_cerrados",
         "v_inventario_comprometido",
@@ -106,6 +106,7 @@ async def test_views_creadas(db_path):
         "v_rendimiento_operadores",
         "v_variaciones_timeline",
         "v_variaciones_operaciones",
+        "v_descuentos_lineas",
         # 4 VIEWs para el dashboard (montos _num con nombres limpios)
         "v_lineas_pedido_num",
         "v_estadisticas_monto_num",
@@ -117,10 +118,9 @@ async def test_views_creadas(db_path):
 
 @pytest.mark.integration
 async def test_views_son_idempotentes(db_path):
-    """Ejecutar crear_views dos veces produce exactamente 11 VIEWs.
+    """Ejecutar crear_views dos veces produce exactamente 12 VIEWs.
 
-    11 = 7 analíticas + 4 del dashboard. Actualizado 2026-07-02: el test
-    esperaba 7 desde antes de que se agregaran las views del dashboard.
+    12 = 8 analíticas + 4 del dashboard.
     """
     async with aiosqlite.connect(db_path) as db:
         await normalizar_montos(db)  # ← obligatorio primero
@@ -131,7 +131,7 @@ async def test_views_son_idempotentes(db_path):
                 await db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='view'")
             ).fetchone()
         )[0]
-    assert count == 11
+    assert count == 12
 
 
 # ── FIX C-4 (auditoría 2026-07-01) — COALESCE en cantidad_pendiente ────────────
@@ -412,7 +412,7 @@ async def test_lector_concurrente_no_ve_ventana_sin_views(db_path):
     """
     async with aiosqlite.connect(db_path) as db:
         await normalizar_montos(db)
-        await crear_views(db)  # estado inicial: las 11 views existen
+        await crear_views(db)  # estado inicial: las 12 views existen
 
     async with aiosqlite.connect(db_path) as db:
         await db.execute("PRAGMA busy_timeout=5000")
@@ -449,13 +449,13 @@ async def test_lector_concurrente_no_ve_ventana_sin_views(db_path):
             await asyncio.wait_for(tarea, timeout=30)
             db.execute = orig_execute  # type: ignore[method-assign]
 
-        # Tras el COMMIT, las 11 views recreadas quedan visibles.
+        # Tras el COMMIT, las 12 views recreadas quedan visibles.
         count = (
             await (
                 await db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='view'")
             ).fetchone()
         )[0]
-    assert count == 11
+    assert count == 12
 
 
 # ── E-3 + E-4 / DEC-020 — métricas veraces y fin del retrabajo ─────────────────
@@ -573,3 +573,57 @@ async def test_normalizar_montos_columna_duplicada_no_propaga(db_path):
         await db.execute("ALTER TABLE lineas_pedido ADD COLUMN precio_unitario_num REAL")
         await db.commit()
         await normalizar_montos(db)
+
+
+# ── VIEW de descuentos (deriva de DEC-024) ─────────────────────────────────────
+
+
+@pytest.mark.integration
+async def test_v_descuentos_lineas_solo_lineas_con_descuento_real(db_path):
+    """v_descuentos_lineas incluye solo líneas con descuento_tipo poblado
+    y expone el monto derivado (precio_unitario_num - precio_descuento_num).
+    """
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO pedidos "
+            "(id_pedido, fecha, servicio_cliente, nombre_empresa, nit, vendedor, "
+            "scraping_completo) VALUES "
+            "('TEST-DESC', '2026-07-01', 'Cliente Test', 'Empresa Test', "
+            "'900000000-1', 'Vendedor Test', 1)"
+        )
+        await db.execute(
+            "INSERT INTO subpedidos (id_pedido, numero_subpedido, tipo_subpedido, estado) "
+            "VALUES ('TEST-DESC', 'SUB-1', 'Normal', 'enviado')"
+        )
+        await db.execute(
+            "INSERT INTO lineas_pedido "
+            "(id_pedido, numero_subpedido, nombre_producto, cantidad_comprada, "
+            "precio_unitario, descuento, descuento_tipo, precio_descuento) VALUES "
+            "('TEST-DESC', 'SUB-1', 'Con descuento', 2.0, "
+            "'COP 10.000', '-', 'Promoción30%', 'COP 7.000'), "
+            "('TEST-DESC', 'SUB-1', 'Sin descuento', 3.0, "
+            "'COP 5.000', '-', '', 'COP 5.000')"
+        )
+        await db.commit()
+
+        await normalizar_montos(db)
+        await crear_views(db)
+
+        rows = await (
+            await db.execute(
+                "SELECT nombre_producto, descuento_tipo, precio_unitario, "
+                "precio_descuento, monto_descuento_unitario, monto_descuento_total, "
+                "servicio_cliente, nombre_empresa, nit, vendedor "
+                "FROM v_descuentos_lineas WHERE id_pedido = 'TEST-DESC'"
+            )
+        ).fetchall()
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row[0] == "Con descuento"
+    assert row[1] == "Promoción30%"
+    assert row[2] == 10000.0
+    assert row[3] == 7000.0
+    assert row[4] == 3000.0
+    assert row[5] == 6000.0  # 3000 * 2 unidades
+    assert row[6:] == ("Cliente Test", "Empresa Test", "900000000-1", "Vendedor Test")

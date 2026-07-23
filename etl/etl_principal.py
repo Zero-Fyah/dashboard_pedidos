@@ -308,10 +308,10 @@ async def crear_views(db: aiosqlite.Connection) -> None:
     DEC-019): con WAL, los lectores concurrentes ven el
     snapshot anterior hasta el COMMIT y nunca una view ausente.
 
-    VIEWs analíticas (7): v_pedidos_activos, v_pedidos_cerrados,
+    VIEWs analíticas (8): v_pedidos_activos, v_pedidos_cerrados,
     v_inventario_comprometido, v_diferencias_resumen,
     v_rendimiento_operadores, v_variaciones_timeline,
-    v_variaciones_operaciones.
+    v_variaciones_operaciones, v_descuentos_lineas.
 
     VIEWs para el dashboard (4): v_lineas_pedido_num,
     v_estadisticas_monto_num, v_gestion_diferencias_num,
@@ -466,6 +466,36 @@ async def crear_views(db: aiosqlite.Connection) -> None:
             AND accion != ''
             GROUP BY accion, tipo_usuario
             ORDER BY total_ocurrencias DESC
+        """,
+        # DEC-024 (nota "monto del descuento"): la ranura monetaria de
+        # lineas_pedido.descuento nunca contiene dinero — el descuento real
+        # se deriva de precio_unitario_num - precio_descuento_num. Solo
+        # filas donde descuento_tipo está poblado tuvieron un descuento
+        # real aplicado (correlación verificada en DEC-025).
+        "v_descuentos_lineas": """
+            SELECT
+                l.id_pedido,
+                p.fecha,
+                p.servicio_cliente,
+                p.nombre_empresa,
+                p.nit,
+                p.vendedor,
+                l.numero_subpedido,
+                l.nombre_producto,
+                l.descuento_tipo,
+                l.cantidad_comprada,
+                l.precio_unitario_num  AS precio_unitario,
+                l.precio_descuento_num AS precio_descuento,
+                (l.precio_unitario_num - l.precio_descuento_num)
+                    AS monto_descuento_unitario,
+                (l.precio_unitario_num - l.precio_descuento_num)
+                    * l.cantidad_comprada AS monto_descuento_total
+            FROM lineas_pedido l
+            JOIN pedidos p ON l.id_pedido = p.id_pedido
+            WHERE l.descuento_tipo IS NOT NULL
+            AND l.descuento_tipo != ''
+            AND l.precio_unitario_num IS NOT NULL
+            AND l.precio_descuento_num IS NOT NULL
         """,
         # ── VIEWs para el dashboard ────────────────────────────────────
         # Exponen los valores monetarios ya convertidos a REAL con
