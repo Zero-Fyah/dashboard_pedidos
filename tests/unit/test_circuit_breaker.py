@@ -7,6 +7,7 @@ cooldowns sin dormir de verdad.
 """
 
 import asyncio
+import time
 
 import pytest
 
@@ -123,7 +124,15 @@ async def test_circuito_cerrado_reanuda_tras_cooldown(monkeypatch, circuito_cort
 @pytest.mark.unit
 async def test_worker_duerme_ante_rate_limit_activo(monkeypatch, sleeps):
     """AUD-M2 + cobertura del loop: con señal de 429 activa, el worker
-    duerme ANTES de procesar el siguiente pedido."""
+    duerme ANTES de procesar el siguiente pedido.
+
+    Reloj congelado: registrar_rate_limit() y rate_limit_pendiente() (ambas
+    en scraper.config, mismo objeto módulo `time` que este import) llaman a
+    time.monotonic() sin inyectar `ahora` — igual que en producción. Sin
+    congelar el reloj, el tiempo real transcurrido entre ambas llamadas
+    hacía el resultado no determinístico (flaky bajo carga/CI).
+    """
+    monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
     procesados: list[str] = []
 
     async def _ok(worker_id, page, pid, rq, db, max_reintentos=None):
@@ -131,12 +140,11 @@ async def test_worker_duerme_ante_rate_limit_activo(monkeypatch, sleeps):
         return True
 
     monkeypatch.setattr(sw, "procesar_pedido", _ok)
-    registrar_rate_limit("30")  # señal activa: ~30s pendientes
+    registrar_rate_limit("30")  # señal activa: 30s pendientes exactos
 
     await _correr_worker(["P1"])
 
-    assert len(sleeps) == 1
-    assert 29 <= sleeps[0] <= 30
+    assert sleeps == [30.0]
     assert procesados == ["P1"]  # procesó después de la pausa
 
 
