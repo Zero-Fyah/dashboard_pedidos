@@ -12,6 +12,7 @@ instalación editable de DEC-018):
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -299,6 +300,81 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
                     )
 
 
+# Pendiente "fragmentación de concepto" (detectado 2026-07-18): la SPA
+# etiqueta el mismo concepto de IVA con la tasa aplicada al subpedido, ej.
+# "IVA alimentos (5%)" / "(0%)" / "(%)" — agrupar por concepto crudo parte
+# el mismo concepto en 3 buckets y ensucia los KPIs. "(%)" (tasa no
+# determinada) siempre trae monto COP 0 — verificado contra la DB real.
+_PATRON_CONCEPTO_TASA = re.compile(r"^(.+) \((\d+)?%\)$")
+
+
+def _parse_concepto(concepto: str) -> tuple[str, float | None]:
+    """Separa el concepto canónico de la tasa de IVA embebida en el texto.
+
+    Args:
+        concepto: Texto original de estadisticas_monto.concepto.
+
+    Returns:
+        Tupla (concepto_base, tasa_iva). tasa_iva es None si el concepto
+        no trae tasa embebida (no es un concepto de IVA) o si la tasa no
+        está determinada (variante "(%)").
+    """
+    match = _PATRON_CONCEPTO_TASA.match(concepto)
+    if not match:
+        return concepto, None
+    base, tasa = match.groups()
+    return base, float(tasa) if tasa is not None else None
+
+
+async def separar_concepto_tasa(db: aiosqlite.Connection) -> None:
+    """Agrega concepto_base y tasa_iva a estadisticas_monto (idempotente).
+
+    Mismo patrón que normalizar_montos: ALTER TABLE tolerante a columna
+    duplicada + poblado en batches de 500 filas, solo sobre las filas
+    donde concepto_base aún es NULL, para reprocesar exclusivamente lo
+    nuevo que deja el scraper en cada corrida.
+
+    Args:
+        db: Conexión abierta a pedidos.db.
+    """
+    for columna, tipo_sql in (("concepto_base", "TEXT"), ("tasa_iva", "REAL")):
+        try:
+            await db.execute(f"ALTER TABLE estadisticas_monto ADD COLUMN {columna} {tipo_sql}")
+            await db.commit()
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
+
+    last_id = 0
+    total = 0
+    while True:
+        async with db.execute(
+            "SELECT id, concepto FROM estadisticas_monto "
+            "WHERE id > ? AND concepto_base IS NULL AND concepto IS NOT NULL "
+            "ORDER BY id LIMIT 500",
+            (last_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        if not rows:
+            break
+        for row_id, concepto in rows:
+            base, tasa = _parse_concepto(concepto)
+            await db.execute(
+                "UPDATE estadisticas_monto SET concepto_base = ?, tasa_iva = ? WHERE id = ?",
+                (base, tasa, row_id),
+            )
+            total += 1
+        last_id = rows[-1][0]
+        await db.commit()
+
+    if total:
+        _log_event(
+            "etl_concepto_separado",
+            msg=f"{total} filas con concepto_base/tasa_iva pobladas",
+            total=total,
+        )
+
+
 async def crear_views(db: aiosqlite.Connection) -> None:
     """Crea o reemplaza las VIEWs analíticas y de montos limpios.
 
@@ -534,6 +610,8 @@ async def crear_views(db: aiosqlite.Connection) -> None:
                 e.orden,
                 e.concepto,
                 e.concepto_tag,
+                e.concepto_base,
+                e.tasa_iva,
                 e.monto_pagar_num   AS monto_pagar,
                 e.monto_final_num   AS monto_final,
                 e.diferencia_num    AS diferencia
@@ -647,6 +725,7 @@ async def main() -> int:
             await db.execute("PRAGMA busy_timeout=5000")
             await db.execute("PRAGMA foreign_keys=ON")
             await normalizar_montos(db)
+            await separar_concepto_tasa(db)
             await crear_views(db)
             async with db.execute("SELECT COUNT(*) FROM v_rendimiento_operadores") as cur:
                 row = await cur.fetchone()

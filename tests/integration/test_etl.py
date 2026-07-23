@@ -8,6 +8,7 @@ import pytest
 from etl.etl_principal import (
     crear_views,
     normalizar_montos,
+    separar_concepto_tasa,
     verificar_pedidos_sin_subpedidos,
 )
 
@@ -607,6 +608,7 @@ async def test_v_descuentos_lineas_solo_lineas_con_descuento_real(db_path):
         await db.commit()
 
         await normalizar_montos(db)
+        await separar_concepto_tasa(db)
         await crear_views(db)
 
         rows = await (
@@ -627,3 +629,65 @@ async def test_v_descuentos_lineas_solo_lineas_con_descuento_real(db_path):
     assert row[4] == 3000.0
     assert row[5] == 6000.0  # 3000 * 2 unidades
     assert row[6:] == ("Cliente Test", "Empresa Test", "900000000-1", "Vendedor Test")
+
+
+# ── Fragmentación de concepto en estadisticas_monto ────────────────────────────
+
+
+@pytest.mark.integration
+async def test_separar_concepto_tasa_iva_con_porcentaje(db_path):
+    """'IVA alimentos (5%)' se separa en concepto_base='IVA alimentos'
+    y tasa_iva=5.0 — el mismo concepto ya no fragmenta en 3 buckets."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO pedidos (id_pedido, fecha, scraping_completo) "
+            "VALUES ('TEST-CONC', '2026-07-01', 1)"
+        )
+        await db.execute(
+            "INSERT INTO estadisticas_monto (id_pedido, concepto) VALUES "
+            "('TEST-CONC', 'IVA alimentos (5%)'), "
+            "('TEST-CONC', 'IVA alimentos (0%)'), "
+            "('TEST-CONC', 'IVA alimentos (%)'), "
+            "('TEST-CONC', 'Flete')"
+        )
+        await db.commit()
+
+        await separar_concepto_tasa(db)
+
+        rows = await (
+            await db.execute(
+                "SELECT concepto, concepto_base, tasa_iva FROM estadisticas_monto "
+                "WHERE id_pedido = 'TEST-CONC' ORDER BY id"
+            )
+        ).fetchall()
+
+    assert rows[0] == ("IVA alimentos (5%)", "IVA alimentos", 5.0)
+    assert rows[1] == ("IVA alimentos (0%)", "IVA alimentos", 0.0)
+    assert rows[2] == ("IVA alimentos (%)", "IVA alimentos", None)
+    assert rows[3] == ("Flete", "Flete", None)
+
+
+@pytest.mark.integration
+async def test_separar_concepto_tasa_es_idempotente(db_path):
+    """Ejecutar separar_concepto_tasa dos veces no genera errores ni
+    re-escribe filas ya pobladas."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO pedidos (id_pedido, fecha, scraping_completo) "
+            "VALUES ('TEST-CONC2', '2026-07-01', 1)"
+        )
+        await db.execute(
+            "INSERT INTO estadisticas_monto (id_pedido, concepto) VALUES "
+            "('TEST-CONC2', 'IVA accesorios (19%)')"
+        )
+        await db.commit()
+        await separar_concepto_tasa(db)
+        await separar_concepto_tasa(db)
+
+        row = await (
+            await db.execute(
+                "SELECT concepto_base, tasa_iva FROM estadisticas_monto "
+                "WHERE id_pedido = 'TEST-CONC2'"
+            )
+        ).fetchone()
+    assert row == ("IVA accesorios", 19.0)
