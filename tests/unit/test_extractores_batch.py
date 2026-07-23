@@ -20,6 +20,7 @@ from scraper.extractores import (
     extraer_registro_operaciones,
     extraer_subpedidos,
     extraer_timeline,
+    extraer_total_subpedidos,
 )
 
 
@@ -384,6 +385,60 @@ async def test_subpedidos_cantidad_no_numerica_emite_warning(monkeypatch):
 @pytest.mark.unit
 async def test_subpedidos_sin_subpedidos():
     assert await extraer_subpedidos(_FakePageSubpedidos([])) == []
+
+
+# ── extraer_total_subpedidos ────────────────────────────────────────────────
+# Seguimiento DEC-021: contador del origen para que FIX C-2 discrimine
+# "0 subpedidos legítimo" de "no renderizó".
+
+
+class _FakeElementoTexto:
+    def __init__(self, texto: str):
+        self._texto = texto
+
+    async def inner_text(self) -> str:
+        return self._texto
+
+
+class _FakePageContador:
+    def __init__(self, texto: str | None, lanza: bool = False):
+        self._texto = texto
+        self._lanza = lanza
+
+    async def query_selector(self, sel: str):
+        assert sel == "span.section-count"
+        if self._lanza:
+            raise RuntimeError("boom")
+        if self._texto is None:
+            return None
+        return _FakeElementoTexto(self._texto)
+
+
+@pytest.mark.unit
+async def test_total_subpedidos_lee_contador_positivo():
+    assert await extraer_total_subpedidos(_FakePageContador("Total 3 subpedidos")) == 3
+
+
+@pytest.mark.unit
+async def test_total_subpedidos_lee_contador_cero():
+    assert await extraer_total_subpedidos(_FakePageContador("Total 0 subpedidos")) == 0
+
+
+@pytest.mark.unit
+async def test_total_subpedidos_selector_ausente_retorna_none():
+    assert await extraer_total_subpedidos(_FakePageContador(None)) is None
+
+
+@pytest.mark.unit
+async def test_total_subpedidos_texto_no_parseable_retorna_none():
+    assert await extraer_total_subpedidos(_FakePageContador("Subpedidos")) is None
+
+
+@pytest.mark.unit
+async def test_total_subpedidos_excepcion_retorna_none():
+    assert (
+        await extraer_total_subpedidos(_FakePageContador("Total 1 subpedidos", lanza=True)) is None
+    )
 
 
 # ── extraer_detalle_diferencias ─────────────────────────────────────────────

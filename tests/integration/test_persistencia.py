@@ -460,6 +460,56 @@ async def test_completo_recupera_pedido_tras_extraccion_vacia(db_path, pedido_si
     assert count == 1
 
 
+# ── Seguimiento DEC-021 — total_subpedidos_origen discrimina el vacío ──────────
+
+
+@pytest.mark.integration
+async def test_vacio_con_contador_cero_marca_completo_sin_warning(db_path, monkeypatch):
+    """total_subpedidos_origen=0 confirma que el vacío es legítimo: se marca
+    scraping_completo=1 y se emite el evento INFO, no el WARNING de siempre."""
+    import scraper.persistencia as persistencia_mod
+
+    eventos = []
+    monkeypatch.setattr(
+        persistencia_mod, "log_event", lambda evento, **kw: eventos.append((evento, kw))
+    )
+
+    vacio = copy.deepcopy(_PEDIDO_BASE)
+    vacio["subpedidos"] = []
+    vacio["total_subpedidos_origen"] = 0
+
+    await persistir_uno(vacio, db_path)
+
+    assert await _leer_scraping_completo(db_path) == 1
+    assert any(e[0] == "subpedidos_vacio_legitimo" for e in eventos)
+    assert not any(e[0] == "subpedidos_vacio" for e in eventos)
+
+
+@pytest.mark.integration
+async def test_vacio_sin_contador_mantiene_guard_conservador(db_path):
+    """Sin total_subpedidos_origen (contador ausente/no parseable), el
+    comportamiento previo de FIX C-2 se mantiene intacto: no se marca
+    scraping_completo."""
+    vacio = copy.deepcopy(_PEDIDO_BASE)
+    vacio["subpedidos"] = []
+    assert "total_subpedidos_origen" not in vacio  # el fixture no lo trae
+
+    await persistir_uno(vacio, db_path)
+    assert await _leer_scraping_completo(db_path) == 0
+
+
+@pytest.mark.integration
+async def test_vacio_con_contador_mayor_a_cero_mantiene_guard_conservador(db_path):
+    """total_subpedidos_origen > 0 con subpedidos=[] es 'no renderizó': el
+    guard conservador de FIX C-2 sigue aplicando pese al contador."""
+    vacio = copy.deepcopy(_PEDIDO_BASE)
+    vacio["subpedidos"] = []
+    vacio["total_subpedidos_origen"] = 2
+
+    await persistir_uno(vacio, db_path)
+    assert await _leer_scraping_completo(db_path) == 0
+
+
 # ── FIX C-3 (auditoría 2026-07-01) — hay_diferencia tri-estado ─────────────────
 
 

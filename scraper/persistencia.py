@@ -425,12 +425,23 @@ async def persistencia_worker(
                                 lineas_rows,
                             )
                     else:
-                        log_event(
-                            "subpedidos_vacio",
-                            level="WARNING",
-                            msg="extracción de subpedidos retornó vacío — datos existentes preservados",
-                            id_pedido=id_pedido,
-                        )
+                        # Seguimiento DEC-021: el contador del origen
+                        # discrimina "0 subpedidos legítimo" (no es un fallo,
+                        # no hay WARNING) de "no renderizó" (guard
+                        # conservador de FIX C-2, WARNING como antes).
+                        if resultado.get("total_subpedidos_origen") == 0:
+                            log_event(
+                                "subpedidos_vacio_legitimo",
+                                msg="origen declara Total 0 subpedidos — vacío confirmado, no es fallo de renderizado",
+                                id_pedido=id_pedido,
+                            )
+                        else:
+                            log_event(
+                                "subpedidos_vacio",
+                                level="WARNING",
+                                msg="extracción de subpedidos retornó vacío — datos existentes preservados",
+                                id_pedido=id_pedido,
+                            )
 
                     timeline = resultado.get("timeline", [])
                     if timeline:
@@ -458,8 +469,10 @@ async def persistencia_worker(
                     # sin subpedidos extraídos. Si subped vino vacío, se conserva
                     # el valor actual (0 en pedidos nuevos) para que
                     # determinar_modo() re-extraiga en modo completo en la
-                    # próxima corrida.
-                    if subped:
+                    # próxima corrida — salvo que el contador del origen
+                    # (seguimiento DEC-021) confirme que el vacío es legítimo.
+                    vacio_legitimo = not subped and resultado.get("total_subpedidos_origen") == 0
+                    if subped or vacio_legitimo:
                         await db.execute(
                             "UPDATE pedidos SET scraping_completo = 1, actualizado_en = ? WHERE id_pedido = ?",
                             (datetime.now(timezone.utc).isoformat(), id_pedido),

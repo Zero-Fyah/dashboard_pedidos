@@ -40,6 +40,7 @@ from scraper.extractores import (
     extraer_registro_operaciones,
     extraer_subpedidos,
     extraer_timeline,
+    extraer_total_subpedidos,
     guardar_debug,
     login,
 )
@@ -216,6 +217,9 @@ async def procesar_pedido(
 
                 info_general = await extraer_info_general(page)
                 subpedidos = await extraer_subpedidos(page)
+                # Seguimiento DEC-021: contador del origen para que FIX C-2
+                # discrimine "0 subpedidos legítimo" de "no renderizó".
+                total_subpedidos_origen = await extraer_total_subpedidos(page)
                 timeline = await extraer_timeline(page, id_pedido)
                 info_entrega = await extraer_info_entrega(page, id_pedido)
                 estadisticas, hay_dif = await extraer_estadisticas_monto(page, id_pedido)
@@ -227,6 +231,7 @@ async def procesar_pedido(
                     "id_pedido": id_pedido,
                     "info_general": info_general,
                     "subpedidos": subpedidos,
+                    "total_subpedidos_origen": total_subpedidos_origen,
                     "timeline": timeline,
                     "info_entrega": info_entrega,
                     "estadisticas": estadisticas,

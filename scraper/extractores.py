@@ -1344,6 +1344,40 @@ _JS_SUBPEDIDOS = """
 """
 
 
+_PATRON_TOTAL_SUBPEDIDOS = re.compile(r"Total\s+(\d+)\s+subpedidos", re.IGNORECASE)
+
+
+async def extraer_total_subpedidos(page: Page) -> int | None:
+    """Lee el contador de subpedidos que declara el origen (seguimiento DEC-021).
+
+    El DOM expone `<span class="section-count">Total N subpedidos</span>`
+    independientemente de si la tabla de subpedidos renderizó. Permite
+    discriminar con certeza "0 subpedidos legítimo" (contador en 0) de
+    "no renderizó" (contador ausente o no parseable) — antes FIX C-2 no
+    podía distinguir los dos casos y optaba por el guard conservador
+    ante cualquier duda.
+
+    Nunca lanza excepción: ante cualquier problema retorna None y el
+    llamador conserva el comportamiento conservador previo.
+
+    Args:
+        page: Página Playwright con el detalle del pedido cargado.
+
+    Returns:
+        El total de subpedidos declarado por el origen, o None si el
+        contador no está presente o no se pudo interpretar.
+    """
+    try:
+        elemento = await page.query_selector("span.section-count")
+        if elemento is None:
+            return None
+        texto = await elemento.inner_text()
+        match = _PATRON_TOTAL_SUBPEDIDOS.search(texto)
+        return int(match.group(1)) if match else None
+    except Exception:
+        return None
+
+
 async def extraer_subpedidos(page: Page) -> list[dict]:
     """Expande todos los subpedidos y extrae sus datos y líneas de productos.
 
