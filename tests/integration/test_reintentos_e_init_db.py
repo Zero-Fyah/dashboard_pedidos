@@ -115,6 +115,55 @@ async def test_init_db_es_reejecutable(db_path):
     await init_db(db_path)  # el fixture ya corrió la primera
 
 
+# ── BUG-004: timeline es a nivel de pedido, numero_subpedido eliminada ──────
+
+
+@pytest.mark.integration
+async def test_timeline_pedido_sin_numero_subpedido(db_path):
+    """El schema ya no crea numero_subpedido en timeline_pedido (BUG-004,
+    confirmado con el Arquitecto: el timeline es del pedido padre)."""
+    async with aiosqlite.connect(db_path) as db:
+        cols = {
+            row[1]
+            for row in await (await db.execute("PRAGMA table_info(timeline_pedido)")).fetchall()
+        }
+    assert "numero_subpedido" not in cols
+    assert {"id", "id_pedido", "paso", "titulo", "fecha_hora", "completado"} <= cols
+
+
+@pytest.mark.integration
+async def test_migracion_drop_numero_subpedido_es_idempotente(tmp_path):
+    """DB legada con numero_subpedido (columna real, no simulada): init_db()
+    la elimina la primera vez y la segunda corrida no explota (DROP sobre
+    una columna que ya no existe se tolera igual que el ADD duplicado)."""
+    db_legado = str(tmp_path / "legado.db")
+    async with aiosqlite.connect(db_legado) as db:
+        await db.execute(
+            """
+            CREATE TABLE timeline_pedido (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_pedido TEXT,
+                numero_subpedido TEXT,
+                paso INTEGER,
+                titulo TEXT,
+                fecha_hora TEXT,
+                completado INTEGER DEFAULT 0
+            )
+            """
+        )
+        await db.commit()
+
+    await init_db(db_legado)  # primera corrida: DROP real
+    await init_db(db_legado)  # segunda corrida: columna ya no existe
+
+    async with aiosqlite.connect(db_legado) as db:
+        cols = {
+            row[1]
+            for row in await (await db.execute("PRAGMA table_info(timeline_pedido)")).fetchall()
+        }
+    assert "numero_subpedido" not in cols
+
+
 # ── AUD-B9: dedupe + índice UNIQUE en gestion_diferencias ───────────────────
 
 

@@ -99,7 +99,6 @@ async def init_db(db_path: str) -> None:
             CREATE TABLE IF NOT EXISTS timeline_pedido (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 id_pedido        TEXT,
-                numero_subpedido TEXT,
                 paso             INTEGER,
                 titulo           TEXT,
                 fecha_hora       TEXT,
@@ -218,6 +217,19 @@ async def init_db(db_path: str) -> None:
                 # debe propagarse, no enmascararse.
                 if "duplicate column name" not in str(exc).lower():
                     raise
+
+        # BUG-004 (confirmado con el Arquitecto 2026-07-22): el timeline es
+        # a nivel de pedido padre, no de subpedido — numero_subpedido nunca
+        # se pobló (extraer_timeline()/persistencia.py jamás la escriben) y
+        # el schema ya no la crea para DBs nuevas. DROP COLUMN (SQLite ≥
+        # 3.35) para las DBs existentes; catch específico de "no such
+        # column" para idempotencia (DB ya migrada, o nueva sin la columna).
+        try:
+            await db.execute("ALTER TABLE timeline_pedido DROP COLUMN numero_subpedido")
+            await db.commit()
+        except sqlite3.OperationalError as exc:
+            if "no such column" not in str(exc).lower():
+                raise
 
         for ddl_idx in (
             "CREATE INDEX IF NOT EXISTS idx_subpedidos_pedido   ON subpedidos(id_pedido)",
