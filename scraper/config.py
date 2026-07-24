@@ -58,8 +58,14 @@ class ConfigDict(TypedDict):
     url_post_login: str
     url_pedidos: str
     url_detalle: str
+    url_inventario: str
     usuario: str
     clave: str
+    bochica_url: str
+    bochica_usuario: str
+    bochica_clave: str
+    bochica_app_usuario: str
+    bochica_app_clave: str
     NAV_TIMEOUT_MS: int
     ELEM_TIMEOUT_MS: int
     PAUSA_ENTRE_PEDIDOS_S: float
@@ -90,9 +96,21 @@ CONFIG: ConfigDict = {
     "url_post_login": os.environ.get("SCRAPER_URL_POST_LOGIN", ""),
     "url_pedidos": os.environ.get("SCRAPER_URL_PEDIDOS", ""),
     "url_detalle": os.environ.get("SCRAPER_URL_DETALLE", ""),
+    # DEC-039: pantalla de gestión de inventario del sistema administrativo
+    # — flujo de descarga distinto al scraping de pedidos, misma sesión.
+    "url_inventario": os.environ.get("SCRAPER_URL_INVENTARIO", ""),
     # Credenciales (configuradas via variables de entorno)
     "usuario": os.environ.get("SCRAPER_USUARIO", ""),
     "clave": os.environ.get("SCRAPER_PASSWORD", ""),
+    # DEC-039: sistema de bodega BOCHICA — login de Google Workspace
+    # separado del admin, credenciales propias.
+    "bochica_url": os.environ.get("BOCHICA_URL", ""),
+    "bochica_usuario": os.environ.get("BOCHICA_USUARIO", ""),
+    "bochica_clave": os.environ.get("BOCHICA_PASSWORD", ""),
+    # DEC-039: segunda capa de login dentro de la propia app de Bochica
+    # ("usuario miempresa") — distinta del login de Google de arriba.
+    "bochica_app_usuario": os.environ.get("BOCHICA_APP_USUARIO", ""),
+    "bochica_app_clave": os.environ.get("BOCHICA_APP_PASSWORD", ""),
     # Timeouts (ms)
     "NAV_TIMEOUT_MS": 45_000,
     "ELEM_TIMEOUT_MS": 20_000,

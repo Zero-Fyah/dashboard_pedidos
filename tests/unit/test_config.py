@@ -68,6 +68,25 @@ def test_headless_y_slow_mo_en_config():
     assert isinstance(CONFIG["SLOW_MO"], int)
 
 
+# ── DEC-039: claves de inventario (admin) y Bochica en CONFIG ──────────────
+
+
+@pytest.mark.unit
+def test_claves_inventario_y_bochica_existen_en_config():
+    """Las claves nuevas de DEC-039 existen y son strings (posiblemente
+    vacíos si .env no las define — validar el contenido es responsabilidad
+    de cada módulo, no de este test)."""
+    for clave in (
+        "url_inventario",
+        "bochica_url",
+        "bochica_usuario",
+        "bochica_clave",
+        "bochica_app_usuario",
+        "bochica_app_clave",
+    ):
+        assert isinstance(CONFIG[clave], str)
+
+
 # ── AUD-B8a: credenciales sin releer env ────────────────────────────────────
 
 

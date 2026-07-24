@@ -16,7 +16,7 @@ requires-python = ">=3.12"
 
 [tool.setuptools]
 # Lista explícita: excluye tests/ y scraper/archive/ (sin __init__.py, solo referencia)
-packages = ["comun", "dashboard", "etl", "scraper", "scraper.migrations"]
+packages = ["comun", "dashboard", "etl", "inventario", "scraper", "scraper.migrations"]
 
 [tool.ruff]
 target-version = "py312"
@@ -34,7 +34,7 @@ extend-exclude = [
 select = ["E4", "E7", "E9", "F", "I", "B"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["comun", "scraper", "etl", "dashboard"]
+known-first-party = ["comun", "scraper", "etl", "dashboard", "inventario"]
 
 [tool.mypy]
 python_version = "3.12"

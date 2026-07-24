@@ -26,6 +26,16 @@ forfiles /p logs /m "*.log" /d -30 /c "cmd /c del @path" >nul 2>nul
 
 REM Ejecutar el scraper en modo incremental desde la raíz
 %PYEXE% scraper/scraper_principal.py --modo incremental >> %LOGFILE% 2>&1
+
+REM DEC-039: descarga del inventario de los dos sistemas fuente, pegada
+REM al final del scraper de pedidos — minimiza la ventana de desfase
+REM entre el estado de subpedidos recién actualizado y la foto de
+REM inventario (ver docs/decisions.md). Cada línea corre aunque la
+REM anterior falle: una descarga de inventario caída no debe bloquear
+REM ni el scraping de pedidos ni el ETL.
+%PYEXE% -m scraper.inventario >> %LOGFILE% 2>&1
+%PYEXE% -m scraper.bochica >> %LOGFILE% 2>&1
+
 REM Ejecutar el ETL después del scraper — como módulo (E-7, DEC-018:
 REM el paquete editable resuelve los imports, sin hack de sys.path)
 %PYEXE% -m etl.etl_principal >> %LOGFILE% 2>&1

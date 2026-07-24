@@ -6,6 +6,12 @@ python-dotenv==1.2.2
 streamlit>=1.35.0
 plotly>=5.0.0
 
+# DEC-039 — parser de los Excel de inventario (admin + Bochica).
+# openpyxl no es dependencia transitiva de streamlit/plotly — hay que
+# declararla explícita para leer .xlsx con pandas.
+pandas>=2.2
+openpyxl>=3.1
+
 # Testing
 pytest>=8.0
 pytest-asyncio>=0.24

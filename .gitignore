@@ -4,6 +4,11 @@ data/pedidos.db
 # Artefactos de scraping
 data/errors/
 data/debug/
+data/inventario/
+
+# Excel de inventario descargados manualmente (DEC-039) — catálogo y
+# precios son datos de negocio, no deben llegar al repo público
+*.xlsx
 
 # Logs
 logs/
@@ -49,6 +54,9 @@ test-results/
 Desktop.ini
 Thumbs.db
 *.lnk
+
+# LibreOffice — lock files de documentos abiertos
+.~lock.*#
 
 # Configuración local de Claude Code — por máquina, no compartible (DEC-017)
 .claude/settings.local.json
