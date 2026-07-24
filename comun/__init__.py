@@ -68,6 +68,13 @@ ESTADOS_ACTIVOS_INVENTARIO: tuple[str, ...] = (
     "pendiente de envío (contra entrega)",
     "pendiente de entrega",
     "en inspección",
+    # DEC-039 (2026-07-24): confirmado por el Arquitecto — estado
+    # transitorio real, controlado por el área de inventarios. El
+    # subpedido queda comprometido y físicamente ya tocado por
+    # alistamiento mientras se resuelve: si la mercancía aparece, vuelve
+    # a alistamiento (re-pick); si no aparece, se aprueba el faltante y
+    # avanza a inspección. Antes sin clasificar (CLAUDE.md pendiente).
+    "auditoría de faltantes",
 )
 
 # Dominio completo de estados conocidos — para checks defensivos (AUD-M8).
