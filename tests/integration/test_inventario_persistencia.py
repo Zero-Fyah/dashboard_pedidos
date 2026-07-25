@@ -1,0 +1,374 @@
+"""Tests de inventario/persistencia.py — el contrato con el dashboard (DEC-043).
+
+Van en integration/ porque ejercitan SQLite real: es justamente lo que se
+quiere verificar (esquema, transacción, reemplazo del snapshot y tipos
+que sqlite3 acepta), no algo que un mock pueda sustituir.
+
+Incluye la cobertura de `calcular_vendido_no_alistado()`, la única pieza
+de la fórmula que toca la DB y que la auditoría previa a la vista
+encontró sin tests.
+"""
+
+import datetime as dt
+import sqlite3
+
+import pandas as pd
+import pytest
+
+from inventario.comparacion import calcular_vendido_no_alistado
+from inventario.persistencia import (
+    UMBRAL_DESACTUALIZADO_H,
+    init_schema,
+    medir_frescura,
+    persistir,
+)
+
+pytestmark = pytest.mark.integration
+
+
+def _comparacion(filas=None):
+    return pd.DataFrame(
+        filas
+        or [
+            ("PA01", "PA", False, 150.0, 10.0, 160.0, 30.0, 60.0, 11.0, 130.0, -70.0),
+            ("PJ91", "PJ", False, 200.0, 25.0, 225.0, 90.0, 300.0, 0.0, 135.0, 165.0),
+        ],
+        columns=[
+            "referencia",
+            "familia",
+            "es_averia",
+            "disponible_venta",
+            "vendido_no_alistado",
+            "inventario_teorico",
+            "bochica_altura",
+            "bochica_picking",
+            "bochica_paso",
+            "picking_estimado",
+            "diferencia",
+        ],
+    )
+
+
+def _anomalias(filas=None):
+    return pd.DataFrame(
+        filas or [("paso_montacarga", "B_25_2", "1001", 7700.0)],
+        columns=["motivo", "ubicacion", "id_especificacion", "cantidad"],
+    )
+
+
+_FRESCURA_OK = {
+    "admin_actualizado_en": "2026-07-25T22:43:12+00:00",
+    "bochica_actualizado_en": "2026-07-25T22:44:41+00:00",
+    "layout_actualizado_en": "2026-07-25T21:29:00+00:00",
+    "fuente_mas_vieja_h": 0.8,
+    "datos_desactualizados": 0,
+}
+
+
+@pytest.fixture
+def db(tmp_path):
+    return str(tmp_path / "pedidos.db")
+
+
+# ─────────────────────────────────────────────
+# Esquema y VIEWs — el contrato que lee el dashboard
+# ─────────────────────────────────────────────
+
+
+def test_init_schema_crea_tablas_y_views(db):
+    con = sqlite3.connect(db)
+    init_schema(con)
+    nombres = {r[0] for r in con.execute("SELECT name FROM sqlite_master")}
+    assert {"inventario_comparacion", "inventario_anomalias", "inventario_corridas"} <= nombres
+    assert {
+        "v_inventario_comparacion",
+        "v_inventario_anomalias",
+        "v_inventario_corridas",
+    } <= nombres
+    con.close()
+
+
+def test_init_schema_es_idempotente(db):
+    """Corre en cada corrida del scheduler: no puede fallar la segunda vez."""
+    con = sqlite3.connect(db)
+    init_schema(con)
+    init_schema(con)
+    con.close()
+
+
+def test_las_views_exponen_lo_que_consume_el_dashboard(db):
+    persistir(_comparacion(), _anomalias(), _FRESCURA_OK, db_path=db)
+    con = sqlite3.connect(db)
+    df = pd.read_sql("SELECT * FROM v_inventario_comparacion", con)
+    assert set(df.columns) == {
+        "referencia",
+        "familia",
+        "es_averia",
+        "disponible_venta",
+        "vendido_no_alistado",
+        "inventario_teorico",
+        "bochica_altura",
+        "bochica_picking",
+        "bochica_paso",
+        "picking_estimado",
+        "diferencia",
+    }
+    assert len(df) == 2
+    con.close()
+
+
+# ─────────────────────────────────────────────
+# Snapshot: la corrida nueva reemplaza a la anterior
+# ─────────────────────────────────────────────
+
+
+def test_persistir_reemplaza_el_snapshot_anterior(db):
+    """DEC-043: comparacion/anomalias guardan solo la última corrida."""
+    persistir(_comparacion(), _anomalias(), _FRESCURA_OK, db_path=db)
+    nueva = _comparacion([("PC10", "PC", False, 5.0, 0.0, 5.0, 1.0, 2.0, 0.0, 4.0, -2.0)])
+    persistir(nueva, _anomalias(), _FRESCURA_OK, db_path=db)
+
+    con = sqlite3.connect(db)
+    refs = [r[0] for r in con.execute("SELECT referencia FROM inventario_comparacion")]
+    assert refs == ["PC10"], "el snapshot viejo debió borrarse"
+    con.close()
+
+
+def test_corridas_acumula_historial(db):
+    """inventario_corridas es la única que crece: es la columna vertebral temporal."""
+    id1 = persistir(_comparacion(), _anomalias(), _FRESCURA_OK, db_path=db)
+    id2 = persistir(_comparacion(), _anomalias(), _FRESCURA_OK, db_path=db)
+    assert id2 > id1
+    con = sqlite3.connect(db)
+    assert con.execute("SELECT COUNT(*) FROM inventario_corridas").fetchone()[0] == 2
+    con.close()
+
+
+def test_agregados_de_la_corrida_son_correctos(db):
+    corrida_id = persistir(_comparacion(), _anomalias(), _FRESCURA_OK, db_path=db)
+    con = sqlite3.connect(db)
+    fila = con.execute(
+        """SELECT referencias, inventario_teorico, bochica_altura, picking_estimado,
+                  referencias_negativas, unidades_negativas, anomalias_filas, anomalias_unidades
+           FROM inventario_corridas WHERE id = ?""",
+        (corrida_id,),
+    ).fetchone()
+    con.close()
+    # teorico 160+225=385 · altura 30+90=120 · picking_estimado 130+135=265
+    assert fila == (2, 385.0, 120.0, 265.0, 0, 0.0, 1, 7700.0)
+
+
+def test_referencias_negativas_se_cuentan(db):
+    """picking_estimado negativo es el hallazgo que la vista debe destacar."""
+    con_negativo = _comparacion(
+        [("PR11A", "PR", False, 100.0, 0.0, 100.0, 372.0, 5.0, 0.0, -272.0, 277.0)]
+    )
+    corrida_id = persistir(con_negativo, _anomalias(), _FRESCURA_OK, db_path=db)
+    con = sqlite3.connect(db)
+    fila = con.execute(
+        "SELECT referencias_negativas, unidades_negativas FROM inventario_corridas WHERE id = ?",
+        (corrida_id,),
+    ).fetchone()
+    con.close()
+    assert fila == (1, -272.0)
+
+
+def test_persistir_sin_anomalias_no_rompe(db):
+    vacias = _anomalias().iloc[0:0]
+    corrida_id = persistir(_comparacion(), vacias, _FRESCURA_OK, db_path=db)
+    con = sqlite3.connect(db)
+    assert con.execute("SELECT COUNT(*) FROM inventario_anomalias").fetchone()[0] == 0
+    assert (
+        con.execute(
+            "SELECT anomalias_unidades FROM inventario_corridas WHERE id=?", (corrida_id,)
+        ).fetchone()[0]
+        == 0.0
+    )
+    con.close()
+
+
+def test_tipos_de_pandas_se_convierten_para_sqlite(db):
+    """numpy.bool_/int64 revientan con InterfaceError si no se normalizan."""
+    df = _comparacion()
+    df["es_averia"] = df["es_averia"].astype(bool)
+    df["disponible_venta"] = df["disponible_venta"].astype("int64")
+    persistir(df, _anomalias(), _FRESCURA_OK, db_path=db)
+    con = sqlite3.connect(db)
+    assert (
+        con.execute(
+            "SELECT COUNT(*) FROM inventario_comparacion WHERE es_averia IN (0,1)"
+        ).fetchone()[0]
+        == 2
+    )
+    con.close()
+
+
+def test_nan_se_guarda_como_null(db):
+    df = _comparacion()
+    df.loc[0, "familia"] = None
+    persistir(df, _anomalias(), _FRESCURA_OK, db_path=db)
+    con = sqlite3.connect(db)
+    assert (
+        con.execute("SELECT COUNT(*) FROM inventario_comparacion WHERE familia IS NULL").fetchone()[
+            0
+        ]
+        == 1
+    )
+    con.close()
+
+
+# ─────────────────────────────────────────────
+# Frescura (DEC-043)
+# ─────────────────────────────────────────────
+
+
+def _tocar(path, horas_atras, ahora):
+    import os
+
+    path.write_text("x", encoding="utf-8")
+    ts = (ahora - dt.timedelta(hours=horas_atras)).timestamp()
+    os.utime(path, (ts, ts))
+    return path
+
+
+def test_frescura_marca_ok_con_fuentes_recientes(tmp_path):
+    ahora = dt.datetime.now(tz=dt.timezone.utc)
+    admin = _tocar(tmp_path / "a.xlsx", 0.5, ahora)
+    bochica = _tocar(tmp_path / "b.xlsx", 0.6, ahora)
+    layout = _tocar(tmp_path / "l.xlsx", 1.0, ahora)
+    f = medir_frescura(admin, bochica, layout, ahora=ahora)
+    assert f["datos_desactualizados"] == 0
+    assert f["fuente_mas_vieja_h"] == pytest.approx(0.6, abs=0.05)
+
+
+def test_frescura_detecta_descarga_fallida(tmp_path):
+    """Sin `&&` en el .bat, una descarga caída deja el Excel viejo en su sitio."""
+    ahora = dt.datetime.now(tz=dt.timezone.utc)
+    admin = _tocar(tmp_path / "a.xlsx", 0.5, ahora)
+    bochica = _tocar(tmp_path / "b.xlsx", UMBRAL_DESACTUALIZADO_H + 2, ahora)
+    layout = _tocar(tmp_path / "l.xlsx", 1.0, ahora)
+    f = medir_frescura(admin, bochica, layout, ahora=ahora)
+    assert f["datos_desactualizados"] == 1
+
+
+def test_layout_viejo_no_marca_desactualizado(tmp_path):
+    """El layout es manual: es normal que tenga semanas, no es una falla."""
+    ahora = dt.datetime.now(tz=dt.timezone.utc)
+    admin = _tocar(tmp_path / "a.xlsx", 0.5, ahora)
+    bochica = _tocar(tmp_path / "b.xlsx", 0.6, ahora)
+    layout = _tocar(tmp_path / "l.xlsx", 24 * 30, ahora)
+    f = medir_frescura(admin, bochica, layout, ahora=ahora)
+    assert f["datos_desactualizados"] == 0
+    assert f["layout_actualizado_en"] is not None
+
+
+def test_frescura_con_fuente_faltante(tmp_path):
+    ahora = dt.datetime.now(tz=dt.timezone.utc)
+    admin = _tocar(tmp_path / "a.xlsx", 0.5, ahora)
+    f = medir_frescura(admin, tmp_path / "no_existe.xlsx", tmp_path / "tampoco.xlsx", ahora=ahora)
+    assert f["bochica_actualizado_en"] is None
+    assert f["datos_desactualizados"] == 1
+
+
+def test_frescura_llega_a_la_view(db):
+    persistir(
+        _comparacion(), _anomalias(), {**_FRESCURA_OK, "datos_desactualizados": 1}, db_path=db
+    )
+    con = sqlite3.connect(db)
+    fila = pd.read_sql("SELECT * FROM v_inventario_corridas", con).iloc[0]
+    con.close()
+    assert fila["datos_desactualizados"] == 1
+    assert fila["bochica_actualizado_en"] == "2026-07-25T22:44:41+00:00"
+
+
+# ─────────────────────────────────────────────
+# calcular_vendido_no_alistado — hueco que encontró la auditoría
+# ─────────────────────────────────────────────
+
+
+def _db_con_pedidos(path, filas):
+    """filas: (referencia, almacen, estado, inicio_inspeccion, cantidad_comprada)."""
+    con = sqlite3.connect(path)
+    con.execute(
+        """CREATE TABLE lineas_pedido (id_pedido TEXT, numero_subpedido TEXT,
+           referencia TEXT, almacen TEXT, cantidad_comprada REAL)"""
+    )
+    con.execute(
+        """CREATE TABLE subpedidos (id_pedido TEXT, numero_subpedido TEXT,
+           estado TEXT, inicio_inspeccion TEXT)"""
+    )
+    for i, (ref, almacen, estado, inspeccion, cant) in enumerate(filas):
+        con.execute(
+            "INSERT INTO lineas_pedido VALUES (?,?,?,?,?)", (f"P{i}", f"S{i}", ref, almacen, cant)
+        )
+        con.execute(
+            "INSERT INTO subpedidos VALUES (?,?,?,?)", (f"P{i}", f"S{i}", estado, inspeccion)
+        )
+    con.commit()
+    con.close()
+    return path
+
+
+def test_vendido_no_alistado_solo_cuenta_alistamiento_sin_terminar(db):
+    """HAL-013: inicio_inspeccion='-' marca que el alistamiento físico no terminó."""
+    _db_con_pedidos(
+        db,
+        [
+            ("PA01", "Bogotá", "Pendiente de entrega", "-", 10),
+            ("PA01", "Bogotá", "Pendiente de entrega", "2026-07-20 10:00", 99),
+        ],
+    )
+    df = calcular_vendido_no_alistado(db)
+    assert df.set_index("referencia").loc["PA01", "vendido_no_alistado"] == 10
+
+
+def test_vendido_no_alistado_filtra_por_almacen(db):
+    """DEC-041: solo la bodega comparada (Bogotá = CEDI Mosquera)."""
+    _db_con_pedidos(
+        db,
+        [
+            ("PA01", "Bogotá", "Pendiente de entrega", "-", 10),
+            ("PA01", "Medellin", "Pendiente de entrega", "-", 500),
+        ],
+    )
+    df = calcular_vendido_no_alistado(db)
+    assert df.set_index("referencia").loc["PA01", "vendido_no_alistado"] == 10
+
+
+def test_vendido_no_alistado_ignora_estados_no_activos(db):
+    _db_con_pedidos(
+        db,
+        [
+            ("PA01", "Bogotá", "Pendiente de entrega", "-", 10),
+            ("PA01", "Bogotá", "Completado", "-", 777),
+        ],
+    )
+    df = calcular_vendido_no_alistado(db)
+    assert df.set_index("referencia").loc["PA01", "vendido_no_alistado"] == 10
+
+
+def test_vendido_no_alistado_agrupa_por_referencia(db):
+    _db_con_pedidos(
+        db,
+        [
+            ("PA01", "Bogotá", "Pendiente de entrega", "-", 10),
+            ("PA01", "Bogotá", "En inspección", "-", 5),
+            ("PJ91", "Bogotá", "Pendiente de entrega", "-", 3),
+        ],
+    )
+    df = calcular_vendido_no_alistado(db).set_index("referencia")
+    assert df.loc["PA01", "vendido_no_alistado"] == 15
+    assert df.loc["PJ91", "vendido_no_alistado"] == 3
+
+
+def test_vendido_no_alistado_descarta_referencias_vacias(db):
+    _db_con_pedidos(
+        db,
+        [
+            ("", "Bogotá", "Pendiente de entrega", "-", 10),
+            (None, "Bogotá", "Pendiente de entrega", "-", 10),
+            ("PA01", "Bogotá", "Pendiente de entrega", "-", 7),
+        ],
+    )
+    df = calcular_vendido_no_alistado(db)
+    assert list(df["referencia"]) == ["PA01"]

@@ -36,6 +36,15 @@ REM ni el scraping de pedidos ni el ETL.
 %PYEXE% -m scraper.inventario >> %LOGFILE% 2>&1
 %PYEXE% -m scraper.bochica >> %LOGFILE% 2>&1
 
+REM DEC-043: cruce de inventario y persistencia en pedidos.db. Va después
+REM de las dos descargas (necesita ambos Excel frescos) y con el mismo
+REM criterio de aislamiento: si falla, no bloquea el ETL. El dashboard lee
+REM el resultado por VIEW en vez de recalcularlo (14,19 s -> 44 ms).
+REM Registra la antigüedad de cada fuente: si una descarga de arriba falló
+REM y dejó el Excel viejo, la corrida se marca datos_desactualizados=1 y
+REM el dashboard lo advierte en vez de mostrar un número que parece fresco.
+%PYEXE% -m inventario.persistencia >> %LOGFILE% 2>&1
+
 REM Ejecutar el ETL después del scraper — como módulo (E-7, DEC-018:
 REM el paquete editable resuelve los imports, sin hack de sys.path)
 %PYEXE% -m etl.etl_principal >> %LOGFILE% 2>&1
