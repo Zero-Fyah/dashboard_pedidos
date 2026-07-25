@@ -1,6 +1,7 @@
 #!/bin/sh
 # Gate de calidad pre-commit (DEC-016, Fase 7).
 # Activar una vez por clon:  git config core.hooksPath scripts/hooks
+#                            cp .confidencial.example .confidencial  (DEC-042)
 #
 # Corre con el python del venv del proyecto para no depender del
 # launcher global (DEC-015: el proyecto está clavado a 3.12).
@@ -12,6 +13,46 @@ PY=".venv/Scripts/python.exe"
 if [ ! -x "$PY" ]; then
     echo "pre-commit: no existe $PY — crear el venv primero (DEC-015)" >&2
     exit 1
+fi
+
+# ─────────────────────────────────────────────
+# Confidencialidad (DEC-042) — va PRIMERO: es el chequeo cuyo costo de
+# omisión es irreversible. Un fallo de ruff se arregla con otro commit;
+# un nombre confidencial que llega al remoto público exige reescribir
+# historial y hacer force-push (pasó dos veces: DEC-017 y 2026-07-25).
+# ─────────────────────────────────────────────
+echo "pre-commit: confidencialidad (DEC-042)"
+if [ ! -f .confidencial ]; then
+    echo "  ⚠️  .confidencial no existe — check de confidencialidad DESACTIVADO." >&2
+    echo "     Activarlo con: cp .confidencial.example .confidencial" >&2
+else
+    # git grep -f trata cada línea como patrón: hay que sacar comentarios
+    # y líneas vacías antes, o un '#' suelto matchearía medio repo.
+    PATRONES="$(mktemp)"
+    trap 'rm -f "$PATRONES"' EXIT
+    sed -e 's/#.*//' -e 's/[[:space:]]*$//' .confidencial | grep -v '^$' > "$PATRONES" || true
+
+    if [ ! -s "$PATRONES" ]; then
+        echo "  ⚠️  .confidencial no define ningún término — check sin efecto." >&2
+    else
+        # --cached: revisa el índice completo, no solo lo que cambió en
+        # este commit. Más estricto a propósito — si un archivo viejo
+        # quedó contaminado, no queremos seguir publicándolo.
+        # -I salta binarios · -F literal · -i sin distinguir mayúsculas.
+        if git grep --cached -I -i -n -F -f "$PATRONES" -- . > /dev/null 2>&1; then
+            echo "" >&2
+            echo "pre-commit: ✗ BLOQUEADO — término confidencial en el contenido indexado" >&2
+            echo "" >&2
+            # Solo file:line — no se imprime el texto que matcheó, para no
+            # volcar el término en la terminal ni en logs de CI.
+            git grep --cached -I -i -n -F -f "$PATRONES" -- . | cut -d: -f1,2 | sed 's/^/    /' >&2
+            echo "" >&2
+            echo "  Reemplazar por el placeholder 'miempresa' (regla de CLAUDE.md)." >&2
+            echo "  El repo es público de forma permanente: si esto llega al remoto," >&2
+            echo "  limpiarlo exige reescribir historial y force-push (DEC-017)." >&2
+            exit 1
+        fi
+    fi
 fi
 
 echo "pre-commit: ruff check"

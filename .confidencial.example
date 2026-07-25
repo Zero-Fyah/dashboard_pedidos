@@ -1,0 +1,27 @@
+# Términos confidenciales — plantilla (DEC-017 / DEC-042)
+#
+# Copiar a `.confidencial` (gitignored) y completar con los términos
+# reales. El gate pre-commit busca cada uno de estos, sin distinguir
+# mayúsculas, en TODO el contenido indexado antes de dejar commitear.
+#
+#   cp .confidencial.example .confidencial
+#
+# Este archivo (`.example`) SÍ se versiona y por eso nunca debe contener
+# los valores reales — solo la plantilla.
+#
+# Reglas del formato:
+#   - Un término por línea.
+#   - Las líneas vacías y las que empiezan con `#` se ignoran.
+#   - La búsqueda es de texto literal (no regex) e insensible a
+#     mayúsculas, y matchea subcadenas: `miempresa` ya cubre
+#     `MiEmpresa`, `miempresa.com` y `usuario_miempresa`. Basta con el
+#     término más corto que sea inequívoco.
+#
+# Ojo: un término demasiado genérico (`co`, `app`) haría fallar todos los
+# commits. Elegir cadenas que no aparezcan en código legítimo.
+
+# Nombre real de la empresa (basta la raíz, matchea el dominio también)
+nombre-real-de-la-empresa
+
+# Otros identificadores que no deben llegar al repo público, si aplica
+# dominio-interno.com

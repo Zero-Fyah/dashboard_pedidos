@@ -20,6 +20,10 @@ logs/
 # Credenciales
 .env
 
+# Términos confidenciales del gate pre-commit (DEC-042) — contiene los
+# valores reales; la plantilla `.confidencial.example` sí se versiona
+.confidencial
+
 # Python
 __pycache__/
 *.pyc
