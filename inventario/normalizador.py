@@ -7,9 +7,8 @@ identificador de producto compartido (`ID de especificación` en el
 admin, `ID Producto` en Bochica — confirmado 71,5% de cruce, ver
 docs/decisions.md DEC-039 pregunta 1).
 
-Deja listo el inventario cruzado salvo la clasificación picking/altura,
-que necesita el layout de bodega (documento 3, aún pendiente) — no
-inventar esa lógica acá.
+La clasificación picking/altura vive en `inventario/layout.py` (DEC-041);
+acá está el recorte de alcance del lado del catálogo administrativo.
 """
 
 import logging
@@ -24,6 +23,30 @@ logger = logging.getLogger("inventario.normalizador")
 # artefactos de migración/zonas de tránsito, no posiciones físicas.
 BOCHICA_ID_PLACEHOLDER = "0"
 BOCHICA_UBICACIONES_PLACEHOLDER = frozenset({"_MIGRADO", "subbodega"})
+
+# Alcance de la comparación del lado admin (DEC-041).
+#
+# `Arena` es la categoría de mercancía recibida por peso: medido sobre los
+# archivos reales, está 100% fuera del layout (893.070 unidades en Bochica
+# contra 50 dentro), mientras el resto de categorías está ≥98,8% dentro.
+# Es el discriminador correcto — NO el prefijo de familia: `PRA*` (Arena)
+# está 100% fuera del layout y `PR0`-`PR7` (Areneras) 100% dentro, así que
+# filtrar por la familia `PR` se llevaría ambas.
+CATEGORIA_RECIBIDA_POR_PESO = "Arena"
+
+# CEDI Mosquera = almacén Bogotá del sistema administrativo (confirmado
+# por el Arquitecto, DEC-041). Excluida `Arena`, Bogotá concentra el
+# 99,76% de las unidades: el filtro es correcto y de bajo impacto.
+ALMACEN_BODEGA = "Bogotá"
+
+# Definición operativa de avería (DEC-041, confirmada por el Arquitecto).
+# Medido sobre el catálogo real: hoy el patrón de referencia está
+# íntegramente contenido en la categoría, así que la unión equivale a
+# filtrar solo por `Outlet %`. Se mantiene como unión a propósito —
+# documenta la intención y aguanta que entre una avería fuera de esa
+# categoría.
+CATEGORIA_AVERIA = "Outlet %"
+_PATRON_AVERIA = r"\sAVER[ÍI]A$"
 
 
 def cargar_admin(path: Path) -> pd.DataFrame:
@@ -130,6 +153,70 @@ def cargar_bochica(path: Path, *, excluir_placeholders: bool = True) -> pd.DataF
         "fecha_vencimiento",
     ]
     return df[columnas]
+
+
+def marcar_averias(df_admin: pd.DataFrame) -> pd.Series:
+    """Marca qué filas del catálogo admin son averías (DEC-041).
+
+    Definición confirmada por el Arquitecto: categoría `Outlet %` **o**
+    referencia terminada en " AVERIA"/" AVERÍA". Las averías se crean
+    dentro de la familia del producto de origen ("PJ91" → "PJ91 AVERIA"),
+    así que `comun.familia_de()` las clasifica bien sin caso especial.
+
+    `Outlet %` no es exclusivamente averías (incluye ítems de fundación);
+    se acepta ese margen — la estandarización de estos datos es trabajo
+    posterior al dashboard, por decisión del Arquitecto.
+
+    Args:
+        df_admin: Resultado de `cargar_admin()`.
+
+    Returns:
+        Serie booleana alineada al índice de `df_admin`.
+    """
+    por_categoria = df_admin["categoria"] == CATEGORIA_AVERIA
+    por_referencia = (
+        df_admin["referencia"].astype(str).str.contains(_PATRON_AVERIA, regex=True, na=False)
+    )
+    solo_referencia = int((por_referencia & ~por_categoria).sum())
+    if solo_referencia:
+        logger.info(
+            "marcar_averias: %d filas con referencia de avería fuera de la "
+            "categoría '%s' — la unión ya no es redundante (DEC-041)",
+            solo_referencia,
+            CATEGORIA_AVERIA,
+        )
+    return por_categoria | por_referencia
+
+
+def filtrar_alcance_admin(df_admin: pd.DataFrame) -> pd.DataFrame:
+    """Recorta el catálogo admin al universo comparable con el layout (DEC-041).
+
+    Dos filtros: excluye la categoría recibida por peso (`Arena`, que vive
+    100% fuera del layout) y se queda con el almacén de la bodega
+    (`Bogotá` = CEDI Mosquera). Ambos descartes se loguean — nunca en
+    silencio, mismo criterio que `cargar_bochica()`.
+
+    Args:
+        df_admin: Resultado de `cargar_admin()`.
+
+    Returns:
+        Subconjunto de `df_admin` comparable contra las ubicaciones del
+        layout.
+    """
+    total = len(df_admin)
+    es_peso = df_admin["categoria"] == CATEGORIA_RECIBIDA_POR_PESO
+    es_bodega = df_admin["almacen"] == ALMACEN_BODEGA
+    filtrado = df_admin[~es_peso & es_bodega]
+    logger.info(
+        "filtrar_alcance_admin: %d/%d filas conservadas (excluidas %d de categoría "
+        "'%s' y %d de otros almacenes)",
+        len(filtrado),
+        total,
+        int(es_peso.sum()),
+        CATEGORIA_RECIBIDA_POR_PESO,
+        int((~es_peso & ~es_bodega).sum()),
+    )
+    return filtrado
 
 
 def cruzar_inventarios(df_admin: pd.DataFrame, df_bochica: pd.DataFrame) -> pd.DataFrame:

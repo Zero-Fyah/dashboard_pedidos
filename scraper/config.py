@@ -108,7 +108,7 @@ CONFIG: ConfigDict = {
     "bochica_usuario": os.environ.get("BOCHICA_USUARIO", ""),
     "bochica_clave": os.environ.get("BOCHICA_PASSWORD", ""),
     # DEC-039: segunda capa de login dentro de la propia app de Bochica
-    # ("usuario miempresa") — distinta del login de Google de arriba.
+    # (el "usuario de miempresa") — distinta del login de Google de arriba.
     "bochica_app_usuario": os.environ.get("BOCHICA_APP_USUARIO", ""),
     "bochica_app_clave": os.environ.get("BOCHICA_APP_PASSWORD", ""),
     # Timeouts (ms)

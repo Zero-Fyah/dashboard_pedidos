@@ -80,15 +80,15 @@ async def login_app_bochica(page: Page, usuario: str, clave: str) -> None:
     """Autentica en la segunda capa de login de la propia app de Bochica.
 
     Distinta del login de Google: es un usuario/clave propios de la app
-    ("usuario miempresa"). Tras un login válido aparece un selector de país
-    (Colombia/Chile) antes de que se muestre #appContent — el proyecto
-    solo opera Colombia (btnPais_CO), Chile queda fuera de alcance.
+    (el "usuario de miempresa"). Tras un login válido aparece un selector
+    de país (Colombia/Chile) antes de que se muestre #appContent — el
+    proyecto solo opera Colombia (btnPais_CO), Chile queda fuera de alcance.
     Asume que `page` ya pasó por login_bochica().
 
     Args:
         page: Página Playwright con sesión de Google ya autenticada.
-        usuario: Usuario miempresa (BOCHICA_APP_USUARIO).
-        clave: Contraseña del usuario miempresa (BOCHICA_APP_PASSWORD).
+        usuario: Usuario de la app (BOCHICA_APP_USUARIO).
+        clave: Contraseña de ese usuario (BOCHICA_APP_PASSWORD).
     """
     frame = await _frame_con_selector(page, "#loginEmail", CONFIG["ELEM_TIMEOUT_MS"])
     await frame.locator("#loginEmail").fill(usuario)

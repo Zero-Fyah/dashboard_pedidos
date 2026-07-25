@@ -13,18 +13,18 @@ orquestador.py. Este archivo conserva dos responsabilidades:
         # Carga histórica completa (primera vez)
         py scraper/scraper_principal.py --desde 2026-01-01 --hasta 2026-05-21 --modo completo
 
-        # Actualización incremental (uso normal, cada 2 horas)
+        # Actualización incremental (uso normal, cada 1 hora)
         py scraper/scraper_principal.py --modo incremental
 
   2. Facade de compatibilidad — re-exporta todos los nombres públicos del
      paquete para los importadores existentes (tests, migraciones):
      `from scraper.scraper_principal import X` sigue funcionando.
 
-Configuración recomendada: NUM_WORKERS=5, PAUSA_ENTRE_PEDIDOS_S=1.2,
-MAX_REINTENTOS=5, NAV_TIMEOUT_MS=45s
+Configuración recomendada: NUM_WORKERS=6 (DEC-030, vía SCRAPER_NUM_WORKERS),
+PAUSA_ENTRE_PEDIDOS_S=1.2, MAX_REINTENTOS=5, NAV_TIMEOUT_MS=45s
 
-Estimación de tiempo (modo incremental con 5 workers):
-    Activos + errores: ~3-5 horas dependiendo del volumen
+Estimación de tiempo (modo incremental con 6 workers):
+    Activos + errores: ~35-45 min dependiendo del volumen
     Pedidos nuevos del día: ~3-8 minutos
 """
 

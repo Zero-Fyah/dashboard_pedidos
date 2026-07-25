@@ -85,6 +85,46 @@ ESTADOS_CONOCIDOS: frozenset[str] = (
     ESTADOS_CERRADOS | ESTADOS_FIJAN_CANTIDADES | frozenset(ESTADOS_ACTIVOS_INVENTARIO)
 )
 
+# Familias de producto (DEC-041, confirmado por el Arquitecto 2026-07-25).
+# La familia son los DOS PRIMEROS CARACTERES de la referencia — incluidas
+# las averías, que son referencias propias dentro de la familia de origen
+# ("PJ91 AVERIA" → "PJ"). Tupla — orden determinístico para SQL y para el
+# orden de los filtros del dashboard.
+# `PW` todavía no tiene existencias (19 referencias, 0 unidades al
+# 2026-07-25) pero está próxima a ingresar: se incluye desde ahora para
+# que el día que llegue mercancía no requiera cambio de código.
+FAMILIAS_PRODUCTO: tuple[str, ...] = (
+    "PA",
+    "PB",
+    "PC",
+    "PH",
+    "PJ",
+    "PO",
+    "PP",
+    "PR",
+    "PS",
+    "PW",
+)
+
+
+def familia_de(referencia: str | None) -> str | None:
+    """Extrae la familia de producto de una referencia (DEC-041).
+
+    Args:
+        referencia: Referencia del catálogo, ej. "PJ91" o "PJ91 AVERIA".
+
+    Returns:
+        Los 2 primeros caracteres en mayúscula si corresponden a una
+        familia conocida, o None si la referencia es vacía o su prefijo
+        no está en `FAMILIAS_PRODUCTO` (referencias legadas o con
+        espacios al inicio — ver pendientes de DEC-041).
+    """
+    if not referencia:
+        return None
+    prefijo = str(referencia).strip()[:2].upper()
+    return prefijo if prefijo in FAMILIAS_PRODUCTO else None
+
+
 # Acciones de staff que cuentan para el rendimiento de operadores
 # (VIEW v_rendimiento_operadores del ETL — HAL-008, extraídas en Fase 6).
 # Verificadas contra registro_operaciones en DB real el 2026-07-17: son
