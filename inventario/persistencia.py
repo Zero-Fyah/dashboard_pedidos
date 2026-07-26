@@ -140,6 +140,21 @@ _TABLAS = {
             PRIMARY KEY (id_pedido, numero_subpedido)
         )
     """,
+    "operacion_ventanas": """
+        CREATE TABLE IF NOT EXISTS operacion_ventanas (
+            usuario       TEXT NOT NULL,
+            dia           TEXT NOT NULL,
+            primer_cierre TEXT,
+            ultimo_cierre TEXT,
+            ventana_h     REAL,
+            subpedidos    INTEGER,
+            lineas        REAL,
+            unidades      REAL,
+            utilizable    INTEGER,
+            corrida_id    INTEGER,
+            PRIMARY KEY (usuario, dia)
+        )
+    """,
     "tareas_hallazgos": """
         CREATE TABLE IF NOT EXISTS tareas_hallazgos (
             clave       TEXT PRIMARY KEY,
@@ -193,6 +208,11 @@ _VIEWS = {
                cola_y_picking_h, inspeccion_h, ciclo_total_h
         FROM operacion_ciclos
     """,
+    "v_operacion_ventanas": """
+        SELECT usuario, dia, primer_cierre, ultimo_cierre, ventana_h,
+               subpedidos, lineas, unidades, utilizable
+        FROM operacion_ventanas
+    """,
     "v_inventario_anomalias": """
         SELECT motivo, ubicacion, id_especificacion, cantidad
         FROM inventario_anomalias
@@ -241,6 +261,18 @@ _COLUMNAS_OPERACION = (
     "cola_y_picking_h",
     "inspeccion_h",
     "ciclo_total_h",
+)
+
+_COLUMNAS_VENTANAS = (
+    "usuario",
+    "dia",
+    "primer_cierre",
+    "ultimo_cierre",
+    "ventana_h",
+    "subpedidos",
+    "lineas",
+    "unidades",
+    "utilizable",
 )
 
 _COLUMNAS_ABC = (
@@ -540,6 +572,7 @@ def persistir(
     salud: pd.DataFrame | None = None,
     abc: pd.DataFrame | None = None,
     operacion: pd.DataFrame | None = None,
+    ventanas: pd.DataFrame | None = None,
 ) -> int:
     """Escribe el snapshot de la corrida, reemplazando el anterior.
 
@@ -564,6 +597,8 @@ def persistir(
             (DEC-050). Si es None, `inventario_abc` queda intacta.
         operacion: Resultado de `inventario.operacion.calcular_operacion()`
             (DEC-054). Si es None, `operacion_ciclos` queda intacta.
+        ventanas: Resultado de `inventario.operacion.calcular_ventanas()`
+            (DEC-055). Si es None, `operacion_ventanas` queda intacta.
 
     Returns:
         El `id` de la corrida registrada en `inventario_corridas`.
@@ -679,6 +714,19 @@ def persistir(
                     ],
                 )
 
+            # DEC-055: ventana activa por alistador y día.
+            if ventanas is not None:
+                con.execute("DELETE FROM operacion_ventanas")
+                con.executemany(
+                    f"INSERT INTO operacion_ventanas "
+                    f"({', '.join(_COLUMNAS_VENTANAS)}, corrida_id) "
+                    f"VALUES ({', '.join('?' * len(_COLUMNAS_VENTANAS))}, ?)",
+                    [
+                        (*_normalizar(fila), corrida_id)
+                        for fila in ventanas[list(_COLUMNAS_VENTANAS)].itertuples(index=False)
+                    ],
+                )
+
             # DEC-045: el puente producto↔pedido. Va en la misma transacción
             # para que el dashboard nunca lo vea a medio poblar.
             if catalogo is not None:
@@ -751,7 +799,7 @@ def main() -> int:
         solo_layout,
     )
     from inventario.normalizador import cargar_admin, cargar_bochica, filtrar_alcance_admin
-    from inventario.operacion import calcular_operacion
+    from inventario.operacion import calcular_operacion, calcular_ventanas
     from inventario.salud import calcular_salud
     from scraper.bochica import DESTINO_DEFAULT as BOCHICA_XLSX
     from scraper.inventario import DESTINO_DEFAULT as ADMIN_XLSX
@@ -782,6 +830,7 @@ def main() -> int:
             salud = calcular_salud(admin, lectura)
             abc = calcular_clasificacion(admin, lectura)
             operacion = calcular_operacion(lectura)
+            ventanas = calcular_ventanas(lectura)
 
         corrida_id = persistir(
             comparacion,
@@ -792,6 +841,7 @@ def main() -> int:
             salud=salud,
             abc=abc,
             operacion=operacion,
+            ventanas=ventanas,
         )
     except FileNotFoundError as e:
         logger.error("inventario: falta una fuente — %s", e)

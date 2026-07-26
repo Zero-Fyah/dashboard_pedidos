@@ -190,3 +190,113 @@ def productividad_por_alistador(df: pd.DataFrame) -> pd.DataFrame:
     for columna in ("exclusivos", "lineas", "unidades"):
         resultado[columna] = resultado[columna].fillna(0)
     return resultado.sort_values("participaciones", ascending=False)
+
+
+# ─────────────────────────────────────────────
+# Ventana activa — capacidad del equipo (DEC-055)
+# ─────────────────────────────────────────────
+
+# Un día con uno o dos cierres no define una jornada, y una ventana muy
+# corta da ritmos absurdos al dividir. Con estos mínimos se descarta el
+# 26,3% de los días-alistador, que concentran solo el 3,7% de las líneas:
+# se pierden jornadas marginales, no volumen.
+MIN_CIERRES_JORNADA = 3
+MIN_VENTANA_H = 0.5
+
+_COLUMNAS_VENTANAS = [
+    "usuario",
+    "dia",
+    "primer_cierre",
+    "ultimo_cierre",
+    "ventana_h",
+    "subpedidos",
+    "lineas",
+    "unidades",
+    "utilizable",
+]
+
+
+def calcular_ventanas(con: sqlite3.Connection) -> pd.DataFrame:
+    """Ventana activa por alistador y día, a partir del log de operaciones.
+
+    `registro_operaciones` resultó estar **a nivel de subpedido**: su campo
+    `referencia` es el `numero_subpedido` (verificado: 25.044 de 25.047
+    eventos casan con un subpedido real). Eso da un cierre fechado por
+    subpedido, con el usuario que lo registró.
+
+    **Por qué la ventana y no el hueco entre cierres.** El intento directo
+    —medir el tiempo entre cierres consecutivos del mismo alistador— da
+    números imposibles: mediana de 0,81 minutos por línea y un percentil 25
+    de 8 segundos. La causa es que **el registro se hace en ráfagas**: el
+    15,6% de los cierres ocurre a menos de 60 segundos del anterior. Ese
+    hueco mide tecleo, no picking.
+
+    La ventana del primer al último cierre del día esquiva el problema
+    porque promedia sobre la jornada entera. **Validación:** la ventana
+    mediana da 6,8 h y por alistador queda entre 7,1 y 8,2 h — reproduce un
+    turno real, que es lo que da confianza en que mide algo.
+
+    ⚠️ **Sirve para el equipo, no para comparar personas.** El evento trae
+    un solo `usuario` pero el 52,3% de los subpedidos tuvo varios
+    alistadores, así que el **83,8% de las líneas** se le acredita a quien
+    cerró, no a quien picó. Al sumar el equipo el error se cancela (cada
+    subpedido se cuenta una vez); a nivel individual, no.
+
+    Args:
+        con: Conexión de lectura a pedidos.db.
+
+    Returns:
+        DataFrame por `(usuario, dia)` con la ventana y lo cerrado en ella.
+    """
+    eventos = pd.read_sql(
+        """SELECT ro.id_pedido, ro.referencia AS numero_subpedido,
+                  ro.momento, ro.usuario
+           FROM registro_operaciones ro
+           JOIN subpedidos s
+             ON s.id_pedido = ro.id_pedido
+            AND s.numero_subpedido = ro.referencia
+           WHERE ro.accion LIKE 'Alistamiento%'
+             AND ro.usuario IS NOT NULL AND ro.usuario != ''""",
+        con,
+    )
+    carga = pd.read_sql(
+        """SELECT id_pedido, numero_subpedido,
+                  COUNT(*) AS lineas, SUM(cantidad_comprada) AS unidades
+           FROM lineas_pedido GROUP BY id_pedido, numero_subpedido""",
+        con,
+    )
+    eventos["momento"] = pd.to_datetime(eventos["momento"], errors="coerce")
+    eventos = eventos.dropna(subset=["momento"])
+    if eventos.empty:
+        return pd.DataFrame(columns=_COLUMNAS_VENTANAS)
+
+    eventos = eventos.merge(carga, on=["id_pedido", "numero_subpedido"], how="left").fillna(
+        {"lineas": 0, "unidades": 0}
+    )
+    eventos["usuario"] = eventos["usuario"].str.strip()
+    eventos["dia"] = eventos["momento"].dt.strftime("%Y-%m-%d")
+
+    v = eventos.groupby(["usuario", "dia"], as_index=False).agg(
+        primer_cierre=("momento", "min"),
+        ultimo_cierre=("momento", "max"),
+        subpedidos=("momento", "size"),
+        lineas=("lineas", "sum"),
+        unidades=("unidades", "sum"),
+    )
+    v["ventana_h"] = (v["ultimo_cierre"] - v["primer_cierre"]).dt.total_seconds() / 3600
+    v["utilizable"] = (
+        (v["subpedidos"] >= MIN_CIERRES_JORNADA) & (v["ventana_h"] >= MIN_VENTANA_H)
+    ).astype(int)
+    for columna in ("primer_cierre", "ultimo_cierre"):
+        v[columna] = v[columna].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    utiles = v[v["utilizable"] == 1]
+    logger.info(
+        "calcular_ventanas: %d días-alistador (%d utilizables, %.1f%% de las líneas) · "
+        "ventana mediana %.1f h",
+        len(v),
+        len(utiles),
+        utiles["lineas"].sum() / max(v["lineas"].sum(), 1) * 100,
+        utiles["ventana_h"].median() if len(utiles) else 0,
+    )
+    return v[_COLUMNAS_VENTANAS]

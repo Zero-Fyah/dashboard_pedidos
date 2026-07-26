@@ -198,3 +198,108 @@ def test_sin_datos_devuelve_vacio_con_las_columnas(con):
     prod = productividad_por_alistador(pd.DataFrame(columns=["alistador"]))
     assert prod.empty
     assert "participaciones" in prod.columns
+
+
+# ─────────────────────────────────────────────
+# Ventana activa (DEC-055)
+# ─────────────────────────────────────────────
+
+
+def _evento(con, pid, subpedido, momento, usuario, accion="Alistamiento sin diferencia"):
+    con.execute(
+        "INSERT INTO registro_operaciones VALUES (?,?,?,?,?)",
+        (pid, subpedido, momento, usuario, accion),
+    )
+
+
+@pytest.fixture
+def con_log(con):
+    con.execute(
+        """CREATE TABLE registro_operaciones (id_pedido TEXT, referencia TEXT,
+           momento TEXT, usuario TEXT, accion TEXT)"""
+    )
+    # calcular_ventanas hace JOIN contra subpedidos por (id_pedido, referencia)
+    con.execute("INSERT INTO subpedidos VALUES ('P1','S1','ANA','LUIS','-','-','-')")
+    con.execute("INSERT INTO subpedidos VALUES ('P2','S2','ANA','LUIS','-','-','-')")
+    con.execute("INSERT INTO lineas_pedido VALUES ('P1','S1',10)")
+    con.execute("INSERT INTO lineas_pedido VALUES ('P1','S1',10)")
+    con.execute("INSERT INTO lineas_pedido VALUES ('P2','S2',5)")
+    return con
+
+
+def test_la_ventana_va_del_primer_al_ultimo_cierre(con_log):
+    from inventario.operacion import calcular_ventanas
+
+    _evento(con_log, "P1", "S1", "2026-03-01 08:00:00", "ANA")
+    _evento(con_log, "P2", "S2", "2026-03-01 14:00:00", "ANA")
+    v = calcular_ventanas(con_log).iloc[0]
+    assert v["ventana_h"] == pytest.approx(6.0)
+    assert v["subpedidos"] == 2
+    assert v["lineas"] == 3
+    assert v["unidades"] == 25
+
+
+def test_cada_alistador_y_dia_es_una_ventana(con_log):
+    from inventario.operacion import calcular_ventanas
+
+    _evento(con_log, "P1", "S1", "2026-03-01 08:00:00", "ANA")
+    _evento(con_log, "P2", "S2", "2026-03-02 08:00:00", "ANA")
+    v = calcular_ventanas(con_log)
+    assert len(v) == 2
+    assert set(v["dia"]) == {"2026-03-01", "2026-03-02"}
+
+
+def test_jornada_con_pocos_cierres_no_es_utilizable(con_log):
+    """Un día con uno o dos cierres no define una jornada medible."""
+    from inventario.operacion import calcular_ventanas
+
+    _evento(con_log, "P1", "S1", "2026-03-01 08:00:00", "ANA")
+    _evento(con_log, "P2", "S2", "2026-03-01 14:00:00", "ANA")
+    assert calcular_ventanas(con_log).iloc[0]["utilizable"] == 0
+
+
+def test_jornada_completa_si_es_utilizable(con_log):
+    from inventario.operacion import calcular_ventanas
+
+    con_log.execute("INSERT INTO subpedidos VALUES ('P3','S3','ANA','LUIS','-','-','-')")
+    con_log.execute("INSERT INTO lineas_pedido VALUES ('P3','S3',7)")
+    for pid, sp, h in (("P1", "S1", "08:00"), ("P2", "S2", "11:00"), ("P3", "S3", "15:00")):
+        _evento(con_log, pid, sp, f"2026-03-01 {h}:00", "ANA")
+    v = calcular_ventanas(con_log).iloc[0]
+    assert v["utilizable"] == 1
+    assert v["ventana_h"] == pytest.approx(7.0)
+
+
+def test_ventana_muy_corta_no_es_utilizable(con_log):
+    """Dividir por una ventana de minutos daría un ritmo absurdo."""
+    from inventario.operacion import calcular_ventanas
+
+    con_log.execute("INSERT INTO subpedidos VALUES ('P3','S3','ANA','LUIS','-','-','-')")
+    con_log.execute("INSERT INTO lineas_pedido VALUES ('P3','S3',7)")
+    for pid, sp, m in (("P1", "S1", "00"), ("P2", "S2", "05"), ("P3", "S3", "10")):
+        _evento(con_log, pid, sp, f"2026-03-01 08:{m}:00", "ANA")
+    assert calcular_ventanas(con_log).iloc[0]["utilizable"] == 0
+
+
+def test_evento_sin_subpedido_real_se_ignora(con_log):
+    """El JOIN contra subpedidos es lo que garantiza que `referencia` sea
+    un número de subpedido y no otra cosa."""
+    from inventario.operacion import calcular_ventanas
+
+    _evento(con_log, "P9", "NO-EXISTE", "2026-03-01 08:00:00", "ANA")
+    assert calcular_ventanas(con_log).empty
+
+
+def test_solo_cuenta_eventos_de_alistamiento(con_log):
+    from inventario.operacion import calcular_ventanas
+
+    _evento(con_log, "P1", "S1", "2026-03-01 08:00:00", "ANA", accion="Entrega")
+    assert calcular_ventanas(con_log).empty
+
+
+def test_sin_eventos_devuelve_vacio_con_columnas(con_log):
+    from inventario.operacion import calcular_ventanas
+
+    v = calcular_ventanas(con_log)
+    assert v.empty
+    assert "ventana_h" in v.columns
