@@ -73,6 +73,16 @@ _TABLAS = {
             corrida_id          INTEGER
         )
     """,
+    "catalogo_productos": """
+        CREATE TABLE IF NOT EXISTS catalogo_productos (
+            referencia    TEXT NOT NULL,
+            codigo_barras TEXT NOT NULL,
+            id_producto   TEXT NOT NULL,
+            nombre_comercial TEXT,
+            corrida_id    INTEGER,
+            PRIMARY KEY (referencia, codigo_barras)
+        )
+    """,
     "inventario_anomalias": """
         CREATE TABLE IF NOT EXISTS inventario_anomalias (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,6 +134,62 @@ _COLUMNAS_COMPARACION = (
 )
 
 _COLUMNAS_ANOMALIAS = ("motivo", "ubicacion", "id_especificacion", "cantidad")
+
+_COLUMNAS_CATALOGO = ("referencia", "codigo_barras", "id_producto", "nombre_comercial")
+
+
+def construir_catalogo_productos(df_admin: pd.DataFrame) -> pd.DataFrame:
+    """Arma el puente `(referencia, código de barras)` → ID de producto (DEC-045).
+
+    `lineas_pedido` no guarda ningún ID de producto: identifica el artículo
+    por referencia, código de barras, nombre y presentación. Los IDs viven
+    solo en el catálogo del admin, así que esta tabla es la que permite
+    mostrarlos en la vista consolidada de Pedidos.
+
+    **Solo se conservan los pares que resuelven a un único `id_producto`.**
+    El código de barras no es único por ID (un mismo código cuelga de hasta
+    21 referencias — la misma arena vendida por unidad, tonelada o
+    corporativo), y si un par quedara con dos IDs el LEFT JOIN del dashboard
+    **duplicaría la línea de pedido e inflaría `Cantidad comprada`**. Medido:
+    el 99,6% de los pares es inequívoco; el 0,4% restante se descarta a
+    propósito y esas líneas muestran el ID vacío.
+
+    Se usa el catálogo **sin filtrar por alcance**: acá interesa poder
+    nombrar cualquier producto que aparezca en un pedido, incluidas las
+    arenas y los otros almacenes que `filtrar_alcance_admin()` excluye del
+    cruce de inventario.
+
+    Args:
+        df_admin: Resultado de `inventario.normalizador.cargar_admin()`.
+
+    Returns:
+        DataFrame con `referencia`, `codigo_barras`, `id_producto` y
+        `nombre_comercial`; una fila por par inequívoco.
+    """
+    df = df_admin[["referencia", "codigo_barras", "id_producto_admin", "nombre_comercial"]].copy()
+    df["referencia"] = df["referencia"].astype(str).str.strip()
+    df["codigo_barras"] = df["codigo_barras"].astype(str).str.strip()
+    df["id_producto"] = df["id_producto_admin"].astype(str).str.strip()
+
+    total = df[["referencia", "codigo_barras"]].drop_duplicates().shape[0]
+    por_par = df.groupby(["referencia", "codigo_barras"])["id_producto"].nunique()
+    inequivocos = por_par[por_par == 1].index
+
+    puente = (
+        df.set_index(["referencia", "codigo_barras"])
+        .loc[df.set_index(["referencia", "codigo_barras"]).index.isin(inequivocos)]
+        .reset_index()
+        .drop_duplicates(subset=["referencia", "codigo_barras"])
+    )
+    descartados = total - len(puente)
+    if descartados:
+        logger.info(
+            "construir_catalogo_productos: %d/%d pares descartados por ambigüedad "
+            "(más de un id_producto) — esas líneas quedan sin ID (DEC-045)",
+            descartados,
+            total,
+        )
+    return puente[list(_COLUMNAS_CATALOGO)]
 
 
 def init_schema(con: sqlite3.Connection) -> None:
@@ -240,6 +306,7 @@ def persistir(
     anomalias: pd.DataFrame,
     frescura: dict[str, object],
     db_path: str | None = None,
+    catalogo: pd.DataFrame | None = None,
 ) -> int:
     """Escribe el snapshot de la corrida, reemplazando el anterior.
 
@@ -252,6 +319,10 @@ def persistir(
         anomalias: Resultado de `inventario.comparacion.anomalias_layout()`.
         frescura: Resultado de `medir_frescura()`.
         db_path: Ruta a pedidos.db. Default: `comun.get_db_path()`.
+        catalogo: Resultado de `construir_catalogo_productos()` (DEC-045).
+            Si es None, `catalogo_productos` se deja intacta — así un
+            problema del cruce de inventario no borra el puente que
+            necesita la vista de Pedidos.
 
     Returns:
         El `id` de la corrida registrada en `inventario_corridas`.
@@ -297,6 +368,20 @@ def persistir(
                     [
                         (*_normalizar(fila), corrida_id)
                         for fila in anomalias[list(_COLUMNAS_ANOMALIAS)].itertuples(index=False)
+                    ],
+                )
+
+            # DEC-045: el puente producto↔pedido. Va en la misma transacción
+            # para que el dashboard nunca lo vea a medio poblar.
+            if catalogo is not None:
+                con.execute("DELETE FROM catalogo_productos")
+                con.executemany(
+                    f"INSERT INTO catalogo_productos "
+                    f"({', '.join(_COLUMNAS_CATALOGO)}, corrida_id) "
+                    f"VALUES ({', '.join('?' * len(_COLUMNAS_CATALOGO))}, ?)",
+                    [
+                        (*_normalizar(fila), corrida_id)
+                        for fila in catalogo[list(_COLUMNAS_CATALOGO)].itertuples(index=False)
                     ],
                 )
         except Exception:
@@ -362,14 +447,20 @@ def main() -> int:
     try:
         frescura = medir_frescura(ADMIN_XLSX, BOCHICA_XLSX, RUTA_LAYOUT_DEFAULT)
 
-        admin = filtrar_alcance_admin(cargar_admin(ADMIN_XLSX))
+        catalogo_completo = cargar_admin(ADMIN_XLSX)
+        # DEC-045: el puente usa el catálogo SIN filtrar por alcance — acá
+        # interesa nombrar cualquier producto que aparezca en un pedido,
+        # incluidas arenas y otros almacenes.
+        catalogo = construir_catalogo_productos(catalogo_completo)
+
+        admin = filtrar_alcance_admin(catalogo_completo)
         layout = cargar_layout()
         bochica = solo_layout(clasificar_ubicaciones(cargar_bochica(BOCHICA_XLSX), layout))
 
         comparacion = comparar(admin, bochica, calcular_vendido_no_alistado())
         anomalias = anomalias_layout(bochica)
 
-        corrida_id = persistir(comparacion, anomalias, frescura)
+        corrida_id = persistir(comparacion, anomalias, frescura, catalogo=catalogo)
     except FileNotFoundError as e:
         logger.error("inventario: falta una fuente — %s", e)
         return 1

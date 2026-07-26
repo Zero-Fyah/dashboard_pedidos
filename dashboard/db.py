@@ -10,12 +10,19 @@ import streamlit as st
 # `comun` cuando Streamlit ejecuta la app con dashboard/ como directorio
 # del script.
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from comun import ESTADOS_CERRADOS
+from comun import ESTADOS_ACTIVOS_INVENTARIO, ESTADOS_CERRADOS
 
 DB_PATH = Path(__file__).parent.parent / "data" / "pedidos.db"
 # Lista de estados de cierre lista para interpolar en IN (...) / NOT IN (...).
 # sorted() para SQL determinístico (frozenset no garantiza orden).
 _cerr = ",".join(f"'{e}'" for e in sorted(ESTADOS_CERRADOS))
+
+# DEC-045: el subfiltro "previos a picking" replica la definición de
+# DEC-039 pregunta 5 (corregida por HAL-013), que son DOS condiciones:
+# el subpedido está activo para inventario **y** su alistamiento físico no
+# terminó. Con solo `inicio_inspeccion='-'` se colarían los cancelados
+# (5.738 nunca se alistaron porque murieron antes) y algunos completados.
+_activos_inv = ",".join(f"'{e}'" for e in ESTADOS_ACTIVOS_INVENTARIO)
 
 # AUD-B6: Colombia opera en UTC-5 sin horario de verano desde 1993 — un
 # offset fijo es correcto todo el año y no depende de la zona horaria
@@ -145,6 +152,135 @@ def get_opciones_filtro() -> tuple[list[str], list[str], list[str], list[str]]:
     finally:
         con.close()
     return ["Todos", "Abiertos", "Cerrados"], estados, almacenes, tipos
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_rango_fechas() -> tuple[str | None, str | None]:
+    """Primera y última fecha con pedidos — para acotar el selector de rango."""
+    con = _conn()
+    try:
+        row = con.execute(
+            "SELECT MIN(fecha), MAX(fecha) FROM pedidos WHERE fecha IS NOT NULL AND fecha != ''"
+        ).fetchone()
+    finally:
+        con.close()
+    return (row[0], row[1]) if row else (None, None)
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_pedidos_consolidado(
+    fecha_desde: str,
+    fecha_hasta: str,
+    estado_pedido: str,
+    almacenes: tuple[str, ...],
+    solo_previos_picking: bool,
+    limite: int,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Tabla consolidada de líneas de pedido, una fila por línea (DEC-045).
+
+    El `LEFT JOIN` contra `catalogo_productos` aporta el ID del producto,
+    que `lineas_pedido` no tiene. Es LEFT y no INNER a propósito: el 4,1%
+    de líneas sin ID en el catálogo (códigos legados o pares ambiguos)
+    debe seguir viéndose, con el ID vacío, en vez de desaparecer de un
+    consolidado que el analista va a sumar. Y la tabla puente guarda solo
+    pares inequívocos, así que el join **no puede multiplicar filas** —
+    verificado: 840.179 líneas antes y después.
+
+    Args:
+        fecha_desde: Fecha inicial inclusive (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive (YYYY-MM-DD).
+        estado_pedido: "Todos", "Abiertos" o "Cerrados" — clasifica el
+            pedido padre según tenga o no algún subpedido abierto.
+        almacenes: Almacenes a incluir; vacío = todos.
+        solo_previos_picking: Si True, deja solo subpedidos cuyo
+            alistamiento físico no terminó (`inicio_inspeccion = '-'`,
+            DEC-039 pregunta 5 corregida por HAL-013) — la misma
+            definición que usa el cruce de inventario.
+        limite: Máximo de filas a traer. Los agregados se calculan en SQL
+            sobre el conjunto completo, no sobre el recorte: mezclar un
+            total con métricas derivadas de la muestra daría cifras que
+            parecen del rango pedido pero son de las primeras N filas.
+
+    Returns:
+        `(DataFrame recortado, agregados del conjunto completo)`. Los
+        agregados traen `lineas`, `pedidos`, `referencias`, `cantidad` y
+        `sin_id`.
+    """
+    filtros = ["p.fecha BETWEEN ? AND ?"]
+    params: list[object] = [fecha_desde, fecha_hasta]
+
+    if estado_pedido == "Abiertos":
+        filtros.append(
+            f"EXISTS (SELECT 1 FROM subpedidos s2 WHERE s2.id_pedido = p.id_pedido "
+            f"AND LOWER(s2.estado) NOT IN ({_cerr}))"
+        )
+    elif estado_pedido == "Cerrados":
+        filtros.append(
+            f"NOT EXISTS (SELECT 1 FROM subpedidos s2 WHERE s2.id_pedido = p.id_pedido "
+            f"AND LOWER(s2.estado) NOT IN ({_cerr}))"
+        )
+
+    if almacenes:
+        filtros.append(f"l.almacen IN ({','.join('?' * len(almacenes))})")
+        params.extend(almacenes)
+
+    if solo_previos_picking:
+        filtros.append(f"LOWER(s.estado) IN ({_activos_inv}) AND s.inicio_inspeccion = '-'")
+
+    where = " AND ".join(filtros)
+    base = f"""
+        FROM lineas_pedido l
+        JOIN pedidos p    ON p.id_pedido = l.id_pedido
+        JOIN subpedidos s ON s.id_pedido = l.id_pedido
+                         AND s.numero_subpedido = l.numero_subpedido
+        LEFT JOIN catalogo_productos c
+               ON c.referencia    = TRIM(l.referencia)
+              AND c.codigo_barras = TRIM(l.codigo_barras)
+        WHERE {where}
+    """
+
+    con = _conn()
+    try:
+        fila = con.execute(
+            f"""SELECT COUNT(*),
+                       COUNT(DISTINCT p.id_pedido),
+                       COUNT(DISTINCT l.referencia),
+                       COALESCE(SUM(l.cantidad_comprada), 0),
+                       SUM(CASE WHEN c.id_producto IS NULL THEN 1 ELSE 0 END)
+                {base}""",
+            params,
+        ).fetchone()
+        agregados = {
+            "lineas": int(fila[0]),
+            "pedidos": int(fila[1]),
+            "referencias": int(fila[2]),
+            "cantidad": float(fila[3]),
+            "sin_id": int(fila[4]),
+        }
+        df = pd.read_sql(
+            f"""
+            SELECT p.fecha              AS "Fecha del pedido",
+                   p.hora               AS "Hora",
+                   p.id_pedido          AS "Pedido padre",
+                   s.numero_subpedido   AS "Número de subpedido",
+                   s.tipo_subpedido     AS "Tipo de subpedido",
+                   s.estado             AS "Estado del subpedido",
+                   l.almacen            AS "Almacén",
+                   c.id_producto        AS "ID del producto",
+                   l.referencia         AS "Referencia",
+                   l.codigo_barras      AS "Código de barras",
+                   l.presentacion       AS "Presentación",
+                   l.cantidad_comprada  AS "Cantidad comprada"
+            {base}
+            ORDER BY p.fecha DESC, p.hora DESC, p.id_pedido, s.numero_subpedido
+            LIMIT ?
+            """,
+            con,
+            params=[*params, limite],
+        )
+    finally:
+        con.close()
+    return df, agregados
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)

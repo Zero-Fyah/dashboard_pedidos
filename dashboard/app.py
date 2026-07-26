@@ -55,7 +55,7 @@ pg = st.navigation(
         "Pedidos": [
             st.Page(
                 "pages/pedidos.py",
-                title="Vista operacional",
+                title="Consolidado",
                 icon=":material/local_shipping:",
             ),
         ],

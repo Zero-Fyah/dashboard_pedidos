@@ -372,3 +372,109 @@ def test_vendido_no_alistado_descarta_referencias_vacias(db):
     )
     df = calcular_vendido_no_alistado(db)
     assert list(df["referencia"]) == ["PA01"]
+
+
+# ─────────────────────────────────────────────
+# catalogo_productos — el puente producto↔pedido (DEC-045)
+# ─────────────────────────────────────────────
+
+
+def _admin_catalogo(filas):
+    """filas: (id_especificacion, id_producto_admin, referencia, codigo_barras, nombre)."""
+    return pd.DataFrame(
+        filas,
+        columns=[
+            "id_especificacion",
+            "id_producto_admin",
+            "referencia",
+            "codigo_barras",
+            "nombre_comercial",
+        ],
+    )
+
+
+def test_catalogo_conserva_pares_inequivocos():
+    from inventario.persistencia import construir_catalogo_productos
+
+    admin = _admin_catalogo(
+        [
+            ("E1", "P1", "PJ91", "7700001", "Peluche"),
+            ("E2", "P1", "PJ91", "7700002", "Peluche"),
+        ]
+    )
+    puente = construir_catalogo_productos(admin)
+    assert len(puente) == 2
+    assert set(puente["id_producto"]) == {"P1"}
+
+
+def test_catalogo_colapsa_variantes_del_mismo_par():
+    """Dos especificaciones bajo el mismo (ref, codigo) y mismo producto: una fila."""
+    from inventario.persistencia import construir_catalogo_productos
+
+    admin = _admin_catalogo(
+        [
+            ("E1", "P1", "PR13", "7700001", "Arena"),
+            ("E2", "P1", "PR13", "7700001", "Arena"),
+        ]
+    )
+    puente = construir_catalogo_productos(admin)
+    assert len(puente) == 1, "un par no puede aparecer dos veces: duplicaría la línea"
+
+
+def test_catalogo_descarta_pares_ambiguos():
+    """El caso que corrompería Cantidad comprada: un par con dos id_producto."""
+    from inventario.persistencia import construir_catalogo_productos
+
+    admin = _admin_catalogo(
+        [
+            ("E1", "P1", "ARENA TONELADA", "7700001", "Arena"),
+            ("E2", "P2", "ARENA TONELADA", "7700001", "Arena"),  # mismo par, otro producto
+            ("E3", "P3", "PJ91", "7700009", "Peluche"),
+        ]
+    )
+    puente = construir_catalogo_productos(admin)
+    assert list(puente["referencia"]) == ["PJ91"], "el par ambiguo debe quedar fuera"
+
+
+def test_catalogo_es_llave_unica_por_par(db):
+    """La PK (referencia, codigo_barras) es la garantía de que el join no multiplica."""
+    from inventario.persistencia import construir_catalogo_productos
+
+    admin = _admin_catalogo(
+        [
+            ("E1", "P1", "PJ91", "7700001", "Peluche"),
+            ("E2", "P1", "PJ91", "7700001", "Peluche"),
+        ]
+    )
+    persistir(
+        _comparacion(),
+        _anomalias(),
+        _FRESCURA_OK,
+        db_path=db,
+        catalogo=construir_catalogo_productos(admin),
+    )
+    con = sqlite3.connect(db)
+    filas = con.execute("SELECT COUNT(*) FROM catalogo_productos").fetchone()[0]
+    pares = con.execute(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT referencia, codigo_barras FROM catalogo_productos)"
+    ).fetchone()[0]
+    con.close()
+    assert filas == pares == 1
+
+
+def test_persistir_sin_catalogo_no_borra_el_puente(db):
+    """Si el cruce de inventario falla, la vista de Pedidos no debe quedarse sin IDs."""
+    from inventario.persistencia import construir_catalogo_productos
+
+    admin = _admin_catalogo([("E1", "P1", "PJ91", "7700001", "Peluche")])
+    persistir(
+        _comparacion(),
+        _anomalias(),
+        _FRESCURA_OK,
+        db_path=db,
+        catalogo=construir_catalogo_productos(admin),
+    )
+    persistir(_comparacion(), _anomalias(), _FRESCURA_OK, db_path=db)  # sin catalogo
+    con = sqlite3.connect(db)
+    assert con.execute("SELECT COUNT(*) FROM catalogo_productos").fetchone()[0] == 1
+    con.close()
