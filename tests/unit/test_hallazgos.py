@@ -20,6 +20,7 @@ from inventario.hallazgos import (
     especificacion_discrepante,
     estados_sin_clasificar,
     lineas_sin_id_producto,
+    personal_duplicado,
     referencias_con_espacios,
 )
 
@@ -207,3 +208,90 @@ def test_un_detector_roto_no_tumba_a_los_demas(con, caplog):
         hallazgos = detectar_todos(admin, con)
     assert any(h.clave == "estados_sin_clasificar" for h in hallazgos)
     assert "un detector falló" in caplog.text
+
+
+# ─────────────────────────────────────────────
+# personal_duplicado (DEC-056)
+# ─────────────────────────────────────────────
+
+
+def _con_personal(alistadores: list[tuple[str, str]]) -> sqlite3.Connection:
+    """Conexión en memoria con subpedidos/registro_operaciones mínimos."""
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE subpedidos (id_pedido TEXT, alistador TEXT, inspector TEXT)")
+    con.execute("CREATE TABLE registro_operaciones (usuario TEXT, tipo_usuario TEXT)")
+    con.executemany(
+        "INSERT INTO subpedidos (id_pedido, alistador, inspector) VALUES (?, ?, '-')",
+        alistadores,
+    )
+    return con
+
+
+def test_personal_duplicado_detecta_letra_faltante():
+    """Una letra de diferencia en el apellido es el caso real que motivó DEC-056."""
+    con = _con_personal(
+        [("1", "LIZETH CAROLINA HERNADEZ"), ("2", "LIZETH CAROLINA HERNANDEZ MUÑOZ")]
+    )
+    hallazgo = personal_duplicado(con)
+
+    assert hallazgo.cantidad == 1  # una persona, no dos variantes
+    assert len(hallazgo.filas) == 2
+    assert set(hallazgo.filas["Grupo"]) == {1}
+
+
+def test_personal_duplicado_agrupa_nombre_truncado():
+    """`PASTOR YESID` contra el nombre completo da similitud 0,60: lo salva el prefijo."""
+    con = _con_personal([("1", "PASTOR YESID RODRIGUEZ NIETO"), ("2", "PASTOR YESID")])
+    hallazgo = personal_duplicado(con)
+
+    assert hallazgo.cantidad == 1
+
+
+def test_personal_duplicado_ignora_cuentas_genericas():
+    """`temporal5`/`temporal6` dan similitud 0,89 y son cuentas distintas.
+
+    Es el falso positivo que motivó el mínimo de dos tokens: un nombre de
+    persona tiene nombre y apellido; una cuenta genérica, no.
+    """
+    con = _con_personal([("1", "temporal5"), ("2", "temporal6")])
+
+    assert personal_duplicado(con).cantidad == 0
+
+
+def test_personal_duplicado_no_marca_personas_distintas():
+    """Dos personas sin parecido no se agrupan — el detector debe callar."""
+    con = _con_personal([("1", "MARIA FERNANDA GOMEZ"), ("2", "CARLOS ANDRES PEREZ")])
+
+    assert personal_duplicado(con).cantidad == 0
+
+
+def test_personal_duplicado_agrupa_tres_variantes_como_un_caso():
+    """Tres grafías de una persona son un caso, no tres pares."""
+    con = _con_personal(
+        [
+            ("1", "WILFRIDO ACEVEDO FLOREZ"),
+            ("2", "WILFRIDO ACEVEDO FLORES"),
+            ("3", "WILFRIDO ACEVEDO FLORES GOMEZ"),
+        ]
+    )
+    hallazgo = personal_duplicado(con)
+
+    assert hallazgo.cantidad == 1
+    assert len(hallazgo.filas) == 3
+
+
+def test_personal_duplicado_separa_alistadores_multivaluados():
+    """El alistador viene separado por comas: cada persona cuenta aparte."""
+    con = _con_personal([("1", "ANA MARIA SOTO, LUIS FELIPE RUIZ"), ("2", "ANA MARIA SOTOS")])
+    hallazgo = personal_duplicado(con)
+
+    assert hallazgo.cantidad == 1
+    # LUIS FELIPE RUIZ no se parece a nadie y queda fuera del detalle.
+    assert "LUIS FELIPE RUIZ" not in set(hallazgo.filas["Nombre como figura"])
+
+
+def test_personal_duplicado_ignora_placeholder():
+    """El guion es el placeholder de 'sin asignar', no una persona."""
+    con = _con_personal([("1", "-"), ("2", "-")])
+
+    assert personal_duplicado(con).cantidad == 0

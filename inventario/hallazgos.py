@@ -14,9 +14,12 @@ Los detectores son funciones puras sobre DataFrames y una conexión de
 lectura: no escriben nada. La persistencia vive en `persistencia.py`.
 """
 
+import itertools
 import logging
 import re
 import sqlite3
+import unicodedata
+from difflib import SequenceMatcher
 
 import pandas as pd
 
@@ -295,6 +298,132 @@ def lineas_sin_id_producto(con: sqlite3.Connection) -> Hallazgo:
     )
 
 
+# ─────────────────────────────────────────────
+# Identidades de personal duplicadas (DEC-056)
+# ─────────────────────────────────────────────
+
+# Umbral de similitud entre nombres normalizados. Medido sobre los 79
+# nombres reales: a 0,85 la regla separa limpiamente los duplicados
+# (la más baja aceptada es 0,86) del resto (la más alta rechazada, 0,84).
+_SIMILITUD_MINIMA = 0.85
+
+# Un nombre de persona tiene al menos nombre y apellido. Exigir dos tokens
+# descarta las cuentas genéricas de un solo token, que es donde la
+# similitud se equivoca: `temporal5` y `temporal6` dan 0,89 y son cuentas
+# distintas, no una errata.
+_TOKENS_MINIMOS = 2
+
+
+def _norm_persona(nombre: str) -> str:
+    """Normaliza un nombre de persona para compararlo: sin tildes, mayúsculas."""
+    texto = unicodedata.normalize("NFKD", nombre).encode("ascii", "ignore").decode()
+    return " ".join(texto.upper().split())
+
+
+def _es_prefijo(tokens_a: list[str], tokens_b: list[str]) -> bool:
+    """True si un nombre es el comienzo literal del otro (nombre truncado)."""
+    corto, largo = sorted((tokens_a, tokens_b), key=len)
+    return len(corto) >= _TOKENS_MINIMOS and largo[: len(corto)] == corto
+
+
+def personal_duplicado(con: sqlite3.Connection) -> Hallazgo:
+    """Personas que figuran con más de una grafía en el maestro de personal.
+
+    Si la misma persona aparece escrita de dos formas, su carga de trabajo
+    queda partida en dos identidades y el conteo de alistadores por día
+    sale inflado — justo los indicadores de DEC-055.
+
+    Dos nombres se agrupan cuando su similitud supera `_SIMILITUD_MINIMA`
+    **o** cuando uno es el comienzo literal del otro (nombre truncado, que
+    puede dar similitud baja: `PASTOR YESID` contra `PASTOR YESID
+    RODRIGUEZ NIETO` da 0,60 y es obviamente la misma persona).
+
+    Las variantes se unen en **grupos**, no en pares: si una persona
+    aparece con tres grafías, es un caso, no tres.
+    """
+    apariciones: dict[str, int] = {}
+
+    def sumar(nombre: object, n: int) -> None:
+        texto = str(nombre or "").strip()
+        if texto and texto != "-":
+            apariciones[texto] = apariciones.get(texto, 0) + n
+
+    # El alistador es multivaluado: un subpedido puede listar varias
+    # personas separadas por coma (DEC-055: el picking se reparte por familia).
+    for columna in ("alistador", "inspector"):
+        for valor, n in con.execute(
+            f"SELECT {columna}, COUNT(*) FROM subpedidos "  # noqa: S608 — nombre de columna literal
+            f"WHERE {columna} IS NOT NULL GROUP BY 1"
+        ):
+            for parte in str(valor).split(","):
+                sumar(parte, n)
+    for valor, n in con.execute(
+        "SELECT usuario, COUNT(*) FROM registro_operaciones "
+        "WHERE tipo_usuario = 'staff' AND usuario IS NOT NULL GROUP BY 1"
+    ):
+        sumar(valor, n)
+
+    candidatos = [
+        (nombre, _norm_persona(nombre).split())
+        for nombre in apariciones
+        if len(_norm_persona(nombre).split()) >= _TOKENS_MINIMOS
+    ]
+
+    # Union-find sobre los nombres: agrupa transitivamente las variantes.
+    padre = {nombre: nombre for nombre, _ in candidatos}
+
+    def raiz(nombre: str) -> str:
+        while padre[nombre] != nombre:
+            padre[nombre] = padre[padre[nombre]]
+            nombre = padre[nombre]
+        return nombre
+
+    similitudes: dict[str, float] = {}
+    for (n_a, t_a), (n_b, t_b) in itertools.combinations(candidatos, 2):
+        similitud = SequenceMatcher(None, " ".join(t_a), " ".join(t_b)).ratio()
+        if similitud >= _SIMILITUD_MINIMA or _es_prefijo(t_a, t_b):
+            padre[raiz(n_a)] = raiz(n_b)
+            for nombre in (n_a, n_b):
+                similitudes[nombre] = max(similitudes.get(nombre, 0.0), similitud)
+
+    grupos: dict[str, list[str]] = {}
+    for nombre in similitudes:
+        grupos.setdefault(raiz(nombre), []).append(nombre)
+
+    registros = [
+        {
+            "Grupo": indice,
+            "Nombre como figura": nombre,
+            "Apariciones": apariciones[nombre],
+            "Similitud": round(similitudes[nombre], 2),
+        }
+        for indice, variantes in enumerate(
+            sorted(grupos.values(), key=lambda v: -sum(apariciones[n] for n in v)), start=1
+        )
+        for nombre in sorted(variantes, key=lambda n: -apariciones[n])
+    ]
+    filas = pd.DataFrame(
+        registros, columns=["Grupo", "Nombre como figura", "Apariciones", "Similitud"]
+    )
+    return Hallazgo(
+        clave="personal_duplicado",
+        titulo="Personas con más de una grafía en el maestro",
+        explicacion=(
+            "La misma persona figura escrita de varias formas (una letra de "
+            "diferencia, una tilde, un apellido de más o de menos). Su carga de "
+            "trabajo queda partida entre dos identidades y el conteo de "
+            "alistadores por día sale inflado. Hay que unificar la grafía en el "
+            "maestro de personal del sistema administrativo."
+        ),
+        categoria="Personal",
+        prioridad="Media",
+        origen="DEC-056",
+        unidad="personas",
+        cantidad=len(grupos),  # identidades reales, no variantes ni pares
+        filas=filas,
+    )
+
+
 def detectar_todos(df_admin: pd.DataFrame, con: sqlite3.Connection) -> list[Hallazgo]:
     """Corre todos los detectores y devuelve solo los que encontraron algo.
 
@@ -319,6 +448,7 @@ def detectar_todos(df_admin: pd.DataFrame, con: sqlite3.Connection) -> list[Hall
         lambda: especificacion_discrepante(df_admin, con),
         lambda: estados_sin_clasificar(con),
         lambda: lineas_sin_id_producto(con),
+        lambda: personal_duplicado(con),
     ]
 
     encontrados: list[Hallazgo] = []

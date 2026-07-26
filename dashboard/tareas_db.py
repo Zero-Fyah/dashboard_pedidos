@@ -30,6 +30,7 @@ CATEGORIAS = [
     "Estados",
     "Ubicaciones",
     "Montos y placeholders",
+    "Personal",
     "Otro",
 ]
 
