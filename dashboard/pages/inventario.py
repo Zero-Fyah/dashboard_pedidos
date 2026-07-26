@@ -5,15 +5,17 @@ Consume las tres VIEWs que `inventario/persistencia.py` escribe en cada
 corrida del scheduler (DEC-043). No lee Excel ni recalcula nada: el cruce
 completo cuesta 14,19 s y acá la consulta son milisegundos.
 
-La lectura de negocio, cerrada en DEC-041:
+La lectura de negocio (DEC-041, reencuadrada en DEC-051):
 
     inventario_teorico = disponible_venta + vendido_no_alistado
-    picking_estimado   = inventario_teorico − bochica_altura
-    diferencia         = bochica_picking − picking_estimado
+    diferencia         = bochica_total − inventario_teorico
+    sobrante_altura    = bochica_altura − inventario_teorico
 
-`altura` es la fuente confiable; `picking` es la incógnita, porque el
-sistema de bodega nunca descuenta sus movimientos. Por eso el estimado se
-calcula restando altura al teórico, en vez de creerle a picking.
+`sobrante_altura` positivo es el hallazgo accionable: si solo la altura ya
+supera al teórico, hay sobrante físico sin necesidad de mirar picking.
+Altura es la zona que el sistema de bodega sí registra bien, así que su
+sesgo conocido no sirve de excusa. Sirve para validar que los movimientos
+de montacarga se hayan registrado.
 """
 
 import sqlite3
@@ -71,32 +73,52 @@ if corrida["datos_desactualizados"]:
 # ── Magnitudes ─────────────────────────────────────────────────────────────────
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Inventario teórico", f"{df['inventario_teorico'].sum():,.0f}")
-k2.metric("Bochica — altura", f"{df['bochica_altura'].sum():,.0f}", help="Fuente confiable.")
+k2.metric(
+    "Bochica — total",
+    f"{df['bochica_total'].sum():,.0f}",
+    help="Altura + picking, tal como lo reporta el sistema de bodega.",
+)
 k3.metric(
-    "Bochica — picking",
-    f"{df['bochica_picking'].sum():,.0f}",
-    help="Inflado por diseño: el sistema de bodega no descuenta los movimientos de picking.",
+    "Diferencia",
+    f"{df['diferencia'].sum():,.0f}",
+    help="Bochica total − teórico. Positiva es sobrante, negativa faltante.",
 )
 k4.metric("Referencias", f"{len(df):,}")
 
-# ── El hallazgo, presentado como tal ───────────────────────────────────────────
-negativos = df[df["picking_estimado"] < 0]
-total_estimado = df["picking_estimado"].sum()
+d1, d2, d3 = st.columns(3)
+d1.metric(
+    "Altura (confiable)",
+    f"{df['bochica_altura'].sum():,.0f}",
+    help="Zona que el sistema de bodega registra bien.",
+)
+d2.metric(
+    "Picking (inflado)",
+    f"{df['bochica_picking'].sum():,.0f}",
+    help="El sistema de bodega no descuenta los movimientos de picking, así que sobreestima.",
+)
+d3.metric(
+    "Paso de montacarga",
+    f"{df['bochica_paso'].sum():,.0f}",
+    help="No es posición de almacenamiento: queda fuera de la fórmula.",
+)
 
-if len(negativos):
+# ── Sobrante físico confirmado ─────────────────────────────────────────────────
+sobrantes = df[df["sobrante_altura"] > 0]
+
+if len(sobrantes):
     st.error(
-        f"**Hallazgo sin explicar — {len(negativos):,} referencias con picking estimado "
-        f"negativo ({negativos['picking_estimado'].sum():,.0f} unidades).**  \n"
-        "En estas referencias el inventario de altura, que es la fuente confiable, ya "
-        "supera al teórico sin contar picking. El sesgo conocido de picking no lo "
-        "explica. Hipótesis sin verificar: el sistema administrativo no publica como "
-        "disponible mercancía que sí está en altura (reservas, tránsito, inactivos), o "
-        "el conteo de altura arrastra error en las posiciones de estiba completa.",
-        icon="🔍",
+        f"**Sobrante físico confirmado — {len(sobrantes):,} referencias, "
+        f"{sobrantes['sobrante_altura'].sum():,.0f} unidades.**  \n"
+        "En estas referencias el inventario de las ubicaciones de **altura** ya supera "
+        "al teórico, **sin siquiera contar lo que haya en picking**. Como altura es la "
+        "zona que el sistema de bodega sí registra bien, el sobrante es real y no un "
+        "efecto del sesgo de picking.",
+        icon="📦",
     )
-    st.caption(
-        f"Agregado del estimado: {total_estimado:,.0f} unidades. **No es una métrica "
-        "cerrada** — es la pregunta que esta vista existe para investigar."
+    st.markdown(
+        "**Qué revisar:** apunta a movimientos de montacarga ejecutados físicamente "
+        "pero no registrados en el sistema — al almacenar mercancía que entra, o al "
+        "reabastecer las ubicaciones de picking desde altura."
     )
 
 st.divider()
@@ -164,8 +186,8 @@ fig.update_yaxes(
 st.plotly_chart(fig, config={"displayModeBar": False})
 
 st.caption(
-    "Donde la barra de altura supera a la del teórico, la referencia entra en el "
-    "hallazgo de arriba. Los mismos datos están en la tabla siguiente."
+    "Donde la barra de altura supera a la del teórico, la familia acumula sobrante "
+    "físico confirmado. Los mismos datos están en la tabla siguiente."
 )
 
 st.divider()
@@ -182,8 +204,8 @@ with f2:
 with f3:
     st.write("")
     solo_neg = st.checkbox(
-        "Solo picking estimado negativo",
-        help="Las referencias del hallazgo: altura supera al teórico.",
+        "Solo con sobrante en altura",
+        help="Referencias donde la altura ya supera al teórico: sobrante físico confirmado.",
     )
 
 vista = df.copy()
@@ -194,14 +216,14 @@ if averias_sel == "Solo averías":
 elif averias_sel == "Sin averías":
     vista = vista[vista["es_averia"] != 1]
 if solo_neg:
-    vista = vista[vista["picking_estimado"] < 0]
+    vista = vista[vista["sobrante_altura"] > 0]
 
 if vista.empty:
     st.info("Sin referencias para los filtros seleccionados.")
 else:
-    st.caption(f"{len(vista):,} referencias · ordenadas por picking estimado ascendente.")
+    st.caption(f"{len(vista):,} referencias · ordenadas por sobrante en altura descendente.")
     st.dataframe(
-        vista.sort_values("picking_estimado")[
+        vista.sort_values("sobrante_altura", ascending=False)[
             [
                 "referencia",
                 "familia",
@@ -211,8 +233,9 @@ else:
                 "inventario_teorico",
                 "bochica_altura",
                 "bochica_picking",
-                "picking_estimado",
+                "bochica_total",
                 "diferencia",
+                "sobrante_altura",
             ]
         ],
         hide_index=True,
@@ -227,8 +250,9 @@ else:
             "inventario_teorico": st.column_config.NumberColumn("Teórico", format="%.0f"),
             "bochica_altura": st.column_config.NumberColumn("Altura", format="%.0f"),
             "bochica_picking": st.column_config.NumberColumn("Picking", format="%.0f"),
-            "picking_estimado": st.column_config.NumberColumn("Picking estimado", format="%.0f"),
+            "bochica_total": st.column_config.NumberColumn("Bochica total", format="%.0f"),
             "diferencia": st.column_config.NumberColumn("Diferencia", format="%.0f"),
+            "sobrante_altura": st.column_config.NumberColumn("Sobrante en altura", format="%.0f"),
         },
     )
     st.download_button(

@@ -26,26 +26,50 @@ from inventario.persistencia import (
 pytestmark = pytest.mark.integration
 
 
+# Columnas del resultado de `comparar()` (DEC-041, ampliado en DEC-051).
+_COLS_COMPARACION = [
+    "referencia",
+    "familia",
+    "es_averia",
+    "disponible_venta",
+    "vendido_no_alistado",
+    "inventario_teorico",
+    "bochica_altura",
+    "bochica_picking",
+    "bochica_paso",
+    "bochica_total",
+    "diferencia",
+    "sobrante_altura",
+    "picking_estimado",
+]
+
+
 def _comparacion(filas=None):
+    """Filas coherentes con la fórmula: total = altura + picking,
+    diferencia = total − teórico, sobrante = altura − teórico."""
     return pd.DataFrame(
         filas
         or [
-            ("PA01", "PA", False, 150.0, 10.0, 160.0, 30.0, 60.0, 11.0, 130.0, -70.0),
-            ("PJ91", "PJ", False, 200.0, 25.0, 225.0, 90.0, 300.0, 0.0, 135.0, 165.0),
+            # teórico 160 · altura 30 · picking 60 → total 90, dif −70, sobrante −130
+            ("PA01", "PA", False, 150.0, 10.0, 160.0, 30.0, 60.0, 11.0, 90.0, -70.0, -130.0, 130.0),
+            # teórico 225 · altura 90 · picking 300 → total 390, dif 165, sobrante −135
+            (
+                "PJ91",
+                "PJ",
+                False,
+                200.0,
+                25.0,
+                225.0,
+                90.0,
+                300.0,
+                0.0,
+                390.0,
+                165.0,
+                -135.0,
+                135.0,
+            ),
         ],
-        columns=[
-            "referencia",
-            "familia",
-            "es_averia",
-            "disponible_venta",
-            "vendido_no_alistado",
-            "inventario_teorico",
-            "bochica_altura",
-            "bochica_picking",
-            "bochica_paso",
-            "picking_estimado",
-            "diferencia",
-        ],
+        columns=_COLS_COMPARACION,
     )
 
 
@@ -100,19 +124,9 @@ def test_las_views_exponen_lo_que_consume_el_dashboard(db):
     persistir(_comparacion(), _anomalias(), _FRESCURA_OK, db_path=db)
     con = sqlite3.connect(db)
     df = pd.read_sql("SELECT * FROM v_inventario_comparacion", con)
-    assert set(df.columns) == {
-        "referencia",
-        "familia",
-        "es_averia",
-        "disponible_venta",
-        "vendido_no_alistado",
-        "inventario_teorico",
-        "bochica_altura",
-        "bochica_picking",
-        "bochica_paso",
-        "picking_estimado",
-        "diferencia",
-    }
+    # La VIEW es el contrato con el dashboard: si cambia una columna, este
+    # test lo dice antes que la página.
+    assert set(df.columns) == set(_COLS_COMPARACION)
     assert len(df) == 2
     con.close()
 
@@ -125,7 +139,9 @@ def test_las_views_exponen_lo_que_consume_el_dashboard(db):
 def test_persistir_reemplaza_el_snapshot_anterior(db):
     """DEC-043: comparacion/anomalias guardan solo la última corrida."""
     persistir(_comparacion(), _anomalias(), _FRESCURA_OK, db_path=db)
-    nueva = _comparacion([("PC10", "PC", False, 5.0, 0.0, 5.0, 1.0, 2.0, 0.0, 4.0, -2.0)])
+    nueva = _comparacion(
+        [("PC10", "PC", False, 5.0, 0.0, 5.0, 1.0, 2.0, 0.0, 3.0, -2.0, -4.0, 4.0)]
+    )
     persistir(nueva, _anomalias(), _FRESCURA_OK, db_path=db)
 
     con = sqlite3.connect(db)
@@ -161,7 +177,7 @@ def test_agregados_de_la_corrida_son_correctos(db):
 def test_referencias_negativas_se_cuentan(db):
     """picking_estimado negativo es el hallazgo que la vista debe destacar."""
     con_negativo = _comparacion(
-        [("PR11A", "PR", False, 100.0, 0.0, 100.0, 372.0, 5.0, 0.0, -272.0, 277.0)]
+        [("PR11A", "PR", False, 100.0, 0.0, 100.0, 372.0, 5.0, 0.0, 377.0, 277.0, 272.0, -272.0)]
     )
     corrida_id = persistir(con_negativo, _anomalias(), _FRESCURA_OK, db_path=db)
     con = sqlite3.connect(db)

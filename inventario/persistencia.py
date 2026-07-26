@@ -68,8 +68,10 @@ _TABLAS = {
             bochica_altura      REAL,
             bochica_picking     REAL,
             bochica_paso        REAL,
-            picking_estimado    REAL,
+            bochica_total       REAL,
             diferencia          REAL,
+            sobrante_altura     REAL,
+            picking_estimado    REAL,
             corrida_id          INTEGER
         )
     """,
@@ -147,8 +149,8 @@ _VIEWS = {
     "v_inventario_comparacion": """
         SELECT referencia, familia, es_averia,
                disponible_venta, vendido_no_alistado, inventario_teorico,
-               bochica_altura, bochica_picking, bochica_paso,
-               picking_estimado, diferencia
+               bochica_altura, bochica_picking, bochica_paso, bochica_total,
+               diferencia, sobrante_altura, picking_estimado
         FROM inventario_comparacion
     """,
     "v_inventario_salud": """
@@ -188,8 +190,10 @@ _COLUMNAS_COMPARACION = (
     "bochica_altura",
     "bochica_picking",
     "bochica_paso",
-    "picking_estimado",
+    "bochica_total",
     "diferencia",
+    "sobrante_altura",
+    "picking_estimado",
 )
 
 _COLUMNAS_ANOMALIAS = ("motivo", "ubicacion", "id_especificacion", "cantidad")
@@ -288,7 +292,43 @@ def init_schema(con: sqlite3.Connection) -> None:
     """
     for sql in _TABLAS.values():
         con.execute(sql)
+    _migrar_columnas(con)
     _crear_views(con)
+
+
+def _migrar_columnas(con: sqlite3.Connection) -> None:
+    """Agrega las columnas que falten en tablas que ya existían.
+
+    `CREATE TABLE IF NOT EXISTS` no toca una tabla ya creada, así que sumar
+    una columna al esquema no llega a las bases existentes y el INSERT
+    falla con "has no column named ...". Mismo patrón forward-compatible
+    que usa `scraper/db.py` (AUD-B8): se comparan las columnas declaradas
+    contra las reales y se agregan las que faltan.
+
+    Es seguro en estas tablas porque todas son snapshots que se reescriben
+    enteros en cada corrida: una columna nueva queda en NULL hasta el
+    siguiente `persistir()`, que es inmediato.
+    """
+    for tabla, ddl in _TABLAS.items():
+        existentes = {fila[1] for fila in con.execute(f"PRAGMA table_info({tabla})")}
+        if not existentes:
+            continue
+        for declarada, tipo in _columnas_declaradas(ddl):
+            if declarada not in existentes:
+                con.execute(f"ALTER TABLE {tabla} ADD COLUMN {declarada} {tipo}")
+                logger.info("_migrar_columnas: %s.%s agregada", tabla, declarada)
+
+
+def _columnas_declaradas(ddl: str) -> list[tuple[str, str]]:
+    """Extrae (nombre, tipo) del cuerpo de un CREATE TABLE del módulo."""
+    cuerpo = ddl[ddl.index("(") + 1 : ddl.rindex(")")]
+    columnas = []
+    for linea in cuerpo.splitlines():
+        partes = linea.strip().rstrip(",").split()
+        # Se saltan las restricciones de tabla (PRIMARY KEY (...), etc.).
+        if len(partes) >= 2 and partes[0].isidentifier() and partes[0].upper() != "PRIMARY":
+            columnas.append((partes[0], partes[1]))
+    return columnas
 
 
 def _crear_views(con: sqlite3.Connection) -> None:

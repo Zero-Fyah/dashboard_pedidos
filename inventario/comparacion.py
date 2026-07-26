@@ -10,12 +10,17 @@ La fórmula se invierte respecto al piloto naive que este módulo
 reemplaza: **altura es el dato confiable y picking la incógnita**.
 
     inventario_teorico = disponible_venta + vendido_no_alistado
-    picking_estimado   = inventario_teorico − bochica_altura
-    diferencia         = bochica_picking − picking_estimado
+    diferencia         = bochica_total − inventario_teorico
+    sobrante_altura    = bochica_altura − inventario_teorico
 
-`picking_estimado` negativo es la alerta real y el principal valor de
-negocio de la vista: el teórico no alcanza a cubrir ni lo que hay en
-altura, un faltante que el sesgo conocido de picking no explica.
+**`sobrante_altura` positivo es el hallazgo accionable** (DEC-051): si solo
+la altura ya supera al teórico, hay más mercancía física de la que debería
+haber, sin necesidad de mirar picking. Altura es la zona que el sistema de
+bodega sí registra bien, así que su sesgo conocido no sirve de excusa.
+
+Lectura operativa: valida que los movimientos de montacarga se hayan
+registrado — tanto al almacenar mercancía que entra como al reabastecer
+picking. Un sobrante indica mercancía movida físicamente sin registrar.
 """
 
 import logging
@@ -112,7 +117,8 @@ def comparar(
         DataFrame por `referencia` con `familia`, `es_averia`,
         `disponible_venta`, `vendido_no_alistado`, `inventario_teorico`,
         `bochica_altura`, `bochica_picking`, `bochica_paso`,
-        `picking_estimado` e `diferencia`.
+        `bochica_total`, `diferencia`, `sobrante_altura` y
+        `picking_estimado`.
     """
     if "tipo" not in df_bochica_layout.columns:
         raise ValueError(
@@ -173,9 +179,25 @@ def comparar(
     comparado["inventario_teorico"] = (
         comparado["disponible_venta"] + comparado["vendido_no_alistado"]
     )
-    # Altura es el dato confiable; picking es la incógnita que se estima.
-    comparado["picking_estimado"] = comparado["inventario_teorico"] - comparado["bochica_altura"]
-    comparado["diferencia"] = comparado["bochica_picking"] - comparado["picking_estimado"]
+    comparado["bochica_total"] = comparado["bochica_altura"] + comparado["bochica_picking"]
+
+    # Diferencia = lo que la bodega reporta menos lo que debería existir.
+    # Positiva es sobrante; negativa, faltante. Incluye picking, así que
+    # arrastra el sesgo conocido de esa zona (el sistema de bodega nunca
+    # descuenta sus movimientos): no todo el sobrante global es real.
+    comparado["diferencia"] = comparado["bochica_total"] - comparado["inventario_teorico"]
+
+    # Sobrante CONFIRMADO: si solo la altura ya supera al teórico, hay más
+    # mercancía física de la que debería haber sin necesidad de mirar
+    # picking. Altura es la zona que el sistema de bodega sí registra bien,
+    # así que acá el sesgo de picking no sirve de excusa (DEC-051).
+    comparado["sobrante_altura"] = comparado["bochica_altura"] - comparado["inventario_teorico"]
+
+    # Lo que debería quedar en picking según el teórico. Solo es una
+    # estimación válida mientras sea ≥ 0: en negativo no significa "falta
+    # picking", significa que ya hay sobrante en altura — y eso se lee en
+    # `sobrante_altura`, que es la misma cifra con el signo correcto.
+    comparado["picking_estimado"] = -comparado["sobrante_altura"]
 
     columnas = [
         "referencia",
@@ -187,8 +209,10 @@ def comparar(
         "bochica_altura",
         "bochica_picking",
         "bochica_paso",
-        "picking_estimado",
+        "bochica_total",
         "diferencia",
+        "sobrante_altura",
+        "picking_estimado",
     ]
     return comparado[columnas].sort_values("referencia").reset_index(drop=True)
 
