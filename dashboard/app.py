@@ -96,6 +96,13 @@ paginas: dict[str, list[st.Page]] = {
             icon=":material/category:",
         ),
     ],
+    "Operación": [
+        st.Page(
+            "pages/operacion.py",
+            title="Tiempos y productividad",
+            icon=":material/schedule:",
+        ),
+    ],
     # A medida que el proyecto evolucione, se agregan aquí nuevas
     # secciones con sus páginas: basta con sumar un st.Page a este
     # diccionario, sin tocar el resto del archivo.

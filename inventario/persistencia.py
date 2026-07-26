@@ -123,6 +123,23 @@ _TABLAS = {
             PRIMARY KEY (nivel, clave)
         )
     """,
+    "operacion_ciclos": """
+        CREATE TABLE IF NOT EXISTS operacion_ciclos (
+            id_pedido        TEXT NOT NULL,
+            numero_subpedido TEXT NOT NULL,
+            dia              TEXT,
+            alistador        TEXT,
+            n_alistadores    INTEGER,
+            inspector        TEXT,
+            lineas           REAL,
+            unidades         REAL,
+            cola_y_picking_h REAL,
+            inspeccion_h     REAL,
+            ciclo_total_h    REAL,
+            corrida_id       INTEGER,
+            PRIMARY KEY (id_pedido, numero_subpedido)
+        )
+    """,
     "tareas_hallazgos": """
         CREATE TABLE IF NOT EXISTS tareas_hallazgos (
             clave       TEXT PRIMARY KEY,
@@ -170,6 +187,12 @@ _VIEWS = {
                celda, politica
         FROM inventario_abc
     """,
+    "v_operacion_ciclos": """
+        SELECT id_pedido, numero_subpedido, dia, alistador, n_alistadores,
+               inspector, lineas, unidades,
+               cola_y_picking_h, inspeccion_h, ciclo_total_h
+        FROM operacion_ciclos
+    """,
     "v_inventario_anomalias": """
         SELECT motivo, ubicacion, id_especificacion, cantidad
         FROM inventario_anomalias
@@ -205,6 +228,20 @@ _COLUMNAS_COMPARACION = (
 _COLUMNAS_ANOMALIAS = ("motivo", "ubicacion", "id_especificacion", "cantidad")
 
 _COLUMNAS_CATALOGO = ("referencia", "codigo_barras", "id_producto", "nombre_comercial")
+
+_COLUMNAS_OPERACION = (
+    "id_pedido",
+    "numero_subpedido",
+    "dia",
+    "alistador",
+    "n_alistadores",
+    "inspector",
+    "lineas",
+    "unidades",
+    "cola_y_picking_h",
+    "inspeccion_h",
+    "ciclo_total_h",
+)
 
 _COLUMNAS_ABC = (
     "nivel",
@@ -502,6 +539,7 @@ def persistir(
     hallazgos: list | None = None,
     salud: pd.DataFrame | None = None,
     abc: pd.DataFrame | None = None,
+    operacion: pd.DataFrame | None = None,
 ) -> int:
     """Escribe el snapshot de la corrida, reemplazando el anterior.
 
@@ -524,6 +562,8 @@ def persistir(
             Si es None, `inventario_salud` queda intacta.
         abc: Resultado de `inventario.clasificacion.calcular_clasificacion()`
             (DEC-050). Si es None, `inventario_abc` queda intacta.
+        operacion: Resultado de `inventario.operacion.calcular_operacion()`
+            (DEC-054). Si es None, `operacion_ciclos` queda intacta.
 
     Returns:
         El `id` de la corrida registrada en `inventario_corridas`.
@@ -626,6 +666,19 @@ def persistir(
                     ],
                 )
 
+            # DEC-054: tiempos de ciclo y carga por subpedido.
+            if operacion is not None:
+                con.execute("DELETE FROM operacion_ciclos")
+                con.executemany(
+                    f"INSERT INTO operacion_ciclos "
+                    f"({', '.join(_COLUMNAS_OPERACION)}, corrida_id) "
+                    f"VALUES ({', '.join('?' * len(_COLUMNAS_OPERACION))}, ?)",
+                    [
+                        (*_normalizar(fila), corrida_id)
+                        for fila in operacion[list(_COLUMNAS_OPERACION)].itertuples(index=False)
+                    ],
+                )
+
             # DEC-045: el puente producto↔pedido. Va en la misma transacción
             # para que el dashboard nunca lo vea a medio poblar.
             if catalogo is not None:
@@ -698,6 +751,7 @@ def main() -> int:
         solo_layout,
     )
     from inventario.normalizador import cargar_admin, cargar_bochica, filtrar_alcance_admin
+    from inventario.operacion import calcular_operacion
     from inventario.salud import calcular_salud
     from scraper.bochica import DESTINO_DEFAULT as BOCHICA_XLSX
     from scraper.inventario import DESTINO_DEFAULT as ADMIN_XLSX
@@ -727,6 +781,7 @@ def main() -> int:
             # salud y el cruce hablen del mismo universo.
             salud = calcular_salud(admin, lectura)
             abc = calcular_clasificacion(admin, lectura)
+            operacion = calcular_operacion(lectura)
 
         corrida_id = persistir(
             comparacion,
@@ -736,6 +791,7 @@ def main() -> int:
             hallazgos=hallazgos,
             salud=salud,
             abc=abc,
+            operacion=operacion,
         )
     except FileNotFoundError as e:
         logger.error("inventario: falta una fuente — %s", e)

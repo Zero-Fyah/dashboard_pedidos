@@ -271,6 +271,18 @@ def get_inventario_abc() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_operacion_ciclos() -> pd.DataFrame:
+    """Tiempos de ciclo y carga por subpedido (DEC-054)."""
+    if not _objeto_existe("v_operacion_ciclos", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_operacion_ciclos", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def get_inventario_anomalias() -> pd.DataFrame:
     """Stock ubicado donde el layout dice que no debería haber (DEC-041)."""
     if not _objeto_existe("v_inventario_anomalias", "view"):
