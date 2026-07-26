@@ -51,6 +51,28 @@ BORDER_SUBTLE = "rgba(255,255,255,0.06)"  # Líneas divisorias y cuadrículas
 BORDER_TEAL_ACCENT = "#1D9E75"  # Línea de acento (3px)
 DECORATION_OPACITY = 0.06  # Opacidad de elementos decorativos de fondo
 
+# ---------------------------------------------------------------------------
+# Paleta categórica para gráficos (DEC-048)
+# ---------------------------------------------------------------------------
+# Los acentos de arriba están pensados para texto y bordes; como series de un
+# gráfico sobre `BG_DEEP` no pasan las verificaciones de accesibilidad:
+# `ACCENT_BLUE` queda en 2,67:1 de contraste (mínimo 3:1) y `STATUS_WARNING`
+# se sale de la banda de luminosidad del modo oscuro (L 0,761 contra un
+# máximo de 0,67).
+#
+# Estos tres se ajustaron hasta pasar las cinco verificaciones contra la
+# superficie real (`#051520`): banda de luminosidad, piso de croma,
+# separación para daltonismo (ΔE 15,4 deutan), piso de visión normal
+# (ΔE 17,4) y contraste. El teal es el mismo `ACCENT_TEAL`, así que la
+# identidad visual no cambia.
+#
+# **Se asignan en orden fijo, nunca cíclico.** Una cuarta serie no se
+# inventa: se agrupa en "Otros" o se separa en gráficos chicos.
+GRAFICO_SERIES = ("#1D9E75", "#4A90D9", "#BE8034")
+
+# Grilla y ejes recesivos: la data manda, el andamiaje acompaña.
+GRAFICO_GRID = "rgba(255,255,255,0.06)"
+
 # Constantes de layout reutilizables (no forman parte de la paleta original,
 # pero se centralizan aquí para mantener consistencia en tarjetas y grillas)
 CARD_RADIUS = "12px"

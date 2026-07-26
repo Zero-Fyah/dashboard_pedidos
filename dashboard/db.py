@@ -155,6 +155,75 @@ def get_opciones_filtro() -> tuple[list[str], list[str], list[str], list[str]]:
     return ["Todos", "Abiertos", "Cerrados"], estados, almacenes, tipos
 
 
+def _objeto_existe(nombre: str, tipo: str = "table") -> bool:
+    """True si existe la tabla o VIEW indicada."""
+    if not DB_PATH.exists():
+        return False
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=5)
+        existe = (
+            con.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type=? AND name=?", (tipo, nombre)
+            ).fetchone()[0]
+            > 0
+        )
+        con.close()
+        return existe
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_inventario_corrida() -> dict | None:
+    """Metadatos de la última corrida del cruce de inventario (DEC-043).
+
+    Trae la frescura de las tres fuentes y los agregados, para el encabezado
+    de la vista. `None` si el cruce nunca corrió.
+    """
+    if not _objeto_existe("v_inventario_corridas", "view"):
+        return None
+    con = _conn()
+    try:
+        df = pd.read_sql("SELECT * FROM v_inventario_corridas ORDER BY id DESC LIMIT 1", con)
+    finally:
+        con.close()
+    return None if df.empty else df.iloc[0].to_dict()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_inventario_comparacion() -> pd.DataFrame:
+    """Comparación por referencia: teórico vs. lo que reporta Bochica (DEC-041).
+
+    `picking_estimado` = `inventario_teorico` − `bochica_altura`. Negativo
+    significa que la fuente confiable (altura) ya supera al teórico sin
+    contar picking — es un hallazgo a explicar, no una métrica cerrada
+    (decisión del Arquitecto, DEC-043).
+    """
+    if not _objeto_existe("v_inventario_comparacion", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_inventario_comparacion", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_inventario_anomalias() -> pd.DataFrame:
+    """Stock ubicado donde el layout dice que no debería haber (DEC-041)."""
+    if not _objeto_existe("v_inventario_anomalias", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """SELECT motivo, ubicacion, id_especificacion, cantidad
+               FROM v_inventario_anomalias ORDER BY cantidad DESC""",
+            con,
+        )
+    finally:
+        con.close()
+
+
 def _tabla_existe(nombre: str) -> bool:
     """True si la tabla existe. Sin caché: se consulta al abrir la app."""
     if not DB_PATH.exists():

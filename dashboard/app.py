@@ -79,15 +79,16 @@ paginas: dict[str, list[st.Page]] = {
             icon=":material/local_shipping:",
         ),
     ],
+    "Inventario": [
+        st.Page(
+            "pages/inventario.py",
+            title="Bodega vs. sistema",
+            icon=":material/inventory_2:",
+        ),
+    ],
     # A medida que el proyecto evolucione, se agregan aquí nuevas
-    # secciones con sus páginas. La próxima prevista es la de
-    # inventario, que ya tiene su backend listo (DEC-043: lee de
-    # v_inventario_comparacion / v_inventario_anomalias /
-    # v_inventario_corridas):
-    # "Inventario": [
-    #     st.Page("pages/inventario.py", title="Bodega vs. sistema",
-    #             icon=":material/inventory_2:"),
-    # ],
+    # secciones con sus páginas: basta con sumar un st.Page a este
+    # diccionario, sin tocar el resto del archivo.
 }
 
 # DEC-047: la sección solo existe mientras haya algo que mostrar. Cuando
