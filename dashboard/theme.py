@@ -70,6 +70,12 @@ DECORATION_OPACITY = 0.06  # Opacidad de elementos decorativos de fondo
 # inventa: se agrupa en "Otros" o se separa en gráficos chicos.
 GRAFICO_SERIES = ("#1D9E75", "#4A90D9", "#BE8034")
 
+# Rampa secuencial de un solo tono, para magnitudes (heatmaps). Validada
+# contra la superficie real: luminosidad monótona, saltos ≥0,06 y el
+# extremo oscuro en 3,04:1 de contraste — por encima del piso de 2:1 que
+# exige que el paso más tenue todavía se lea como marca.
+GRAFICO_SECUENCIAL = ("#1A6F54", "#22916D", "#37AE86", "#6FCDA9", "#A9E3CA")
+
 # Grilla y ejes recesivos: la data manda, el andamiaje acompaña.
 GRAFICO_GRID = "rgba(255,255,255,0.06)"
 

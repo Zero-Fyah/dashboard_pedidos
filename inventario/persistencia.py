@@ -99,6 +99,23 @@ _TABLAS = {
             corrida_id     INTEGER
         )
     """,
+    "inventario_abc": """
+        CREATE TABLE IF NOT EXISTS inventario_abc (
+            referencia      TEXT PRIMARY KEY,
+            familia         TEXT,
+            valor_consumo   REAL,
+            pct_valor       REAL,
+            pct_acumulado   REAL,
+            abc             TEXT,
+            unidades        REAL,
+            cv              REAL,
+            meses_con_venta REAL,
+            xyz             TEXT,
+            celda           TEXT,
+            politica        TEXT,
+            corrida_id      INTEGER
+        )
+    """,
     "tareas_hallazgos": """
         CREATE TABLE IF NOT EXISTS tareas_hallazgos (
             clave       TEXT PRIMARY KEY,
@@ -140,6 +157,11 @@ _VIEWS = {
                dias_cobertura, ultima_salida, dias_sin_salida, estado
         FROM inventario_salud
     """,
+    "v_inventario_abc": """
+        SELECT referencia, familia, valor_consumo, pct_valor, pct_acumulado,
+               abc, unidades, cv, meses_con_venta, xyz, celda, politica
+        FROM inventario_abc
+    """,
     "v_inventario_anomalias": """
         SELECT motivo, ubicacion, id_especificacion, cantidad
         FROM inventario_anomalias
@@ -173,6 +195,21 @@ _COLUMNAS_COMPARACION = (
 _COLUMNAS_ANOMALIAS = ("motivo", "ubicacion", "id_especificacion", "cantidad")
 
 _COLUMNAS_CATALOGO = ("referencia", "codigo_barras", "id_producto", "nombre_comercial")
+
+_COLUMNAS_ABC = (
+    "referencia",
+    "familia",
+    "valor_consumo",
+    "pct_valor",
+    "pct_acumulado",
+    "abc",
+    "unidades",
+    "cv",
+    "meses_con_venta",
+    "xyz",
+    "celda",
+    "politica",
+)
 
 _COLUMNAS_SALUD = (
     "referencia",
@@ -360,6 +397,7 @@ def persistir(
     catalogo: pd.DataFrame | None = None,
     hallazgos: list | None = None,
     salud: pd.DataFrame | None = None,
+    abc: pd.DataFrame | None = None,
 ) -> int:
     """Escribe el snapshot de la corrida, reemplazando el anterior.
 
@@ -380,6 +418,8 @@ def persistir(
             (DEC-047). Si es None, `tareas_hallazgos` queda intacta.
         salud: Resultado de `inventario.salud.calcular_salud()` (DEC-049).
             Si es None, `inventario_salud` queda intacta.
+        abc: Resultado de `inventario.clasificacion.calcular_clasificacion()`
+            (DEC-050). Si es None, `inventario_abc` queda intacta.
 
     Returns:
         El `id` de la corrida registrada en `inventario_corridas`.
@@ -469,6 +509,19 @@ def persistir(
                     ],
                 )
 
+            # DEC-050: clasificación ABC-XYZ.
+            if abc is not None:
+                con.execute("DELETE FROM inventario_abc")
+                con.executemany(
+                    f"INSERT INTO inventario_abc "
+                    f"({', '.join(_COLUMNAS_ABC)}, corrida_id) "
+                    f"VALUES ({', '.join('?' * len(_COLUMNAS_ABC))}, ?)",
+                    [
+                        (*_normalizar(fila), corrida_id)
+                        for fila in abc[list(_COLUMNAS_ABC)].itertuples(index=False)
+                    ],
+                )
+
             # DEC-045: el puente producto↔pedido. Va en la misma transacción
             # para que el dashboard nunca lo vea a medio poblar.
             if catalogo is not None:
@@ -531,6 +584,7 @@ def main() -> int:
         0 si la corrida se persistió, 1 si faltó una fuente o falló la
         escritura.
     """
+    from inventario.clasificacion import calcular_clasificacion
     from inventario.comparacion import anomalias_layout, calcular_vendido_no_alistado, comparar
     from inventario.hallazgos import detectar_todos
     from inventario.layout import (
@@ -568,6 +622,7 @@ def main() -> int:
             # DEC-049: usa el catálogo ya filtrado por alcance, para que la
             # salud y el cruce hablen del mismo universo.
             salud = calcular_salud(admin, lectura)
+            abc = calcular_clasificacion(admin, lectura)
 
         corrida_id = persistir(
             comparacion,
@@ -576,6 +631,7 @@ def main() -> int:
             catalogo=catalogo,
             hallazgos=hallazgos,
             salud=salud,
+            abc=abc,
         )
     except FileNotFoundError as e:
         logger.error("inventario: falta una fuente — %s", e)

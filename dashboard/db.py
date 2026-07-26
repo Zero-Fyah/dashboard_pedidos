@@ -225,6 +225,18 @@ def get_inventario_salud() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_inventario_abc() -> pd.DataFrame:
+    """Clasificación ABC-XYZ por referencia (DEC-050)."""
+    if not _objeto_existe("v_inventario_abc", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_inventario_abc", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def get_inventario_anomalias() -> pd.DataFrame:
     """Stock ubicado donde el layout dice que no debería haber (DEC-041)."""
     if not _objeto_existe("v_inventario_anomalias", "view"):

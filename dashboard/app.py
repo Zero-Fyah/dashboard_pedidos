@@ -90,6 +90,11 @@ paginas: dict[str, list[st.Page]] = {
             title="Salud y cobertura",
             icon=":material/monitor_heart:",
         ),
+        st.Page(
+            "pages/clasificacion.py",
+            title="Clasificación ABC-XYZ",
+            icon=":material/category:",
+        ),
     ],
     # A medida que el proyecto evolucione, se agregan aquí nuevas
     # secciones con sus páginas: basta con sumar un st.Page a este
