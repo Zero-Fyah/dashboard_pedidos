@@ -83,6 +83,22 @@ _TABLAS = {
             PRIMARY KEY (referencia, codigo_barras)
         )
     """,
+    "inventario_salud": """
+        CREATE TABLE IF NOT EXISTS inventario_salud (
+            referencia     TEXT PRIMARY KEY,
+            familia        TEXT,
+            disponible     REAL,
+            valor_venta    REAL,
+            demanda_30d    REAL,
+            demanda_90d    REAL,
+            demanda_diaria REAL,
+            dias_cobertura REAL,
+            ultima_salida  TEXT,
+            dias_sin_salida REAL,
+            estado         TEXT,
+            corrida_id     INTEGER
+        )
+    """,
     "tareas_hallazgos": """
         CREATE TABLE IF NOT EXISTS tareas_hallazgos (
             clave       TEXT PRIMARY KEY,
@@ -118,6 +134,12 @@ _VIEWS = {
                picking_estimado, diferencia
         FROM inventario_comparacion
     """,
+    "v_inventario_salud": """
+        SELECT referencia, familia, disponible, valor_venta,
+               demanda_30d, demanda_90d, demanda_diaria,
+               dias_cobertura, ultima_salida, dias_sin_salida, estado
+        FROM inventario_salud
+    """,
     "v_inventario_anomalias": """
         SELECT motivo, ubicacion, id_especificacion, cantidad
         FROM inventario_anomalias
@@ -151,6 +173,20 @@ _COLUMNAS_COMPARACION = (
 _COLUMNAS_ANOMALIAS = ("motivo", "ubicacion", "id_especificacion", "cantidad")
 
 _COLUMNAS_CATALOGO = ("referencia", "codigo_barras", "id_producto", "nombre_comercial")
+
+_COLUMNAS_SALUD = (
+    "referencia",
+    "familia",
+    "disponible",
+    "valor_venta",
+    "demanda_30d",
+    "demanda_90d",
+    "demanda_diaria",
+    "dias_cobertura",
+    "ultima_salida",
+    "dias_sin_salida",
+    "estado",
+)
 
 
 def construir_catalogo_productos(df_admin: pd.DataFrame) -> pd.DataFrame:
@@ -323,6 +359,7 @@ def persistir(
     db_path: str | None = None,
     catalogo: pd.DataFrame | None = None,
     hallazgos: list | None = None,
+    salud: pd.DataFrame | None = None,
 ) -> int:
     """Escribe el snapshot de la corrida, reemplazando el anterior.
 
@@ -341,6 +378,8 @@ def persistir(
             necesita la vista de Pedidos.
         hallazgos: Resultado de `inventario.hallazgos.detectar_todos()`
             (DEC-047). Si es None, `tareas_hallazgos` queda intacta.
+        salud: Resultado de `inventario.salud.calcular_salud()` (DEC-049).
+            Si es None, `inventario_salud` queda intacta.
 
     Returns:
         El `id` de la corrida registrada en `inventario_corridas`.
@@ -417,6 +456,19 @@ def persistir(
                     ],
                 )
 
+            # DEC-049: cobertura y movimiento por referencia.
+            if salud is not None:
+                con.execute("DELETE FROM inventario_salud")
+                con.executemany(
+                    f"INSERT INTO inventario_salud "
+                    f"({', '.join(_COLUMNAS_SALUD)}, corrida_id) "
+                    f"VALUES ({', '.join('?' * len(_COLUMNAS_SALUD))}, ?)",
+                    [
+                        (*_normalizar(fila), corrida_id)
+                        for fila in salud[list(_COLUMNAS_SALUD)].itertuples(index=False)
+                    ],
+                )
+
             # DEC-045: el puente producto↔pedido. Va en la misma transacción
             # para que el dashboard nunca lo vea a medio poblar.
             if catalogo is not None:
@@ -488,6 +540,7 @@ def main() -> int:
         solo_layout,
     )
     from inventario.normalizador import cargar_admin, cargar_bochica, filtrar_alcance_admin
+    from inventario.salud import calcular_salud
     from scraper.bochica import DESTINO_DEFAULT as BOCHICA_XLSX
     from scraper.inventario import DESTINO_DEFAULT as ADMIN_XLSX
 
@@ -512,9 +565,17 @@ def main() -> int:
         # reciente del sistema administrativo.
         with sqlite3.connect(get_db_path(), timeout=30) as lectura:
             hallazgos = detectar_todos(catalogo_completo, lectura)
+            # DEC-049: usa el catálogo ya filtrado por alcance, para que la
+            # salud y el cruce hablen del mismo universo.
+            salud = calcular_salud(admin, lectura)
 
         corrida_id = persistir(
-            comparacion, anomalias, frescura, catalogo=catalogo, hallazgos=hallazgos
+            comparacion,
+            anomalias,
+            frescura,
+            catalogo=catalogo,
+            hallazgos=hallazgos,
+            salud=salud,
         )
     except FileNotFoundError as e:
         logger.error("inventario: falta una fuente — %s", e)

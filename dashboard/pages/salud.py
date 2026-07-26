@@ -1,0 +1,260 @@
+"""
+Salud de inventario — cobertura, movimiento y quiebres (DEC-049).
+
+Responde tres preguntas: ¿alcanza el inventario?, ¿se está moviendo?,
+¿hay algo detenido?
+
+Lee `v_inventario_salud`, que el scheduler recalcula en cada corrida. No
+agrega ninguna fuente de datos: sale del inventario disponible del sistema
+administrativo y de los ~7 meses de demanda que ya tiene el scraper.
+
+**Lo que esta vista NO muestra, a propósito:** rotación financiera, días
+de inventario (DOH) y GMROI necesitan el costo de la mercancía, y el
+catálogo solo publica precio de venta. El "exceso sobre el máximo
+objetivo" necesita un stock objetivo por referencia, que el negocio no
+tiene definido. Mostrarlos con el precio de venta como sustituto del costo
+daría cifras que parecen financieras y no lo son.
+"""
+
+import sqlite3
+
+import plotly.graph_objects as go
+import streamlit as st
+
+from db import get_inventario_corrida, get_inventario_salud
+from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
+
+st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_html=True)
+st.title("🩺 Salud de inventario")
+
+try:
+    df = get_inventario_salud()
+    corrida = get_inventario_corrida()
+except sqlite3.OperationalError as e:
+    st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
+    st.stop()
+
+if df.empty:
+    st.info(
+        "Todavía no hay cálculo de salud de inventario. Se genera en cada ciclo del "
+        "scheduler, o a mano con `python -m inventario.persistencia`."
+    )
+    st.stop()
+
+if corrida and corrida.get("datos_desactualizados"):
+    st.warning(
+        f"⚠️ La fuente más antigua tiene {corrida['fuente_mas_vieja_h']:.1f} horas. "
+        "Probablemente falló una descarga: las cifras de abajo pueden estar desfasadas."
+    )
+
+con_stock = df[df["disponible"] > 0]
+quiebre = df[df["estado"] == "Quiebre"]
+riesgo = df[df["estado"] == "Riesgo de quiebre"]
+detenido = df[df["dias_sin_salida"] > 180]
+
+# ── Lo accionable primero ──────────────────────────────────────────────────────
+k1, k2, k3, k4 = st.columns(4)
+k1.metric(
+    "En quiebre",
+    f"{len(quiebre):,}",
+    help="Sin stock y con demanda en los últimos 90 días. Son las que duelen.",
+)
+k2.metric(
+    "En riesgo",
+    f"{len(riesgo):,}",
+    help="Menos de 15 días de cobertura al ritmo de venta de los últimos 90 días.",
+)
+k3.metric("Con stock", f"{len(con_stock):,}", help=f"De {len(df):,} referencias del catálogo.")
+k4.metric(
+    "Detenidas +180 días",
+    f"{len(detenido):,}",
+    help="Sin una sola salida en más de 180 días.",
+)
+
+if len(quiebre):
+    st.error(
+        f"**{len(quiebre):,} referencias en quiebre** — sin stock disponible pero con "
+        f"demanda en los últimos 90 días ({quiebre['demanda_90d'].sum():,.0f} unidades "
+        "vendidas en ese lapso). Son las que tienen impacto comercial directo.",
+        icon="🚨",
+    )
+
+st.divider()
+
+# ── Composición ────────────────────────────────────────────────────────────────
+st.subheader("Cómo se reparte el catálogo")
+
+orden = [
+    "Quiebre",
+    "Riesgo de quiebre",
+    "Normal",
+    "Cobertura alta",
+    "Sin demanda",
+    "Sin stock ni demanda",
+]
+conteo = df["estado"].value_counts().reindex(orden).fillna(0).astype(int)
+
+c1, c2 = st.columns([1, 1])
+with c1:
+    for estado in orden:
+        st.markdown(f"**{conteo[estado]:,}** · {estado}")
+    st.caption(
+        "«Sin stock ni demanda» es catálogo por depurar, no un problema de "
+        "abastecimiento: son referencias en cero que además nadie pidió."
+    )
+
+with c2:
+    # Barras horizontales: la comparación es entre categorías nombradas y
+    # los nombres son largos. Una sola serie, así que no lleva leyenda —
+    # el título ya la nombra.
+    fig = go.Figure()
+    fig.add_bar(
+        y=orden[::-1],
+        x=[conteo[e] for e in orden[::-1]],
+        orientation="h",
+        marker_color=GRAFICO_SERIES[0],
+        marker_line=dict(color=BG_DEEP, width=2),
+        marker_cornerradius=4,
+        hovertemplate="<b>%{y}</b><br>%{x:,.0f} referencias<extra></extra>",
+    )
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=TEXT_SECONDARY, size=12),
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=260,
+        showlegend=False,
+    )
+    fig.update_xaxes(gridcolor=GRAFICO_GRID, zerolinecolor=GRAFICO_GRID, automargin=True)
+    fig.update_yaxes(showgrid=False, tickfont=dict(color=TEXT_PRIMARY), automargin=True)
+    st.plotly_chart(fig, config={"displayModeBar": False})
+
+st.divider()
+
+# ── Antigüedad del movimiento ──────────────────────────────────────────────────
+st.subheader("Cuánto hace que no sale cada referencia")
+
+# El primer corte arranca sin piso y el último no tiene techo: así ninguna
+# referencia se cae del histograma en silencio si una fecha quedara fuera
+# del rango esperado (p. ej. un pedido con fecha futura por desfase de reloj).
+cortes = [(-(10**6), 30), (31, 60), (61, 90), (91, 180), (181, 10**6)]
+etiquetas = ["0-30 días", "31-60", "61-90", "91-180", "+180 días"]
+valores = [
+    int(((df["dias_sin_salida"] >= a) & (df["dias_sin_salida"] <= b)).sum()) for a, b in cortes
+]
+nunca = int(df["dias_sin_salida"].isna().sum())
+
+fig2 = go.Figure()
+fig2.add_bar(
+    x=[*etiquetas, "Nunca salió"],
+    y=[*valores, nunca],
+    marker_color=GRAFICO_SERIES[0],
+    marker_line=dict(color=BG_DEEP, width=2),
+    marker_cornerradius=4,
+    hovertemplate="<b>%{x}</b><br>%{y:,.0f} referencias<extra></extra>",
+)
+fig2.update_layout(
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(color=TEXT_SECONDARY, size=12),
+    margin=dict(l=10, r=10, t=10, b=10),
+    height=300,
+    showlegend=False,
+    bargap=0.35,
+)
+fig2.update_xaxes(showgrid=False, tickfont=dict(color=TEXT_PRIMARY), automargin=True)
+fig2.update_yaxes(gridcolor=GRAFICO_GRID, zerolinecolor=GRAFICO_GRID, automargin=True)
+st.plotly_chart(fig2, config={"displayModeBar": False})
+
+if len(detenido):
+    st.caption(
+        f"Las {len(detenido):,} referencias detenidas por más de 180 días acumulan "
+        f"**{detenido['valor_venta'].sum():,.0f}** a precio de venta. No es el costo "
+        "inmovilizado — el catálogo no publica costo, así que esta cifra sobreestima "
+        "la exposición financiera real."
+    )
+
+st.divider()
+
+# ── Detalle ────────────────────────────────────────────────────────────────────
+st.subheader("Detalle por referencia")
+
+f1, f2, f3 = st.columns([1.5, 1.5, 1])
+with f1:
+    estados_sel = st.multiselect("Estado", orden, placeholder="Todos...")
+with f2:
+    familias = sorted(df["familia"].dropna().unique())
+    familias_sel = st.multiselect("Familia", familias, placeholder="Todas...")
+with f3:
+    orden_sel = st.selectbox(
+        "Ordenar por",
+        ["Más urgente", "Mayor demanda", "Más días detenida", "Mayor cobertura"],
+    )
+
+vista = df.copy()
+if estados_sel:
+    vista = vista[vista["estado"].isin(estados_sel)]
+if familias_sel:
+    vista = vista[vista["familia"].isin(familias_sel)]
+
+if orden_sel == "Más urgente":
+    # Quiebre primero, después menor cobertura: el orden en que conviene atacar.
+    prioridad = {e: i for i, e in enumerate(orden)}
+    vista = (
+        vista.assign(_p=vista["estado"].map(prioridad))
+        .sort_values(["_p", "dias_cobertura"], na_position="last")
+        .drop(columns="_p")
+    )
+elif orden_sel == "Mayor demanda":
+    vista = vista.sort_values("demanda_90d", ascending=False)
+elif orden_sel == "Más días detenida":
+    vista = vista.sort_values("dias_sin_salida", ascending=False, na_position="first")
+else:
+    vista = vista.sort_values("dias_cobertura", ascending=False, na_position="last")
+
+if vista.empty:
+    st.info("Sin referencias para los filtros seleccionados.")
+else:
+    st.caption(f"{len(vista):,} referencias.")
+    st.dataframe(
+        vista[
+            [
+                "referencia",
+                "familia",
+                "estado",
+                "disponible",
+                "demanda_30d",
+                "demanda_90d",
+                "dias_cobertura",
+                "ultima_salida",
+                "dias_sin_salida",
+                "valor_venta",
+            ]
+        ],
+        hide_index=True,
+        column_config={
+            "referencia": st.column_config.TextColumn("Referencia", width="medium"),
+            "familia": st.column_config.TextColumn("Familia", width="small"),
+            "estado": st.column_config.TextColumn("Estado", width="medium"),
+            "disponible": st.column_config.NumberColumn("Disponible", format="%.0f"),
+            "demanda_30d": st.column_config.NumberColumn("Demanda 30d", format="%.0f"),
+            "demanda_90d": st.column_config.NumberColumn("Demanda 90d", format="%.0f"),
+            "dias_cobertura": st.column_config.NumberColumn("Días cobertura", format="%.0f"),
+            "ultima_salida": st.column_config.TextColumn("Última salida", width="small"),
+            "dias_sin_salida": st.column_config.NumberColumn("Días sin salir", format="%.0f"),
+            "valor_venta": st.column_config.NumberColumn("Valor (precio venta)", format="%.0f"),
+        },
+    )
+    st.download_button(
+        "⬇️ Descargar (CSV)",
+        vista.to_csv(index=False).encode("utf-8-sig"),
+        file_name="salud_inventario.csv",
+        mime="text/csv",
+    )
+
+st.caption(
+    "La cobertura se calcula con la demanda de los últimos 90 días, excluyendo "
+    "subpedidos cancelados. Umbrales por defecto: riesgo bajo 15 días, cobertura "
+    "alta sobre 90. Alcance: catálogo sin arenas y almacén Bogotá, el mismo del "
+    "cruce de inventario."
+)

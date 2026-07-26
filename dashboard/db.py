@@ -209,6 +209,22 @@ def get_inventario_comparacion() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_inventario_salud() -> pd.DataFrame:
+    """Cobertura, movimiento y riesgo por referencia (DEC-049).
+
+    Lo calcula el scheduler porque agregar la demanda sobre 840.000 líneas
+    cuesta ~10 s: acá la consulta es inmediata.
+    """
+    if not _objeto_existe("v_inventario_salud", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_inventario_salud", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def get_inventario_anomalias() -> pd.DataFrame:
     """Stock ubicado donde el layout dice que no debería haber (DEC-041)."""
     if not _objeto_existe("v_inventario_anomalias", "view"):

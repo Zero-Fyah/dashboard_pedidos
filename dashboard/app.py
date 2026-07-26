@@ -85,6 +85,11 @@ paginas: dict[str, list[st.Page]] = {
             title="Bodega vs. sistema",
             icon=":material/inventory_2:",
         ),
+        st.Page(
+            "pages/salud.py",
+            title="Salud y cobertura",
+            icon=":material/monitor_heart:",
+        ),
     ],
     # A medida que el proyecto evolucione, se agregan aquí nuevas
     # secciones con sus páginas: basta con sumar un st.Page a este
