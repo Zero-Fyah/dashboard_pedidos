@@ -34,7 +34,19 @@ extend-exclude = [
 select = ["E4", "E7", "E9", "F", "I", "B"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["comun", "scraper", "etl", "dashboard", "inventario"]
+# `theme`, `components` y `db` se importan sin el prefijo `dashboard.`
+# porque Streamlit pone el directorio del entry point (dashboard/) en
+# sys.path — son módulos propios aunque el import no lo parezca.
+known-first-party = [
+    "comun",
+    "scraper",
+    "etl",
+    "dashboard",
+    "inventario",
+    "theme",
+    "components",
+    "db",
+]
 
 [tool.mypy]
 python_version = "3.12"
