@@ -105,8 +105,10 @@ _TABLAS = {
     """,
     "inventario_abc": """
         CREATE TABLE IF NOT EXISTS inventario_abc (
-            referencia      TEXT PRIMARY KEY,
-            familia         TEXT,
+            nivel           TEXT NOT NULL,
+            clave           TEXT NOT NULL,
+            padre           TEXT,
+            etiqueta        TEXT,
             valor_consumo   REAL,
             pct_valor       REAL,
             pct_acumulado   REAL,
@@ -117,7 +119,8 @@ _TABLAS = {
             xyz             TEXT,
             celda           TEXT,
             politica        TEXT,
-            corrida_id      INTEGER
+            corrida_id      INTEGER,
+            PRIMARY KEY (nivel, clave)
         )
     """,
     "tareas_hallazgos": """
@@ -162,8 +165,9 @@ _VIEWS = {
         FROM inventario_salud
     """,
     "v_inventario_abc": """
-        SELECT referencia, familia, valor_consumo, pct_valor, pct_acumulado,
-               abc, unidades, cv, meses_con_venta, xyz, celda, politica
+        SELECT nivel, clave, padre, etiqueta, valor_consumo, pct_valor,
+               pct_acumulado, abc, unidades, cv, meses_con_venta, xyz,
+               celda, politica
         FROM inventario_abc
     """,
     "v_inventario_anomalias": """
@@ -203,8 +207,10 @@ _COLUMNAS_ANOMALIAS = ("motivo", "ubicacion", "id_especificacion", "cantidad")
 _COLUMNAS_CATALOGO = ("referencia", "codigo_barras", "id_producto", "nombre_comercial")
 
 _COLUMNAS_ABC = (
-    "referencia",
-    "familia",
+    "nivel",
+    "clave",
+    "padre",
+    "etiqueta",
     "valor_consumo",
     "pct_valor",
     "pct_acumulado",
@@ -294,8 +300,32 @@ def init_schema(con: sqlite3.Connection) -> None:
     """
     for sql in _TABLAS.values():
         con.execute(sql)
+    _recrear_si_cambio_la_forma(con)
     _migrar_columnas(con)
     _crear_views(con)
+
+
+# Tablas que son snapshots puros: se reescriben enteras en cada corrida, así
+# que recrearlas no pierde información. Se listan explícitamente para que un
+# DROP nunca alcance a una tabla con historia (`inventario_corridas`).
+_SNAPSHOTS_RECREABLES = {"inventario_abc": "nivel"}
+
+
+def _recrear_si_cambio_la_forma(con: sqlite3.Connection) -> None:
+    """Recrea un snapshot cuando su esquema cambió de forma, no solo de columnas.
+
+    `_migrar_columnas()` resuelve columnas agregadas, pero no un cambio de
+    llave primaria: `inventario_abc` pasó de estar indexada por
+    `referencia` a estarlo por `(nivel, clave)` al volverse jerárquica
+    (DEC-053). Se detecta por la ausencia de la columna testigo y se
+    recrea, que es seguro porque la tabla se repuebla entera enseguida.
+    """
+    for tabla, testigo in _SNAPSHOTS_RECREABLES.items():
+        columnas = {fila[1] for fila in con.execute(f"PRAGMA table_info({tabla})")}
+        if columnas and testigo not in columnas:
+            con.execute(f"DROP TABLE {tabla}")
+            con.execute(_TABLAS[tabla])
+            logger.info("_recrear_si_cambio_la_forma: %s recreada con el esquema nuevo", tabla)
 
 
 def _migrar_columnas(con: sqlite3.Connection) -> None:

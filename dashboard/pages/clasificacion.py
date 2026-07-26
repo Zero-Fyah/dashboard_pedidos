@@ -1,9 +1,9 @@
 """
-Clasificación ABC-XYZ (DEC-050).
+Clasificación ABC-XYZ jerárquica: familia → referencia → ID (DEC-053).
 
-ABC ordena por cuánto ingreso genera cada referencia; XYZ, por qué tan
-predecible es su demanda. La matriz cruza ambas y sugiere una política por
-celda.
+El análisis va de lo macro a lo micro. En cada nivel el Pareto se corre
+**dentro del padre**: una referencia se compara contra las de su propia
+familia, y un ID contra los de su propia referencia.
 
 Lee `v_inventario_abc`, que el scheduler recalcula en cada corrida. No
 agrega ninguna fuente: usa el ingreso real ya registrado en
@@ -25,6 +25,9 @@ from theme import (
     TEXT_SECONDARY,
 )
 
+FILAS_ABC = ["A", "B", "C"]
+COLUMNAS_XYZ = ["X", "Y", "Z"]
+
 st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_html=True)
 st.title("🗂 Clasificación ABC-XYZ")
 
@@ -34,260 +37,236 @@ except sqlite3.OperationalError as e:
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()
 
-if df.empty:
+if df.empty or "nivel" not in df.columns:
     st.info(
         "Todavía no hay clasificación. Se genera en cada ciclo del scheduler, o a "
         "mano con `python -m inventario.persistencia`."
     )
     st.stop()
 
-con_consumo = df[df["abc"] != "Sin consumo"]
-sin_consumo = df[df["abc"] == "Sin consumo"]
+familias = df[df["nivel"] == "familia"]
+referencias = df[df["nivel"] == "referencia"]
+ids = df[df["nivel"] == "id"]
 
-if con_consumo.empty:
-    st.info("Ninguna referencia registró consumo en la ventana analizada.")
-    st.stop()
 
-# ── Resumen ────────────────────────────────────────────────────────────────────
-resumen = con_consumo.groupby("abc").agg(
-    refs=("referencia", "size"), valor=("valor_consumo", "sum")
-)
-total_valor = resumen["valor"].sum()
+def _con_consumo(datos):
+    return datos[datos["abc"] != "Sin consumo"]
 
-k1, k2, k3, k4 = st.columns(4)
-for col, clase in zip((k1, k2, k3), ("A", "B", "C"), strict=True):
-    if clase in resumen.index:
-        refs = int(resumen.loc[clase, "refs"])
-        pct = resumen.loc[clase, "valor"] / total_valor * 100
-        col.metric(
-            f"Clase {clase}",
-            f"{refs:,} refs",
-            f"{pct:.1f}% del ingreso",
-            delta_color="off",
-        )
-k4.metric(
-    "Sin consumo",
-    f"{len(sin_consumo):,}",
-    help="Referencias del catálogo sin una sola venta en la ventana analizada.",
-)
 
-st.caption(
-    "Ventana: los 6 meses calendario completos anteriores al mes en curso. El mes "
-    "en curso se excluye porque, a medio transcurrir, subestimaría el consumo y "
-    "metería una caída artificial en la variabilidad. Alcance: catálogo sin arenas "
-    "y almacén Bogotá, el mismo de las otras vistas de inventario."
-)
+def _matriz(datos) -> list[list[int]]:
+    return [
+        [int(((datos["abc"] == a) & (datos["xyz"] == x)).sum()) for x in COLUMNAS_XYZ]
+        for a in FILAS_ABC
+    ]
 
-st.divider()
 
-# ── Pareto ─────────────────────────────────────────────────────────────────────
-st.subheader("Concentración del ingreso")
-
-curva = con_consumo.sort_values("valor_consumo", ascending=False).reset_index(drop=True)
-curva["rank"] = curva.index + 1
-
-fig = go.Figure()
-fig.add_scatter(
-    x=curva["rank"],
-    y=curva["pct_acumulado"],
-    mode="lines",
-    line=dict(color=GRAFICO_SERIES[0], width=2, shape="spline"),
-    fill="tozeroy",
-    fillcolor="rgba(29,158,117,0.12)",
-    hovertemplate="Referencia n.º %{x}<br>%{y:.1f}% del ingreso acumulado<extra></extra>",
-)
-# Los cortes de Pareto, como referencia recesiva.
-for corte, etiqueta in ((80, "80% — corte A/B"), (95, "95% — corte B/C")):
-    fig.add_hline(
-        y=corte,
-        line=dict(color=GRAFICO_GRID, width=1, dash="dot"),
-        annotation_text=etiqueta,
-        annotation_position="right",
-        annotation_font=dict(color=TEXT_SECONDARY, size=11),
-    )
-fig.update_layout(
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(0,0,0,0)",
-    font=dict(color=TEXT_SECONDARY, size=12),
-    margin=dict(l=10, r=10, t=20, b=10),
-    height=320,
-    showlegend=False,
-    hovermode="x unified",
-)
-fig.update_xaxes(
-    title="Referencias ordenadas por ingreso",
-    showgrid=False,
-    linecolor=GRAFICO_GRID,
-    tickfont=dict(color=TEXT_PRIMARY),
-    automargin=True,
-)
-fig.update_yaxes(
-    title="% acumulado",
-    gridcolor=GRAFICO_GRID,
-    zerolinecolor=GRAFICO_GRID,
-    range=[0, 100],
-    automargin=True,
-)
-st.plotly_chart(fig, config={"displayModeBar": False})
-
-st.divider()
-
-# ── Matriz ─────────────────────────────────────────────────────────────────────
-st.subheader("Matriz ABC-XYZ")
-
-filas, columnas = ["A", "B", "C"], ["X", "Y", "Z"]
-matriz = [
-    [int(((con_consumo["abc"] == a) & (con_consumo["xyz"] == x)).sum()) for x in columnas]
-    for a in filas
-]
-
-m1, m2 = st.columns([1.1, 1])
-with m1:
+def _dibujar_matriz(datos, titulo: str) -> None:
+    """Heatmap 3×3 con el conteo por celda."""
+    matriz = _matriz(datos)
     heat = go.Figure(
         go.Heatmap(
             z=matriz,
-            x=columnas,
-            y=filas,
+            x=COLUMNAS_XYZ,
+            y=FILAS_ABC,
             # Rampa secuencial de un solo tono: la magnitud es el conteo.
             colorscale=[
                 [i / (len(GRAFICO_SECUENCIAL) - 1), c] for i, c in enumerate(GRAFICO_SECUENCIAL)
             ],
-            hovertemplate="<b>%{y}%{x}</b><br>%{z:,} referencias<extra></extra>",
+            hovertemplate="<b>%{y}%{x}</b><br>%{z:,} unidades<extra></extra>",
             showscale=False,
             xgap=2,
             ygap=2,
         )
     )
-
     # El número va como anotación y no con `texttemplate` porque el color
     # tiene que cambiar por celda: en blanco sobre el extremo claro de la
-    # rampa el contraste es ilegible. Sobre las celdas claras se usa el
-    # navy del fondo, que ahí sí contrasta.
+    # rampa el contraste es ilegible.
     maximo = max(max(fila) for fila in matriz) or 1
-    for i, clase in enumerate(filas):
-        for j, variabilidad in enumerate(columnas):
+    for i, clase in enumerate(FILAS_ABC):
+        for j, variabilidad in enumerate(COLUMNAS_XYZ):
             valor = matriz[i][j]
-            claro = valor / maximo > 0.62  # a partir de ahí la celda ya es clara
+            claro = valor / maximo > 0.62
             heat.add_annotation(
                 x=variabilidad,
                 y=clase,
                 text=f"{valor:,}",
                 showarrow=False,
-                font=dict(size=16, color=BG_DEEP if claro else TEXT_PRIMARY),
+                font=dict(size=15, color=BG_DEEP if claro else TEXT_PRIMARY),
             )
     heat.update_layout(
+        title=dict(text=titulo, font=dict(color=TEXT_SECONDARY, size=13)),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color=TEXT_SECONDARY, size=13),
-        margin=dict(l=10, r=10, t=10, b=10),
-        height=300,
+        font=dict(color=TEXT_SECONDARY, size=12),
+        margin=dict(l=10, r=10, t=40, b=10),
+        height=260,
     )
-    heat.update_xaxes(
-        title="XYZ — predecibilidad de la demanda",
-        side="top",
-        tickfont=dict(color=TEXT_PRIMARY, size=14),
-        automargin=True,
-    )
+    heat.update_xaxes(side="top", tickfont=dict(color=TEXT_PRIMARY, size=13), automargin=True)
     heat.update_yaxes(
-        title="ABC — aporte al ingreso",
-        autorange="reversed",
-        tickfont=dict(color=TEXT_PRIMARY, size=14),
-        automargin=True,
+        autorange="reversed", tickfont=dict(color=TEXT_PRIMARY, size=13), automargin=True
     )
     st.plotly_chart(heat, config={"displayModeBar": False})
 
-with m2:
-    st.markdown(
-        "**X** demanda estable (CV ≤ 0,5) · **Y** variable (≤ 1,0) · **Z** errática (> 1,0)"
-    )
-    celda_sel = st.selectbox(
-        "Ver política de la celda",
-        [f"{a}{x}" for a in filas for x in columnas],
-    )
-    politica = con_consumo[con_consumo["celda"] == celda_sel]["politica"].dropna()
-    if not politica.empty:
-        st.info(politica.iloc[0], icon="💡")
-    n_celda = int((con_consumo["celda"] == celda_sel).sum())
-    st.caption(f"{n_celda:,} referencias en {celda_sel}.")
 
-z_nuevas = int(((con_consumo["xyz"] == "Z") & (con_consumo["meses_con_venta"] <= 2)).sum())
-if z_nuevas:
-    st.warning(
-        f"⚠️ De las referencias clasificadas **Z**, {z_nuevas:,} vendieron en solo "
-        "1 o 2 de los 6 meses. Con una ventana corta, un producto **nuevo** también "
-        "sale con variabilidad alta: ahí el CV no mide volatilidad sino que antes no "
-        "existía. Mirá la columna «Meses con venta» antes de decidir sobre ellas."
-    )
+_COLUMNAS_TABLA = [
+    "clave",
+    "etiqueta",
+    "abc",
+    "xyz",
+    "celda",
+    "valor_consumo",
+    "pct_valor",
+    "unidades",
+    "cv",
+    "meses_con_venta",
+    "politica",
+]
 
-st.divider()
 
-# ── Detalle ────────────────────────────────────────────────────────────────────
-st.subheader("Detalle por referencia")
-
-f1, f2, f3 = st.columns(3)
-with f1:
-    abc_sel = st.multiselect("Clase ABC", ["A", "B", "C", "Sin consumo"], placeholder="Todas...")
-with f2:
-    xyz_sel = st.multiselect("Clase XYZ", ["X", "Y", "Z"], placeholder="Todas...")
-with f3:
-    familias = sorted(df["familia"].dropna().unique())
-    fam_sel = st.multiselect("Familia", familias, placeholder="Todas...")
-
-vista = df.copy()
-if abc_sel:
-    vista = vista[vista["abc"].isin(abc_sel)]
-if xyz_sel:
-    vista = vista[vista["xyz"].isin(xyz_sel)]
-if fam_sel:
-    vista = vista[vista["familia"].isin(fam_sel)]
-
-if vista.empty:
-    st.info("Sin referencias para los filtros seleccionados.")
-else:
-    st.caption(f"{len(vista):,} referencias · ordenadas por ingreso descendente.")
+def _tabla(datos, etiqueta_clave: str, *, mostrar_etiqueta: bool = False) -> None:
+    columnas = [c for c in _COLUMNAS_TABLA if mostrar_etiqueta or c != "etiqueta"]
     st.dataframe(
-        vista[
-            [
-                "referencia",
-                "familia",
-                "abc",
-                "xyz",
-                "celda",
-                "valor_consumo",
-                "pct_valor",
-                "pct_acumulado",
-                "unidades",
-                "cv",
-                "meses_con_venta",
-                "politica",
-            ]
-        ],
+        datos.sort_values("valor_consumo", ascending=False)[columnas],
         hide_index=True,
         column_config={
-            "referencia": st.column_config.TextColumn("Referencia", width="medium"),
-            "familia": st.column_config.TextColumn("Familia", width="small"),
+            "clave": st.column_config.TextColumn(etiqueta_clave, width="medium"),
+            "etiqueta": st.column_config.TextColumn("Especificación", width="large"),
             "abc": st.column_config.TextColumn("ABC", width="small"),
             "xyz": st.column_config.TextColumn("XYZ", width="small"),
             "celda": st.column_config.TextColumn("Celda", width="small"),
             "valor_consumo": st.column_config.NumberColumn("Ingreso 6 meses", format="%.0f"),
-            "pct_valor": st.column_config.NumberColumn("% del total", format="%.2f"),
-            "pct_acumulado": st.column_config.NumberColumn("% acumulado", format="%.1f"),
+            "pct_valor": st.column_config.NumberColumn("% de su grupo", format="%.2f"),
             "unidades": st.column_config.NumberColumn("Unidades", format="%.0f"),
             "cv": st.column_config.NumberColumn("CV", format="%.2f"),
             "meses_con_venta": st.column_config.NumberColumn("Meses con venta", format="%.0f"),
             "politica": st.column_config.TextColumn("Política sugerida", width="large"),
         },
     )
-    st.download_button(
-        "⬇️ Descargar (CSV)",
-        vista.to_csv(index=False).encode("utf-8-sig"),
-        file_name="clasificacion_abc_xyz.csv",
-        mime="text/csv",
-    )
+
 
 st.caption(
-    "El ABC usa el **ingreso real** cobrado por línea, no un estimado de "
-    "demanda × precio de catálogo. Los subpedidos cancelados quedan fuera. Las "
-    "políticas por celda son guía estándar de gestión de inventarios, no una regla "
-    "que el sistema aplique."
+    "El análisis va de lo macro a lo micro. **En cada nivel el Pareto se corre dentro "
+    "del padre**: una referencia se compara contra las de su propia familia, no contra "
+    "todo el catálogo. Ventana: 6 meses calendario completos, sin el mes en curso. "
+    "Alcance: catálogo sin arenas y almacén Bogotá."
 )
+
+nivel_1, nivel_2, nivel_3 = st.tabs(
+    ["1 · Familias", "2 · Referencias por familia", "3 · ID por referencia"]
+)
+
+# ── Nivel 1 ────────────────────────────────────────────────────────────────────
+with nivel_1:
+    vivas = _con_consumo(familias)
+    st.subheader("ABC-XYZ de las familias completas")
+
+    c1, c2 = st.columns([1.3, 1])
+    with c1:
+        orden = vivas.sort_values("valor_consumo", ascending=False)
+        fig = go.Figure()
+        fig.add_bar(
+            x=orden["clave"],
+            y=orden["valor_consumo"],
+            marker_color=GRAFICO_SERIES[0],
+            marker_line=dict(color=BG_DEEP, width=2),
+            marker_cornerradius=4,
+            hovertemplate="<b>%{x}</b><br>%{y:,.0f} de ingreso<extra></extra>",
+        )
+        fig.update_layout(
+            title=dict(text="Ingreso por familia", font=dict(color=TEXT_SECONDARY, size=13)),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color=TEXT_SECONDARY, size=12),
+            margin=dict(l=10, r=10, t=40, b=10),
+            height=260,
+            showlegend=False,
+            bargap=0.35,
+        )
+        fig.update_xaxes(showgrid=False, tickfont=dict(color=TEXT_PRIMARY), automargin=True)
+        fig.update_yaxes(
+            gridcolor=GRAFICO_GRID, zerolinecolor=GRAFICO_GRID, tickformat=",.0f", automargin=True
+        )
+        st.plotly_chart(fig, config={"displayModeBar": False})
+    with c2:
+        _dibujar_matriz(vivas, "Familias por celda")
+
+    _tabla(familias, "Familia")
+
+# ── Nivel 2 ────────────────────────────────────────────────────────────────────
+with nivel_2:
+    st.subheader("ABC-XYZ de las referencias, dentro de su familia")
+    disponibles = sorted(referencias["padre"].dropna().unique())
+    familia_sel = st.selectbox("Familia", disponibles, key="fam_n2")
+
+    del_grupo = referencias[referencias["padre"] == familia_sel]
+    vivas = _con_consumo(del_grupo)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Referencias", f"{len(del_grupo):,}")
+    k2.metric("Con consumo", f"{len(vivas):,}")
+    k3.metric("Clase A", f"{int((del_grupo['abc'] == 'A').sum()):,}")
+    k4.metric("Ingreso de la familia", f"{del_grupo['valor_consumo'].sum():,.0f}")
+
+    if vivas.empty:
+        st.info("Ninguna referencia de esta familia registró consumo en la ventana.")
+    else:
+        _dibujar_matriz(vivas, f"Referencias de {familia_sel} por celda")
+        st.caption(
+            "Los porcentajes son sobre el ingreso **de esta familia**: una referencia "
+            "puede ser A acá sin serlo en el total del catálogo."
+        )
+    _tabla(del_grupo, "Referencia")
+
+# ── Nivel 3 ────────────────────────────────────────────────────────────────────
+with nivel_3:
+    st.subheader("ABC-XYZ de los ID, dentro de su referencia")
+
+    con_ids = _con_consumo(ids)
+    por_referencia = con_ids.groupby("padre").agg(
+        ids=("clave", "size"), clases=("abc", "nunique"), celdas=("celda", "nunique")
+    )
+    mixtas = por_referencia[(por_referencia["ids"] > 1) & (por_referencia["clases"] > 1)]
+
+    if len(mixtas):
+        st.warning(
+            f"**{len(mixtas):,} referencias contienen ID de clases ABC distintas** "
+            f"(de {int((por_referencia['ids'] > 1).sum()):,} con más de un ID vendido). "
+            "Como el slotting se hace por referencia, hoy esas variantes comparten una "
+            "misma ubicación lógica aunque roten de forma muy distinta — es exactamente "
+            "el recorrido de picking que se puede acortar bajando el slotting a nivel ID.",
+            icon="🎯",
+        )
+
+    solo_mixtas = st.checkbox(
+        "Ver solo referencias con ID de clases distintas",
+        value=bool(len(mixtas)),
+        help="Las que más ganarían con un slotting por ID.",
+    )
+    candidatas = sorted(mixtas.index if solo_mixtas else por_referencia.index)
+
+    if not candidatas:
+        st.info("No hay referencias con ID clasificables para este filtro.")
+    else:
+        ref_sel = st.selectbox("Referencia", candidatas, key="ref_n3")
+        del_grupo = ids[ids["padre"] == ref_sel]
+        vivos = _con_consumo(del_grupo)
+
+        k1, k2, k3 = st.columns(3)
+        k1.metric("ID de la referencia", f"{len(del_grupo):,}")
+        k2.metric("Clases ABC distintas", f"{del_grupo['abc'].nunique():,}")
+        k3.metric("Ingreso de la referencia", f"{del_grupo['valor_consumo'].sum():,.0f}")
+
+        if not vivos.empty:
+            _dibujar_matriz(vivos, f"ID de {ref_sel} por celda")
+            st.caption(
+                "Los porcentajes son sobre el ingreso **de esta referencia**. Si los ID "
+                "caen en celdas distintas, conviene asignarles ubicaciones distintas."
+            )
+        _tabla(del_grupo, "ID de especificación", mostrar_etiqueta=True)
+
+    st.caption(
+        f"Se clasificaron {len(ids):,} ID. La atribución de una venta a un ID usa el par "
+        "referencia/código de barras: **el 80,8% de las líneas resuelve a un ID único**, "
+        "el resto queda sin atribuir porque su par apunta a más de una especificación. "
+        "Esa ambigüedad es una de las tareas de calidad de datos pendientes."
+    )
