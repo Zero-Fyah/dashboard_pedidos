@@ -191,6 +191,40 @@ def get_inventario_corrida() -> dict | None:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_inventario_tendencia() -> pd.DataFrame:
+    """Sobrante en altura por día, para seguir si crece o se estabiliza (DEC-052).
+
+    Una fila por día, con la **última corrida** de cada uno. El scheduler
+    corre cada hora, así que promediar mezclaría fotos del mismo día;
+    quedarse con la última da el estado con que cerró la jornada.
+
+    La fecha se pasa a hora de Colombia (UTC−5, AUD-B6): `ejecutado_en` se
+    guarda en UTC, y sin convertir las corridas de la noche caerían en el
+    día siguiente.
+    """
+    if not _objeto_existe("v_inventario_corridas", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """SELECT DATE(ejecutado_en, '-5 hours') AS dia,
+                      MAX(ejecutado_en)              AS ultima_corrida,
+                      COUNT(*)                       AS corridas,
+                      sobrante_referencias,
+                      sobrante_unidades,
+                      inventario_teorico,
+                      bochica_altura
+               FROM v_inventario_corridas
+               WHERE sobrante_unidades IS NOT NULL
+               GROUP BY dia
+               ORDER BY dia""",
+            con,
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def get_inventario_comparacion() -> pd.DataFrame:
     """Comparación por referencia: teórico vs. lo que reporta Bochica (DEC-041).
 

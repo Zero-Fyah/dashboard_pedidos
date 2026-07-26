@@ -24,8 +24,17 @@ from datetime import datetime
 import plotly.graph_objects as go
 import streamlit as st
 
-from db import get_inventario_anomalias, get_inventario_comparacion, get_inventario_corrida
+from db import (
+    get_inventario_anomalias,
+    get_inventario_comparacion,
+    get_inventario_corrida,
+    get_inventario_tendencia,
+)
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
+
+# Con menos días la variación es indistinguible del ruido: la tendencia se
+# muestra como tabla hasta que haya historia suficiente.
+DIAS_MINIMOS_TENDENCIA = 3
 
 st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_html=True)
 st.title("📦 Bodega vs. sistema administrativo")
@@ -119,6 +128,99 @@ if len(sobrantes):
         "**Qué revisar:** apunta a movimientos de montacarga ejecutados físicamente "
         "pero no registrados en el sistema — al almacenar mercancía que entra, o al "
         "reabastecer las ubicaciones de picking desde altura."
+    )
+
+st.divider()
+
+# ── Tendencia del sobrante ─────────────────────────────────────────────────────
+# Si el sobrante viene de movimientos sin registrar, la pregunta útil no es
+# cuánto hay hoy sino si crece: creciendo, se siguen perdiendo movimientos;
+# estable, el desfase es histórico y no se está agravando.
+st.subheader("Cómo evoluciona el sobrante")
+
+tendencia = get_inventario_tendencia()
+
+if tendencia.empty:
+    st.info("Todavía no hay corridas registradas para construir la tendencia.")
+elif len(tendencia) < DIAS_MINIMOS_TENDENCIA:
+    st.info(
+        f"Hay **{len(tendencia)} día(s)** de historia. Se necesitan al menos "
+        f"{DIAS_MINIMOS_TENDENCIA} para que una tendencia signifique algo — con menos, "
+        "cualquier variación es indistinguible del ruido. La serie se va armando sola "
+        "con cada corrida del scheduler."
+    )
+    st.dataframe(
+        tendencia[["dia", "corridas", "sobrante_referencias", "sobrante_unidades"]],
+        hide_index=True,
+        column_config={
+            "dia": st.column_config.TextColumn("Día", width="small"),
+            "corridas": st.column_config.NumberColumn("Corridas", format="%d", width="small"),
+            "sobrante_referencias": st.column_config.NumberColumn(
+                "Referencias con sobrante", format="%d"
+            ),
+            "sobrante_unidades": st.column_config.NumberColumn(
+                "Unidades de sobrante", format="%.0f"
+            ),
+        },
+    )
+else:
+    ultimo = tendencia.iloc[-1]
+    previo = tendencia.iloc[-2]
+    delta_u = ultimo["sobrante_unidades"] - previo["sobrante_unidades"]
+    delta_r = int(ultimo["sobrante_referencias"] - previo["sobrante_referencias"])
+
+    t1, t2, t3 = st.columns(3)
+    t1.metric(
+        "Sobrante hoy",
+        f"{ultimo['sobrante_unidades']:,.0f}",
+        f"{delta_u:+,.0f} vs. día anterior",
+        # Crecer es malo: se siguen perdiendo movimientos.
+        delta_color="inverse",
+    )
+    t2.metric(
+        "Referencias afectadas",
+        f"{int(ultimo['sobrante_referencias']):,}",
+        f"{delta_r:+d}",
+        delta_color="inverse",
+    )
+    t3.metric("Días de historia", f"{len(tendencia):,}")
+
+    # Una sola serie: sin leyenda, el título ya la nombra.
+    fig_t = go.Figure()
+    fig_t.add_scatter(
+        x=tendencia["dia"],
+        y=tendencia["sobrante_unidades"],
+        mode="lines+markers",
+        line=dict(color=GRAFICO_SERIES[0], width=2, shape="spline"),
+        marker=dict(size=8, color=GRAFICO_SERIES[0], line=dict(color=BG_DEEP, width=2)),
+        fill="tozeroy",
+        fillcolor="rgba(29,158,117,0.12)",
+        hovertemplate="<b>%{x}</b><br>%{y:,.0f} unidades de sobrante<extra></extra>",
+    )
+    fig_t.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=TEXT_SECONDARY, size=12),
+        margin=dict(l=10, r=10, t=20, b=10),
+        height=300,
+        showlegend=False,
+        hovermode="x unified",
+    )
+    fig_t.update_xaxes(
+        showgrid=False,
+        linecolor=GRAFICO_GRID,
+        tickfont=dict(color=TEXT_PRIMARY),
+        automargin=True,
+    )
+    fig_t.update_yaxes(
+        gridcolor=GRAFICO_GRID, zerolinecolor=GRAFICO_GRID, tickformat=",.0f", automargin=True
+    )
+    st.plotly_chart(fig_t, config={"displayModeBar": False})
+
+    st.caption(
+        "Un punto por día, tomando la última corrida de cada uno. **Si la línea sube, "
+        "se siguen ejecutando movimientos sin registrar**; si se aplana, el desfase es "
+        "histórico y dejó de agravarse."
     )
 
 st.divider()

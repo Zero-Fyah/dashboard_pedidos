@@ -53,6 +53,8 @@ _TABLAS = {
             picking_estimado       REAL,
             referencias_negativas  INTEGER,
             unidades_negativas     REAL,
+            sobrante_referencias   INTEGER,
+            sobrante_unidades      REAL,
             anomalias_filas        INTEGER,
             anomalias_unidades     REAL
         )
@@ -174,7 +176,7 @@ _VIEWS = {
                fuente_mas_vieja_h, datos_desactualizados,
                referencias, disponible_venta, vendido_no_alistado,
                inventario_teorico, bochica_altura, bochica_picking, bochica_paso,
-               picking_estimado, referencias_negativas, unidades_negativas,
+               picking_estimado, sobrante_referencias, sobrante_unidades,
                anomalias_filas, anomalias_unidades
         FROM inventario_corridas
     """,
@@ -317,6 +319,33 @@ def _migrar_columnas(con: sqlite3.Connection) -> None:
             if declarada not in existentes:
                 con.execute(f"ALTER TABLE {tabla} ADD COLUMN {declarada} {tipo}")
                 logger.info("_migrar_columnas: %s.%s agregada", tabla, declarada)
+    _backfill_sobrante(con)
+
+
+def _backfill_sobrante(con: sqlite3.Connection) -> None:
+    """Rellena el sobrante en las corridas anteriores a DEC-051.
+
+    Esas corridas ya traen el dato, solo que con el nombre de la lectura
+    vieja: `referencias_negativas` es el conteo de referencias con sobrante
+    y `unidades_negativas` es la misma cifra con el signo invertido. No hay
+    que recalcular nada — se copia, y así la tendencia arranca con toda la
+    historia disponible en vez de desde cero.
+    """
+    cambios = con.execute(
+        """UPDATE inventario_corridas
+           SET sobrante_referencias = referencias_negativas,
+               sobrante_unidades    = -unidades_negativas
+           WHERE sobrante_unidades IS NULL AND unidades_negativas IS NOT NULL"""
+    ).rowcount
+    # El UPDATE abre una transacción implícita bajo el isolation_level
+    # legacy de sqlite3, y sin cerrarla el `BEGIN IMMEDIATE` de
+    # `_crear_views()` revienta con "cannot start a transaction within a
+    # transaction" — dejando las VIEWs con la definición vieja y la corrida
+    # entera sin persistir. Los ALTER de arriba no dan problema porque el
+    # DDL no abre transacción implícita; solo el DML lo hace.
+    con.commit()
+    if cambios:
+        logger.info("_backfill_sobrante: %d corridas históricas completadas", cambios)
 
 
 def _columnas_declaradas(ddl: str) -> list[tuple[str, str]]:
@@ -412,7 +441,10 @@ def medir_frescura(
 
 def _resumir(comparacion: pd.DataFrame, anomalias: pd.DataFrame) -> dict[str, object]:
     """Calcula los agregados de la corrida que van a `inventario_corridas`."""
-    negativos = comparacion[comparacion["picking_estimado"] < 0]
+    # DEC-051: el sobrante en altura es el hallazgo. Se sigue guardando con
+    # el nombre viejo además del nuevo para no dejar en NULL una columna que
+    # las corridas históricas sí tienen poblada.
+    con_sobrante = comparacion[comparacion["sobrante_altura"] > 0]
     return {
         "referencias": len(comparacion),
         "disponible_venta": float(comparacion["disponible_venta"].sum()),
@@ -422,8 +454,10 @@ def _resumir(comparacion: pd.DataFrame, anomalias: pd.DataFrame) -> dict[str, ob
         "bochica_picking": float(comparacion["bochica_picking"].sum()),
         "bochica_paso": float(comparacion["bochica_paso"].sum()),
         "picking_estimado": float(comparacion["picking_estimado"].sum()),
-        "referencias_negativas": len(negativos),
-        "unidades_negativas": float(negativos["picking_estimado"].sum()),
+        "sobrante_referencias": len(con_sobrante),
+        "sobrante_unidades": float(con_sobrante["sobrante_altura"].sum()),
+        "referencias_negativas": len(con_sobrante),
+        "unidades_negativas": -float(con_sobrante["sobrante_altura"].sum()),
         "anomalias_filas": len(anomalias),
         "anomalias_unidades": float(anomalias["cantidad"].sum()) if len(anomalias) else 0.0,
     }

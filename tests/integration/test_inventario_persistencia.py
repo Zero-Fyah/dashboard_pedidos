@@ -494,3 +494,151 @@ def test_persistir_sin_catalogo_no_borra_el_puente(db):
     con = sqlite3.connect(db)
     assert con.execute("SELECT COUNT(*) FROM catalogo_productos").fetchone()[0] == 1
     con.close()
+
+
+# ─────────────────────────────────────────────
+# Migración de esquema y tendencia (DEC-051/052)
+# ─────────────────────────────────────────────
+
+
+def test_columna_nueva_se_agrega_a_una_tabla_existente(db):
+    """CREATE TABLE IF NOT EXISTS no toca una tabla ya creada."""
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE inventario_corridas (id INTEGER PRIMARY KEY, ejecutado_en TEXT)")
+    con.commit()
+    con.close()
+
+    init_schema(sqlite3.connect(db))
+    con = sqlite3.connect(db)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(inventario_corridas)")}
+    con.close()
+    assert {"sobrante_referencias", "sobrante_unidades", "bochica_altura"} <= cols
+
+
+def test_las_views_se_recrean_despues_de_migrar(db):
+    """El UPDATE del backfill abría una transacción implícita y hacía
+    reventar el BEGIN IMMEDIATE de las VIEWs — dejándolas con la definición
+    vieja y la corrida entera sin persistir."""
+    con = sqlite3.connect(db)
+    con.execute(
+        """CREATE TABLE inventario_corridas (id INTEGER PRIMARY KEY, ejecutado_en TEXT,
+           referencias_negativas INTEGER, unidades_negativas REAL)"""
+    )
+    con.execute(
+        "INSERT INTO inventario_corridas VALUES (1, '2026-07-01T00:00:00+00:00', 7, -700.0)"
+    )
+    con.commit()
+    con.close()
+
+    init_schema(sqlite3.connect(db))  # no debe lanzar
+    con = sqlite3.connect(db)
+    sql = con.execute(
+        "SELECT sql FROM sqlite_master WHERE name='v_inventario_corridas'"
+    ).fetchone()[0]
+    con.close()
+    assert "sobrante_referencias" in sql
+
+
+def test_backfill_recupera_el_sobrante_de_corridas_viejas(db):
+    """Las corridas anteriores a DEC-051 ya traen el dato con el nombre
+    viejo: se copia en vez de arrancar la tendencia desde cero."""
+    con = sqlite3.connect(db)
+    con.execute(
+        """CREATE TABLE inventario_corridas (id INTEGER PRIMARY KEY, ejecutado_en TEXT,
+           referencias_negativas INTEGER, unidades_negativas REAL)"""
+    )
+    con.execute(
+        "INSERT INTO inventario_corridas VALUES (1, '2026-07-01T00:00:00+00:00', 7, -700.0)"
+    )
+    con.commit()
+    con.close()
+
+    init_schema(sqlite3.connect(db))
+    con = sqlite3.connect(db)
+    fila = con.execute(
+        "SELECT sobrante_referencias, sobrante_unidades FROM inventario_corridas WHERE id=1"
+    ).fetchone()
+    con.close()
+    assert fila == (7, 700.0), "el signo se invierte: 'negativas' era el sobrante al revés"
+
+
+def test_backfill_no_pisa_lo_ya_calculado(db):
+    persistir(_comparacion(), _anomalias(), _FRESCURA_OK, db_path=db)
+    con = sqlite3.connect(db)
+    antes = con.execute("SELECT sobrante_unidades FROM inventario_corridas").fetchone()[0]
+    con.close()
+
+    init_schema(sqlite3.connect(db))  # vuelve a correr la migración
+    con = sqlite3.connect(db)
+    despues = con.execute("SELECT sobrante_unidades FROM inventario_corridas").fetchone()[0]
+    con.close()
+    assert antes == despues
+
+
+def test_la_corrida_registra_el_sobrante(db):
+    """PR11A: teórico 100, altura 372 → sobrante 272."""
+    con_sobrante = _comparacion(
+        [("PR11A", "PR", False, 100.0, 0.0, 100.0, 372.0, 5.0, 0.0, 377.0, 277.0, 272.0, -272.0)]
+    )
+    corrida_id = persistir(con_sobrante, _anomalias(), _FRESCURA_OK, db_path=db)
+    con = sqlite3.connect(db)
+    fila = con.execute(
+        "SELECT sobrante_referencias, sobrante_unidades FROM inventario_corridas WHERE id=?",
+        (corrida_id,),
+    ).fetchone()
+    con.close()
+    assert fila == (1, 272.0)
+
+
+def test_la_tendencia_toma_una_corrida_por_dia(db):
+    """El scheduler corre cada hora: promediar mezclaría fotos del mismo
+    día. Se toma la última, que es el estado con que cerró la jornada."""
+    con = sqlite3.connect(db)
+    init_schema(con)
+    filas = [
+        ("2026-07-20T14:00:00+00:00", 5, 500.0),
+        ("2026-07-20T20:00:00+00:00", 7, 700.0),  # última del 20 (09:00 hora CO)
+        ("2026-07-21T20:00:00+00:00", 9, 900.0),
+    ]
+    for momento, refs, unidades in filas:
+        con.execute(
+            """INSERT INTO inventario_corridas
+               (ejecutado_en, sobrante_referencias, sobrante_unidades)
+               VALUES (?, ?, ?)""",
+            (momento, refs, unidades),
+        )
+    con.commit()
+
+    serie = con.execute(
+        """SELECT DATE(ejecutado_en, '-5 hours') AS dia, COUNT(*),
+                  MAX(ejecutado_en), sobrante_unidades
+           FROM inventario_corridas
+           WHERE sobrante_unidades IS NOT NULL
+           GROUP BY dia ORDER BY dia"""
+    ).fetchall()
+    con.close()
+
+    assert len(serie) == 2, "dos días distintos"
+    assert serie[0][1] == 2, "el 20 agrupa dos corridas"
+    # SQLite: con un único MAX, las columnas sueltas vienen de esa misma
+    # fila (mismo comportamiento documentado que aprovecha DEC-021).
+    assert serie[0][3] == 700.0, "se queda con la última corrida del día"
+
+
+def test_la_fecha_de_la_tendencia_usa_hora_colombia(db):
+    """`ejecutado_en` se guarda en UTC. Sin convertir, una corrida de las
+    23:00 hora local caería en el día siguiente."""
+    con = sqlite3.connect(db)
+    init_schema(con)
+    # 2026-07-21 02:00 UTC = 2026-07-20 21:00 en Colombia.
+    con.execute(
+        """INSERT INTO inventario_corridas
+           (ejecutado_en, sobrante_referencias, sobrante_unidades)
+           VALUES ('2026-07-21T02:00:00+00:00', 3, 300.0)"""
+    )
+    con.commit()
+    dia = con.execute("SELECT DATE(ejecutado_en, '-5 hours') FROM inventario_corridas").fetchone()[
+        0
+    ]
+    con.close()
+    assert dia == "2026-07-20"
