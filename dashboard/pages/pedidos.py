@@ -127,7 +127,6 @@ else:
     )
     st.dataframe(
         df_consolidado,
-        use_container_width=True,
         hide_index=True,
         column_config={
             "Comprometido": st.column_config.NumberColumn(format="%g"),
@@ -170,7 +169,6 @@ else:
 
     evento_op = st.dataframe(
         df_pedidos_activos,
-        use_container_width=True,
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
@@ -228,7 +226,6 @@ else:
 
             st.dataframe(
                 df_det_op,
-                use_container_width=True,
                 hide_index=True,
                 column_config={
                     "Comprometido": st.column_config.NumberColumn(format="%g"),
@@ -250,7 +247,6 @@ if df_pedidos.empty:
 
 evento = st.dataframe(
     df_pedidos,
-    use_container_width=True,
     hide_index=True,
     on_select="rerun",
     selection_mode="single-row",
@@ -300,7 +296,6 @@ e4.metric("Pendiente", f"{int(df_detalle['Pendiente'].sum()):,}")
 
 st.dataframe(
     df_detalle,
-    use_container_width=True,
     hide_index=True,
     column_config={
         "Comprometido": st.column_config.NumberColumn(format="%g"),

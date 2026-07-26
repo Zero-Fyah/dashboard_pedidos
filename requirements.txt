@@ -3,7 +3,14 @@ playwright==1.60.0
 python-dotenv==1.2.2
 
 # Dashboard
-streamlit>=1.35.0
+# El piso subió de 1.35 al quitar `use_container_width` de dashboard/: en
+# versiones viejas ese parámetro venía en False por defecto, así que sin él
+# las tablas saldrían angostas en vez de ocupar el contenedor. Hoy `width`
+# ya trae "stretch" por defecto (verificado en la firma de st.dataframe) y
+# el parámetro viejo quedó deprecado con fecha de remoción 2025-12-31.
+# 1.59.2 es la versión contra la que se prueba; no se declara un piso menor
+# porque no está verificado en qué release exacto cambió el default.
+streamlit>=1.59
 plotly>=5.0.0
 
 # DEC-039 — parser de los Excel de inventario (admin + Bochica).
