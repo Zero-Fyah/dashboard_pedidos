@@ -42,41 +42,66 @@ st.set_page_config(
 
 inject_global_css()
 
-pg = st.navigation(
-    {
-        "Principal": [
-            st.Page(
-                "pages/inicio.py",
-                title="Inicio",
-                icon=":material/home:",
-                default=True,
-            ),
-        ],
-        "Pedidos": [
-            st.Page(
-                "pages/pedidos.py",
-                title="Consolidado",
-                icon=":material/local_shipping:",
-            ),
-        ],
-        "Tareas": [
-            st.Page(
-                "pages/tareas.py",
-                title="Calidad de datos",
-                icon=":material/checklist:",
-            ),
-        ],
-        # A medida que el proyecto evolucione, se agregan aquí nuevas
-        # secciones con sus páginas. La próxima prevista es la de
-        # inventario, que ya tiene su backend listo (DEC-043: lee de
-        # v_inventario_comparacion / v_inventario_anomalias /
-        # v_inventario_corridas):
-        # "Inventario": [
-        #     st.Page("pages/inventario.py", title="Bodega vs. sistema",
-        #             icon=":material/inventory_2:"),
-        # ],
-    },
-    expanded=True,  # secciones desplegadas por defecto en el sidebar
-)
+
+def _hay_tareas() -> bool:
+    """Decide si la sección de Tareas aparece en el menú (DEC-047).
+
+    Se oculta cuando no queda nada por hacer: ni inconsistencias detectadas
+    en el sistema administrativo ni tareas manuales abiertas.
+
+    **Nunca deja caer la app.** Ante cualquier error se devuelve True: un
+    menú con una sección de más es molesto; un dashboard que no arranca
+    porque falló un chequeo secundario, no.
+    """
+    try:
+        from tareas_db import hay_manuales_pendientes
+
+        from db import get_hallazgos
+
+        return not get_hallazgos().empty or hay_manuales_pendientes()
+    except Exception:
+        return True
+
+
+paginas: dict[str, list[st.Page]] = {
+    "Principal": [
+        st.Page(
+            "pages/inicio.py",
+            title="Inicio",
+            icon=":material/home:",
+            default=True,
+        ),
+    ],
+    "Pedidos": [
+        st.Page(
+            "pages/pedidos.py",
+            title="Consolidado",
+            icon=":material/local_shipping:",
+        ),
+    ],
+    # A medida que el proyecto evolucione, se agregan aquí nuevas
+    # secciones con sus páginas. La próxima prevista es la de
+    # inventario, que ya tiene su backend listo (DEC-043: lee de
+    # v_inventario_comparacion / v_inventario_anomalias /
+    # v_inventario_corridas):
+    # "Inventario": [
+    #     st.Page("pages/inventario.py", title="Bodega vs. sistema",
+    #             icon=":material/inventory_2:"),
+    # ],
+}
+
+# DEC-047: la sección solo existe mientras haya algo que mostrar. Cuando
+# se corrigen todas las inconsistencias en el sistema administrativo y no
+# quedan tareas manuales abiertas, desaparece del menú.
+if _hay_tareas():
+    paginas["Tareas"] = [
+        st.Page(
+            "pages/tareas.py",
+            title="Calidad de datos",
+            icon=":material/checklist:",
+        ),
+    ]
+
+pg = st.navigation(paginas, expanded=True)
 
 pg.run()

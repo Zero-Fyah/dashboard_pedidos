@@ -56,66 +56,30 @@ _CREATE = """
     )
 """
 
-# Backlog real, medido y documentado en docs/decisions.md. Se siembra una
-# sola vez (ver `_sembrar`): si el Arquitecto borra alguna, no reaparece.
+# Tareas MANUALES: las que no se pueden detectar midiendo los datos —
+# requieren criterio o son trabajo del proyecto, no del sistema
+# administrativo. Las inconsistencias medibles viven en
+# `inventario/hallazgos.py` y se actualizan solas (DEC-047).
+# Se siembran una sola vez: si el Arquitecto borra alguna, no reaparece.
 _SEMILLA: list[tuple[str, str, str, str, str]] = [
     (
         "Estandarizar nombres de producto",
         "El mismo producto aparece con nombres distintos entre el sistema "
         "administrativo y los pedidos. Sin nombres uniformes, agrupar por "
-        "producto en un reporte parte el mismo artículo en varias filas.",
+        "producto en un reporte parte el mismo artículo en varias filas. No "
+        "tiene detector automático: requiere criterio para decidir cuál es el "
+        "nombre correcto.",
         "Nombres y descripciones",
         "Alta",
         "DEC-045",
-    ),
-    (
-        "Códigos de barras asociados a múltiples IDs",
-        "663 códigos de barras del catálogo apuntan a 2 o más ID de "
-        "especificación. El caso extremo cuelga de 21 referencias distintas "
-        "(misma arena vendida por unidad, tonelada y corporativo). Impide "
-        "usar el código de barras como llave de producto.",
-        "Códigos y referencias",
-        "Alta",
-        "DEC-045",
-    ),
-    (
-        "Unificar cómo se escribe la Especificación entre sistemas",
-        "El mismo producto se escribe 'PRESENTACION: PR13 10KG MANZANA' en "
-        "pedidos y 'Presentación: PR13, 10KG, MANZANA; ' en el catálogo. "
-        "Solo el 32% cruza aun normalizando mayúsculas, tildes y comas. "
-        "Resolverlo habilita la llave más precisa para el ID de producto.",
-        "Nombres y descripciones",
-        "Alta",
-        "DEC-045",
-    ),
-    (
-        "Clasificar el estado 'Entregado sin liquidar'",
-        "737 subpedidos, aparecido el 2026-07-24. No está en ninguna lista de "
-        "comun/, así que el ETL lo reporta como desconocido en cada corrida. "
-        "730 de 737 ya tienen inicio_inspeccion y su registro llega hasta "
-        "'Entrega': la mercancía ya salió. Hace que 600 pedidos figuren como "
-        "activos e infla 'Días abierto'. Ojo: marcarlo cerrado haría que el "
-        "scraper deje de seguirlo hasta Completado.",
-        "Estados",
-        "Alta",
-        "Sesión 2026-07-25",
-    ),
-    (
-        "Referencias con espacio inicial y familia 'ER'",
-        "2 referencias del catálogo empiezan con espacio (' P…', 1.428 "
-        "unidades en Bochica) y hay una familia 'ER' de 1 sola referencia. "
-        "Con la regla familia = 2 primeros caracteres caen fuera de "
-        "FAMILIAS_PRODUCTO y quedan en un cubo sin clasificar.",
-        "Códigos y referencias",
-        "Baja",
-        "DEC-041",
     ),
     (
         "Semántica de placeholders en la columna descuento",
         "~1,14M valores no convertibles: placeholders '-' (≈920k) y etiquetas "
         "tipo 'Promoción30%' / 'Tipo de cambio3%' (≈165k) que no son montos. "
         "Es el 96% del costo estacionario del ETL — procesar basura que nunca "
-        "va a convertir.",
+        "va a convertir. Requiere decisión de negocio, no es una corrección "
+        "mecánica.",
         "Montos y placeholders",
         "Media",
         "AUD-M1 / DEC-020",
@@ -123,33 +87,20 @@ _SEMILLA: list[tuple[str, str, str, str, str]] = [
     (
         "Normalizar el estado a minúsculas en el scraper",
         "Hoy las comparaciones usan LOWER() en SQL, correcto con el 100% de "
-        "los datos actuales (ningún estado con mayúscula no-ASCII). A largo "
-        "plazo conviene normalizar con .lower() en la persistencia del "
-        "scraper y migrar lo existente, para no depender de LOWER() en cada "
-        "consulta.",
+        "los datos actuales. A largo plazo conviene normalizar con .lower() en "
+        "la persistencia del scraper y migrar lo existente. Es trabajo del "
+        "proyecto, no del sistema administrativo.",
         "Estados",
         "Baja",
         "HAL-011",
     ),
     (
-        "Placeholder '-' como Estado en 3 subpedidos",
-        "Confirmado en vivo que NO es bug del scraper: el sistema "
-        "administrativo muestra literalmente '-' en la columna Estado de "
-        "esos 3 subpedidos, y también en su 'Forma de pago'. Hipótesis: "
-        "nunca tuvieron forma de pago registrada al crearse. Los deja como "
-        "activos indefinidamente en el dashboard.",
-        "Estados",
-        "Baja",
-        "DEC-040",
-    ),
-    (
         "Explicar el picking_estimado negativo (PR11A y familia PS)",
         "El inventario de altura (fuente confiable) supera al teórico sin "
         "contar picking: −105.910 unidades agregadas, 162 referencias en "
-        "negativo. PR11A concentra −270.940. Hipótesis sin verificar: el "
-        "admin no publica como disponible mercancía que sí está en altura "
-        "(reservas, tránsito, inactivos), o el conteo de altura arrastra "
-        "error en las posiciones de estiba completa.",
+        "negativo. PR11A concentra −270.940. Hipótesis sin verificar: el admin "
+        "no publica como disponible mercancía que sí está en altura, o el "
+        "conteo de altura arrastra error en las estibas completas.",
         "Ubicaciones",
         "Alta",
         "DEC-043",
@@ -157,10 +108,9 @@ _SEMILLA: list[tuple[str, str, str, str, str]] = [
     (
         "Incorporar las ubicaciones fuera del layout",
         "47% de las unidades de Bochica (3,2M) están en ubicaciones que el "
-        "layout no cubre: buckets Q/R1/YU/Z, prefijos PU* y nombres de "
-        "ciudad. Es mercancía recibida por peso que se convierte a unidades "
-        "en un proceso aparte. Queda fuera del cruce hasta tener controlado "
-        "el flujo de unidades.",
+        "layout no cubre: buckets Q/R1/YU/Z, prefijos PU* y nombres de ciudad. "
+        "Es mercancía recibida por peso. Queda fuera del cruce hasta tener "
+        "controlado el flujo de unidades.",
         "Ubicaciones",
         "Media",
         "DEC-041",
@@ -318,3 +268,18 @@ def resumen() -> dict[str, int]:
         "total": len(df),
         **{e: int(conteo.get(e, 0)) for e in ESTADOS},
     }
+
+
+def hay_manuales_pendientes() -> bool:
+    """True si queda alguna tarea manual sin completar.
+
+    La usa `app.py` para decidir si el menú muestra la sección de Tareas.
+    Nunca levanta: si la base no se puede leer, se asume que hay tareas —
+    esconder el módulo por un error transitorio sería peor que mostrarlo
+    vacío.
+    """
+    try:
+        df = listar_tareas()
+    except Exception:
+        return True
+    return bool((df["estado"] != "Completada").any())

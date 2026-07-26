@@ -1,3 +1,4 @@
+import io
 import sqlite3
 import sys
 from pathlib import Path
@@ -152,6 +153,87 @@ def get_opciones_filtro() -> tuple[list[str], list[str], list[str], list[str]]:
     finally:
         con.close()
     return ["Todos", "Abiertos", "Cerrados"], estados, almacenes, tipos
+
+
+def _tabla_existe(nombre: str) -> bool:
+    """True si la tabla existe. Sin caché: se consulta al abrir la app."""
+    if not DB_PATH.exists():
+        return False
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=5)
+        existe = (
+            con.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", (nombre,)
+            ).fetchone()[0]
+            > 0
+        )
+        con.close()
+        return existe
+    except Exception:
+        return False
+
+
+def get_hallazgos() -> pd.DataFrame:
+    """Inconsistencias detectadas en la última corrida del scheduler (DEC-047).
+
+    Solo trae las que **todavía tienen casos**: `inventario/persistencia.py`
+    reescribe la tabla en cada corrida y no inserta los detectores que no
+    encontraron nada. Por eso una tarea resuelta en el sistema
+    administrativo desaparece sola.
+
+    Sin `st.cache_data`: son pocas filas y cachearlas retrasaría hasta
+    10 minutos el reflejo de una corrección recién hecha en el origen,
+    que es justo lo que el módulo promete mostrar al día.
+    """
+    if not _tabla_existe("tareas_hallazgos"):
+        return pd.DataFrame(
+            columns=[
+                "clave",
+                "titulo",
+                "explicacion",
+                "categoria",
+                "prioridad",
+                "origen",
+                "unidad",
+                "cantidad",
+                "medido_en",
+            ]
+        )
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """SELECT clave, titulo, explicacion, categoria, prioridad, origen,
+                      unidad, cantidad, medido_en
+               FROM tareas_hallazgos
+               ORDER BY CASE prioridad WHEN 'Alta' THEN 0 WHEN 'Media' THEN 1 ELSE 2 END,
+                        cantidad DESC""",
+            con,
+        )
+    finally:
+        con.close()
+
+
+def get_detalle_hallazgo(clave: str) -> pd.DataFrame:
+    """Listado de casos concretos de un hallazgo — el detalle de la tarea.
+
+    El detalle se guarda serializado porque cada detector tiene sus
+    propias columnas (un código de barras con sus IDs no se parece a un
+    estado con su conteo). Son cientos de filas, así que deserializar
+    completo es barato y evita inventar un esquema genérico que no le
+    quede bien a ninguno.
+    """
+    if not _tabla_existe("tareas_hallazgos"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        fila = con.execute(
+            "SELECT detalle FROM tareas_hallazgos WHERE clave = ?", (clave,)
+        ).fetchone()
+    finally:
+        con.close()
+    if not fila or not fila[0]:
+        return pd.DataFrame()
+    return pd.read_json(io.StringIO(fila[0]), orient="split")
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)

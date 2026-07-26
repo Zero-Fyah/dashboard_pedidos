@@ -83,6 +83,21 @@ _TABLAS = {
             PRIMARY KEY (referencia, codigo_barras)
         )
     """,
+    "tareas_hallazgos": """
+        CREATE TABLE IF NOT EXISTS tareas_hallazgos (
+            clave       TEXT PRIMARY KEY,
+            titulo      TEXT NOT NULL,
+            explicacion TEXT,
+            categoria   TEXT,
+            prioridad   TEXT,
+            origen      TEXT,
+            unidad      TEXT,
+            cantidad    INTEGER NOT NULL,
+            detalle     TEXT,
+            medido_en   TEXT,
+            corrida_id  INTEGER
+        )
+    """,
     "inventario_anomalias": """
         CREATE TABLE IF NOT EXISTS inventario_anomalias (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -307,6 +322,7 @@ def persistir(
     frescura: dict[str, object],
     db_path: str | None = None,
     catalogo: pd.DataFrame | None = None,
+    hallazgos: list | None = None,
 ) -> int:
     """Escribe el snapshot de la corrida, reemplazando el anterior.
 
@@ -323,6 +339,8 @@ def persistir(
             Si es None, `catalogo_productos` se deja intacta — así un
             problema del cruce de inventario no borra el puente que
             necesita la vista de Pedidos.
+        hallazgos: Resultado de `inventario.hallazgos.detectar_todos()`
+            (DEC-047). Si es None, `tareas_hallazgos` queda intacta.
 
     Returns:
         El `id` de la corrida registrada en `inventario_corridas`.
@@ -368,6 +386,34 @@ def persistir(
                     [
                         (*_normalizar(fila), corrida_id)
                         for fila in anomalias[list(_COLUMNAS_ANOMALIAS)].itertuples(index=False)
+                    ],
+                )
+
+            # DEC-047: los hallazgos de calidad de datos. El DELETE total
+            # es lo que hace que una tarea resuelta desaparezca: si el
+            # detector ya no encuentra casos, no se vuelve a insertar.
+            if hallazgos is not None:
+                con.execute("DELETE FROM tareas_hallazgos")
+                con.executemany(
+                    """INSERT INTO tareas_hallazgos
+                       (clave, titulo, explicacion, categoria, prioridad, origen,
+                        unidad, cantidad, detalle, medido_en, corrida_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        (
+                            h.clave,
+                            h.titulo,
+                            h.explicacion,
+                            h.categoria,
+                            h.prioridad,
+                            h.origen,
+                            h.unidad,
+                            h.cantidad,
+                            h.filas.to_json(orient="split", index=False),
+                            ejecutado_en,
+                            corrida_id,
+                        )
+                        for h in hallazgos
                     ],
                 )
 
@@ -434,6 +480,7 @@ def main() -> int:
         escritura.
     """
     from inventario.comparacion import anomalias_layout, calcular_vendido_no_alistado, comparar
+    from inventario.hallazgos import detectar_todos
     from inventario.layout import (
         RUTA_LAYOUT_DEFAULT,
         cargar_layout,
@@ -460,7 +507,15 @@ def main() -> int:
         comparacion = comparar(admin, bochica, calcular_vendido_no_alistado())
         anomalias = anomalias_layout(bochica)
 
-        corrida_id = persistir(comparacion, anomalias, frescura, catalogo=catalogo)
+        # DEC-047: los detectores leen el estado actual de la DB y del
+        # catálogo recién descargado, así que cada corrida refleja lo más
+        # reciente del sistema administrativo.
+        with sqlite3.connect(get_db_path(), timeout=30) as lectura:
+            hallazgos = detectar_todos(catalogo_completo, lectura)
+
+        corrida_id = persistir(
+            comparacion, anomalias, frescura, catalogo=catalogo, hallazgos=hallazgos
+        )
     except FileNotFoundError as e:
         logger.error("inventario: falta una fuente — %s", e)
         return 1
@@ -468,7 +523,11 @@ def main() -> int:
         logger.exception("inventario: la corrida falló sin persistir nada")
         return 1
 
-    logger.info("inventario: corrida %d persistida en pedidos.db", corrida_id)
+    logger.info(
+        "inventario: corrida %d persistida en pedidos.db (%d hallazgos de calidad)",
+        corrida_id,
+        len(hallazgos),
+    )
     return 0
 
 

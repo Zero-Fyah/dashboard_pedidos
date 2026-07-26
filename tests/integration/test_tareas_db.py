@@ -45,14 +45,15 @@ def _filas(db):
 
 def test_init_siembra_el_backlog_documentado(db):
     tareas_db.init_db()
-    assert _filas(db) == len(tareas_db._SEMILLA) == 10
+    assert _filas(db) == len(tareas_db._SEMILLA)
+    assert _filas(db) > 0, "la semilla no puede quedar vacía"
 
 
 def test_init_es_idempotente(db):
     """Se llama en cada carga de la página: no puede duplicar."""
     tareas_db.init_db()
     tareas_db.init_db()
-    assert _filas(db) == 10
+    assert _filas(db) == len(tareas_db._SEMILLA)
 
 
 def test_borrar_todas_no_las_revive(db):
@@ -85,7 +86,7 @@ def test_guardar_actualiza_sin_cambiar_el_id(db):
 
     nuevas, actualizadas, borradas = tareas_db.guardar_tareas(df)
     assert (nuevas, borradas) == (0, 0)
-    assert actualizadas == 10
+    assert actualizadas == len(tareas_db._SEMILLA)
 
     despues = tareas_db.listar_tareas()
     fila = despues[despues["id"] == id_original].iloc[0]
@@ -125,16 +126,17 @@ def test_guardar_inserta_filas_nuevas(db):
 
     nuevas, _, _ = tareas_db.guardar_tareas(df)
     assert nuevas == 1
-    assert _filas(db) == 11
+    assert _filas(db) == len(tareas_db._SEMILLA) + 1
     assert "Revisar unidades de peso" in set(tareas_db.listar_tareas()["titulo"])
 
 
 def test_guardar_borra_las_que_faltan(db):
     tareas_db.init_db()
-    df = tareas_db.listar_tareas().iloc[:3]
+    conservadas = 2
+    df = tareas_db.listar_tareas().iloc[:conservadas]
     _, _, borradas = tareas_db.guardar_tareas(df)
-    assert borradas == 7
-    assert _filas(db) == 3
+    assert borradas == len(tareas_db._SEMILLA) - conservadas
+    assert _filas(db) == conservadas
 
 
 def test_fila_sin_titulo_se_ignora(db):
@@ -146,7 +148,7 @@ def test_fila_sin_titulo_se_ignora(db):
 
     nuevas, _, _ = tareas_db.guardar_tareas(df)
     assert nuevas == 0
-    assert _filas(db) == 10
+    assert _filas(db) == len(tareas_db._SEMILLA)
 
 
 def test_valores_por_defecto_al_guardar(db):
@@ -187,6 +189,6 @@ def test_orden_prioriza_lo_activo_y_urgente(db):
 def test_resumen_cuenta_por_estado(db):
     tareas_db.init_db()
     r = tareas_db.resumen()
-    assert r["total"] == 10
-    assert r["Pendiente"] == 10
+    assert r["total"] == len(tareas_db._SEMILLA)
+    assert r["Pendiente"] == len(tareas_db._SEMILLA)
     assert r["Completada"] == 0
