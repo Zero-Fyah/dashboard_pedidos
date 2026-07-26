@@ -59,6 +59,13 @@ pg = st.navigation(
                 icon=":material/local_shipping:",
             ),
         ],
+        "Tareas": [
+            st.Page(
+                "pages/tareas.py",
+                title="Calidad de datos",
+                icon=":material/checklist:",
+            ),
+        ],
         # A medida que el proyecto evolucione, se agregan aquí nuevas
         # secciones con sus páginas. La próxima prevista es la de
         # inventario, que ya tiene su backend listo (DEC-043: lee de
