@@ -295,6 +295,18 @@ def get_operacion_ventanas() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_inventario_ubicaciones() -> pd.DataFrame:
+    """Líneas SKU-posición con su prioridad de conteo (DEC-057)."""
+    if not _objeto_existe("v_inventario_ubicaciones", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_inventario_ubicaciones", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def get_inventario_anomalias() -> pd.DataFrame:
     """Stock ubicado donde el layout dice que no debería haber (DEC-041)."""
     if not _objeto_existe("v_inventario_anomalias", "view"):

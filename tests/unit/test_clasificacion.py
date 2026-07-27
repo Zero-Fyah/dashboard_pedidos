@@ -13,6 +13,7 @@ import pytest
 from inventario.clasificacion import (
     NIVEL_FAMILIA,
     NIVEL_ID,
+    NIVEL_ID_GLOBAL,
     NIVEL_REFERENCIA,
     SIN_CONSUMO,
     VENTANA_MESES,
@@ -218,7 +219,9 @@ def test_sin_ventas_en_absoluto_no_rompe(con):
 def test_los_tres_niveles_se_calculan(con):
     _venta(con, "PA01", "2026-01", 10, 1000)
     df = calcular_clasificacion(_admin(["PA01"]), con, hoy=HOY)
-    assert set(df["nivel"]) == {NIVEL_FAMILIA, NIVEL_REFERENCIA, NIVEL_ID}
+    # DEC-057 sumó `id_global` fuera de la jerarquía; los tres de la
+    # jerarquía siguen siendo estos.
+    assert {NIVEL_FAMILIA, NIVEL_REFERENCIA, NIVEL_ID} <= set(df["nivel"])
 
 
 def test_el_pareto_de_referencias_corre_dentro_de_su_familia(con):
@@ -286,3 +289,62 @@ def test_un_par_ambiguo_no_atribuye_id(con):
     assert df[df.nivel == NIVEL_ID].empty
     # La referencia sí se clasifica: el nivel 2 no depende del puente.
     assert _refs(df).loc["PA01", "abc"] == "A"
+
+
+# ─────────────────────────────────────────────
+# ABC global (DEC-057)
+# ─────────────────────────────────────────────
+
+
+def test_abc_global_convive_con_el_jerarquico(con):
+    """El cuarto nivel se agrega sin tocar los tres de la jerarquía."""
+    _venta(con, "PA01", "2026-01", 10, 1000)
+    df = calcular_clasificacion(_admin(["PA01"]), con, hoy=HOY)
+
+    assert NIVEL_ID_GLOBAL in set(df["nivel"])
+    # Mismo universo de ID en ambos niveles: cambia el Pareto, no las filas.
+    assert set(df[df["nivel"] == NIVEL_ID]["clave"]) == set(
+        df[df["nivel"] == NIVEL_ID_GLOBAL]["clave"]
+    )
+
+
+def test_abc_global_compara_contra_todo_el_almacen_no_contra_el_padre(con):
+    """La diferencia que justifica el nivel nuevo.
+
+    `PB01` es una referencia marginal (1% del valor) pero su único ID la
+    domina por completo, así que en el jerárquico sale A. Priorizar conteos
+    con esa clase inflaría A: cada referencia aporta la suya.
+    """
+    especificaciones = [
+        ("PA01", "CB1", "ID_GRANDE", "grande"),
+        ("PB01", "CB2", "ID_CHICO", "chico"),
+    ]
+    admin = _admin(None, especificaciones=especificaciones)
+    _venta(con, "PA01", "2026-01", 100, 990_000, cb="CB1")
+    _venta(con, "PB01", "2026-01", 1, 10_000, cb="CB2")
+
+    df = calcular_clasificacion(admin, con, hoy=HOY)
+    jerarquico = df[df["nivel"] == NIVEL_ID].set_index("clave")["abc"]
+    global_ = df[df["nivel"] == NIVEL_ID_GLOBAL].set_index("clave")["abc"]
+
+    assert jerarquico["ID_CHICO"] == "A"  # manda dentro de su referencia
+    assert global_["ID_CHICO"] != "A"  # es marginal en el almacén
+    assert global_["ID_GRANDE"] == "A"
+
+
+def test_abc_global_reparte_cien_por_ciento_una_sola_vez(con):
+    """El acumulado global se corre sobre el total, no una vez por padre."""
+    _venta(con, "PA01", "2026-01", 10, 6000, cb="CB1")
+    _venta(con, "PB01", "2026-01", 10, 4000, cb="CB2")
+    admin = _admin(
+        None,
+        especificaciones=[
+            ("PA01", "CB1", "ID_A", "a"),
+            ("PB01", "CB2", "ID_B", "b"),
+        ],
+    )
+    df = calcular_clasificacion(admin, con, hoy=HOY)
+    global_ = df[df["nivel"] == NIVEL_ID_GLOBAL]
+
+    assert global_["pct_valor"].sum() == pytest.approx(100.0, abs=0.01)
+    assert global_["pct_acumulado"].max() == pytest.approx(100.0, abs=0.01)

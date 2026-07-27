@@ -170,6 +170,28 @@ _TABLAS = {
             corrida_id  INTEGER
         )
     """,
+    "inventario_ubicaciones": """
+        CREATE TABLE IF NOT EXISTS inventario_ubicaciones (
+            ubicacion         TEXT NOT NULL,
+            id_especificacion TEXT NOT NULL,
+            tipo              TEXT,
+            rack              TEXT,
+            posicion          INTEGER,
+            nivel             INTEGER,
+            referencia        TEXT,
+            familia           TEXT,
+            cantidad          REAL,
+            clase             TEXT,
+            xyz               TEXT,
+            clase_posicion    TEXT,
+            precio_unitario   REAL,
+            valor_linea       REAL,
+            dias_sin_salida   REAL,
+            prioridad         INTEGER,
+            corrida_id        INTEGER,
+            PRIMARY KEY (ubicacion, id_especificacion)
+        )
+    """,
     "inventario_anomalias": """
         CREATE TABLE IF NOT EXISTS inventario_anomalias (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -212,6 +234,13 @@ _VIEWS = {
         SELECT usuario, dia, primer_cierre, ultimo_cierre, ventana_h,
                subpedidos, lineas, unidades, utilizable
         FROM operacion_ventanas
+    """,
+    "v_inventario_ubicaciones": """
+        SELECT ubicacion, tipo, rack, posicion, nivel,
+               id_especificacion, referencia, familia, cantidad,
+               clase, xyz, clase_posicion,
+               precio_unitario, valor_linea, dias_sin_salida, prioridad
+        FROM inventario_ubicaciones
     """,
     "v_inventario_anomalias": """
         SELECT motivo, ubicacion, id_especificacion, cantidad
@@ -290,6 +319,25 @@ _COLUMNAS_ABC = (
     "xyz",
     "celda",
     "politica",
+)
+
+_COLUMNAS_UBICACIONES = (
+    "ubicacion",
+    "id_especificacion",
+    "tipo",
+    "rack",
+    "posicion",
+    "nivel",
+    "referencia",
+    "familia",
+    "cantidad",
+    "clase",
+    "xyz",
+    "clase_posicion",
+    "precio_unitario",
+    "valor_linea",
+    "dias_sin_salida",
+    "prioridad",
 )
 
 _COLUMNAS_SALUD = (
@@ -573,6 +621,7 @@ def persistir(
     abc: pd.DataFrame | None = None,
     operacion: pd.DataFrame | None = None,
     ventanas: pd.DataFrame | None = None,
+    ubicaciones: pd.DataFrame | None = None,
 ) -> int:
     """Escribe el snapshot de la corrida, reemplazando el anterior.
 
@@ -599,6 +648,9 @@ def persistir(
             (DEC-054). Si es None, `operacion_ciclos` queda intacta.
         ventanas: Resultado de `inventario.operacion.calcular_ventanas()`
             (DEC-055). Si es None, `operacion_ventanas` queda intacta.
+        ubicaciones: Resultado de
+            `inventario.ubicaciones.calcular_ubicaciones()` (DEC-057). Si
+            es None, `inventario_ubicaciones` queda intacta.
 
     Returns:
         El `id` de la corrida registrada en `inventario_corridas`.
@@ -727,6 +779,19 @@ def persistir(
                     ],
                 )
 
+            # DEC-057: líneas SKU-posición, la unidad de conteo del plan.
+            if ubicaciones is not None:
+                con.execute("DELETE FROM inventario_ubicaciones")
+                con.executemany(
+                    f"INSERT INTO inventario_ubicaciones "
+                    f"({', '.join(_COLUMNAS_UBICACIONES)}, corrida_id) "
+                    f"VALUES ({', '.join('?' * len(_COLUMNAS_UBICACIONES))}, ?)",
+                    [
+                        (*_normalizar(fila), corrida_id)
+                        for fila in ubicaciones[list(_COLUMNAS_UBICACIONES)].itertuples(index=False)
+                    ],
+                )
+
             # DEC-045: el puente producto↔pedido. Va en la misma transacción
             # para que el dashboard nunca lo vea a medio poblar.
             if catalogo is not None:
@@ -801,6 +866,7 @@ def main() -> int:
     from inventario.normalizador import cargar_admin, cargar_bochica, filtrar_alcance_admin
     from inventario.operacion import calcular_operacion, calcular_ventanas
     from inventario.salud import calcular_salud
+    from inventario.ubicaciones import calcular_ubicaciones
     from scraper.bochica import DESTINO_DEFAULT as BOCHICA_XLSX
     from scraper.inventario import DESTINO_DEFAULT as ADMIN_XLSX
 
@@ -832,6 +898,9 @@ def main() -> int:
             operacion = calcular_operacion(lectura)
             ventanas = calcular_ventanas(lectura)
 
+        # DEC-057: depende de abc y salud, por eso va tras el bloque de lectura.
+        ubicaciones = calcular_ubicaciones(bochica, abc, admin, salud)
+
         corrida_id = persistir(
             comparacion,
             anomalias,
@@ -842,6 +911,7 @@ def main() -> int:
             abc=abc,
             operacion=operacion,
             ventanas=ventanas,
+            ubicaciones=ubicaciones,
         )
     except FileNotFoundError as e:
         logger.error("inventario: falta una fuente — %s", e)

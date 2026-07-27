@@ -52,6 +52,17 @@ NIVEL_FAMILIA = "familia"
 NIVEL_REFERENCIA = "referencia"
 NIVEL_ID = "id"
 
+# Cuarto nivel, fuera de la jerarquía: el mismo ID comparado contra **todo
+# el almacén**, no contra los de su propia referencia (DEC-057).
+#
+# No reemplaza a `NIVEL_ID`, responde otra pregunta. El jerárquico dice
+# "dentro de esta referencia, cuáles mandan" — que es lo que sirve para
+# slotting, porque las variantes de una referencia comparten ubicación. El
+# global dice "de todo lo que hay en bodega, qué cuento primero" — que es
+# lo que sirve para priorizar conteos. Usar el jerárquico para priorizar
+# inflaría la clase A: cada referencia aporta las suyas.
+NIVEL_ID_GLOBAL = "id_global"
+
 # Política sugerida por celda. Es guía estándar de gestión de inventarios,
 # no una regla que el sistema aplique: la decisión sigue siendo del negocio.
 POLITICAS = {
@@ -193,14 +204,30 @@ def calcular_clasificacion(
         ],
     )
 
-    resultado = pd.concat([familias, referencias, ids], ignore_index=True)
+    # Sin columna `padre`, `_abc_xyz` corre el Pareto sobre todo el conjunto:
+    # ese es exactamente el ABC global (DEC-057).
+    etiquetas_id = mov_id.drop_duplicates("id_especificacion").set_index("id_especificacion")[
+        "especificacion"
+    ]
+    ids_globales = _abc_xyz(
+        mov_id.assign(clave=mov_id["id_especificacion"]),
+        meses,
+        nivel=NIVEL_ID_GLOBAL,
+        etiquetas=etiquetas_id,
+    )
+
+    resultado = pd.concat([familias, referencias, ids, ids_globales], ignore_index=True)
+    en_a = ids_globales["abc"] == "A"
     logger.info(
-        "calcular_clasificacion: ventana %s..%s · %d familias · %d referencias · %d ID",
+        "calcular_clasificacion: ventana %s..%s · %d familias · %d referencias · %d ID "
+        "· ABC global: %d ID clase A concentran %.1f%% del valor",
         meses[0],
         meses[-1],
         len(familias),
         len(referencias),
         len(ids),
+        int(en_a.sum()),
+        ids_globales.loc[en_a, "pct_valor"].sum(),
     )
     return resultado[_COLUMNAS]
 

@@ -95,6 +95,11 @@ paginas: dict[str, list[st.Page]] = {
             title="Clasificación ABC-XYZ",
             icon=":material/category:",
         ),
+        st.Page(
+            "pages/plan_conteo.py",
+            title="Plan de conteo",
+            icon=":material/checklist:",
+        ),
     ],
     "Operación": [
         st.Page(
