@@ -69,6 +69,19 @@ class Hallazgo:
         self.filas = filas
 
 
+def _tabla_existe(con: sqlite3.Connection, nombre: str) -> bool:
+    """True si la tabla ya está creada.
+
+    Hace falta porque los detectores corren **antes** de que la corrida
+    persista sus tablas: en una base recién creada, `inventario_ubicaciones`
+    todavía no existe y un SELECT la haría fallar.
+    """
+    fila = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (nombre,)
+    ).fetchone()
+    return fila is not None
+
+
 def _norm_especificacion(valor: object) -> str:
     """Normaliza un texto de especificación/presentación para compararlo.
 
@@ -424,6 +437,76 @@ def personal_duplicado(con: sqlite3.Connection) -> Hallazgo:
     )
 
 
+def productos_en_bodega_sin_precio(df_admin: pd.DataFrame, con: sqlite3.Connection) -> Hallazgo:
+    """Producto ocupando una posición que el catálogo no sabe cuánto vale.
+
+    No distorsiona la cola de conteo —esas líneas son casi todas de clase
+    "Sin rotación", que ya va última por clase, medido: 1.568 de 1.576— pero
+    sí deja un hueco real: hay decenas de miles de unidades en bodega sobre
+    las que no se puede decir si conviene contarlas primero, ni cuánto
+    capital representan.
+
+    Solo cuenta lo que **está en una posición**: un ID sin precio y sin
+    existencias es una ficha incompleta de algo que no está, y no compite
+    por la atención de nadie.
+    """
+    columnas = {
+        "id_especificacion": "ID",
+        "referencia": "Referencia",
+        "nombre_comercial": "Nombre comercial",
+        "posiciones": "Posiciones",
+        "unidades": "Unidades",
+    }
+    if not _tabla_existe(con, "inventario_ubicaciones"):
+        return Hallazgo(
+            clave="productos_en_bodega_sin_precio",
+            titulo="Producto en bodega sin precio en el catálogo",
+            explicacion="",
+            categoria="Montos y placeholders",
+            prioridad="Media",
+            origen="DEC-061",
+            unidad="productos",
+            cantidad=0,
+            filas=pd.DataFrame(columns=list(columnas.values())),
+        )
+
+    catalogo = df_admin[["id_especificacion", "referencia", "nombre_comercial", "precio"]].copy()
+    catalogo["id_especificacion"] = catalogo["id_especificacion"].astype(str)
+    catalogo["precio"] = pd.to_numeric(catalogo["precio"], errors="coerce")
+    sin_precio = catalogo[catalogo["precio"].fillna(0) <= 0]
+
+    en_bodega = pd.read_sql(
+        """SELECT id_especificacion,
+                  COUNT(DISTINCT ubicacion) AS posiciones,
+                  SUM(cantidad)             AS unidades
+           FROM inventario_ubicaciones
+           GROUP BY id_especificacion""",
+        con,
+    )
+    en_bodega["id_especificacion"] = en_bodega["id_especificacion"].astype(str)
+
+    afectados = sin_precio.merge(en_bodega, on="id_especificacion", how="inner")
+    filas = (
+        afectados[list(columnas)].rename(columns=columnas).sort_values("Unidades", ascending=False)
+    )
+    return Hallazgo(
+        clave="productos_en_bodega_sin_precio",
+        titulo="Producto en bodega sin precio en el catálogo",
+        explicacion=(
+            "Hay existencias de estos productos en posiciones del layout, pero el "
+            "catálogo no les asigna precio. No se pueden valorar, así que no se sabe "
+            "cuánto capital representan ni si conviene priorizarlos en el conteo. "
+            "Requiere asignarles precio o confirmarlos como descontinuados."
+        ),
+        categoria="Montos y placeholders",
+        prioridad="Media",
+        origen="DEC-061",
+        unidad="productos",
+        cantidad=len(filas),
+        filas=filas,
+    )
+
+
 def detectar_todos(df_admin: pd.DataFrame, con: sqlite3.Connection) -> list[Hallazgo]:
     """Corre todos los detectores y devuelve solo los que encontraron algo.
 
@@ -449,6 +532,7 @@ def detectar_todos(df_admin: pd.DataFrame, con: sqlite3.Connection) -> list[Hall
         lambda: estados_sin_clasificar(con),
         lambda: lineas_sin_id_producto(con),
         lambda: personal_duplicado(con),
+        lambda: productos_en_bodega_sin_precio(df_admin, con),
     ]
 
     encontrados: list[Hallazgo] = []

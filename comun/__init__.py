@@ -258,3 +258,73 @@ def get_db_path() -> str:
     path = Path(__file__).parent.parent / "data" / "pedidos.db"
     path.parent.mkdir(parents=True, exist_ok=True)
     return str(path)
+
+
+# ─────────────────────────────────────────────
+# Hoja de conteo físico — contrato entre etapas (DEC-058)
+# ─────────────────────────────────────────────
+#
+# El dashboard **escribe** esta hoja (la emite para ir a campo) y el
+# pipeline de inventario la **lee** de vuelta desde `data/conteos/`. Es un
+# contrato de datos entre dos etapas, así que vive acá y no en ninguna de
+# las dos: si las columnas se declararan por separado, un cambio en el
+# generador rompería el lector en silencio.
+#
+# Sigue el Anexo A del plan de inventario del área.
+
+COLUMNAS_HOJA_CONTEO: tuple[str, ...] = (
+    "fecha",
+    "ubicacion",
+    "id_especificacion",
+    "referencia",
+    "cantidad_contada",
+    "lote",
+    "vencimiento",
+    "hallazgo",
+    "causa",
+    "contado_por",
+    "actividad_origen",
+    "observacion",
+)
+
+# Sin estas cinco un conteo no es interpretable, así que el archivo se
+# rechaza entero. El resto es opcional: que falte el lote no invalida la
+# cantidad contada.
+COLUMNAS_CONTEO_REQUERIDAS: tuple[str, ...] = (
+    "fecha",
+    "ubicacion",
+    "id_especificacion",
+    "cantidad_contada",
+    "contado_por",
+)
+
+# Tolerancias de exactitud por clase, sección 4 del plan. La identidad del
+# SKU tiene tolerancia cero en todos los casos, pero eso se evalúa por
+# hallazgo, no por diferencia de cantidad.
+TOLERANCIA_POR_CLASE: dict[str, float] = {"A": 0.01, "B": 0.02, "C": 0.05}
+TOLERANCIA_CONTEO_DEFECTO: float = 0.05
+
+# Metas de IRA por clase, sección 12 del plan.
+META_IRA_POR_CLASE: dict[str, float] = {"A": 95.0, "B": 90.0, "C": 85.0}
+
+
+# Vocabulario cerrado de causas de discrepancia. **Cerrado a propósito**:
+# en texto libre, "error de despacho", "mal despachado" y "despacho" son
+# tres causas distintas para el Pareto, y el análisis mensual deja de
+# poder agrupar nada. Sale de la sección 10 del plan de inventario y del
+# catálogo de causas de su componente A.1.
+#
+# Solo aplica cuando hubo diferencia: un conteo que coincide no tiene causa
+# que investigar.
+CAUSAS_DISCREPANCIA: tuple[str, ...] = (
+    "Error de recepción",
+    "Error de despacho",
+    "Movimiento no registrado",
+    "Error de digitación",
+    "Producto dañado o avería",
+    "Mal ubicado",
+    "Sin identificar",
+)
+
+# Meta de antigüedad del último conteo para clase A, sección 12 del plan.
+META_ANTIGUEDAD_CONTEO_DIAS: int = 45

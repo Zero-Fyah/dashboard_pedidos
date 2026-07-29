@@ -29,6 +29,15 @@ TIPO_PICKING = "Picking"
 TIPO_ALTURA = "Altura"
 TIPO_PASO = "Paso Montacarga"
 TIPO_FUERA = "FUERA_LAYOUT"
+TIPO_VIRTUAL = "Virtual"
+
+# Racks que existen en Bochica pero **no son ubicaciones físicas**:
+# confirmado por el Arquitecto el 2026-07-27. Se separan de `FUERA_LAYOUT`
+# —que mezcla otros almacenes y mercancía por peso— para que queden
+# identificadas cuando se decida qué hacer con ellas. `O_51` es el caso
+# raro: rack real, posición una más allá del final declarado del layout.
+RACKS_VIRTUALES: frozenset[str] = frozenset({"Q", "R", "R1", "S", "T", "U", "Z", "YU"})
+UBICACIONES_VIRTUALES: frozenset[str] = frozenset({"O_51_1"})
 
 # Los tres valores que el layout puede traer en `Tipo Ubicación`.
 # `Paso Montacarga` (DEC-041) es un túnel transversal a mitad de rack, no
@@ -182,6 +191,12 @@ def clasificar_ubicaciones(df_bochica: pd.DataFrame, df_layout: pd.DataFrame) ->
         df_bochica: Resultado de `inventario.normalizador.cargar_bochica()`.
         df_layout: Resultado de `cargar_layout()`.
 
+    Las ubicaciones virtuales confirmadas (`RACKS_VIRTUALES`,
+    `UBICACIONES_VIRTUALES`) se marcan `Virtual` en vez de `FUERA_LAYOUT`:
+    no son un hallazgo de calidad de datos que haya que investigar, son
+    ubicaciones lógicas conocidas. Mezclarlas con las otras esconde las
+    que sí hay que revisar.
+
     Returns:
         `df_bochica` con las columnas `tipo`, `rack`, `posicion`,
         `altura`, `subbodega` y `activa` agregadas. `tipo` nunca es NaN:
@@ -199,6 +214,14 @@ def clasificar_ubicaciones(df_bochica: pd.DataFrame, df_layout: pd.DataFrame) ->
     ]
     anotado = df_bochica.merge(df_layout[columnas_layout], on="ubicacion", how="left")
     anotado["tipo"] = anotado["tipo"].fillna(TIPO_FUERA)
+
+    ubicacion = anotado["ubicacion"].astype(str)
+    es_virtual = ubicacion.isin(UBICACIONES_VIRTUALES) | ubicacion.str.split("_").str[0].isin(
+        RACKS_VIRTUALES
+    )
+    # Solo reclasifica lo que quedó fuera del layout: si el layout llegara a
+    # declarar uno de estos racks, manda el layout.
+    anotado.loc[es_virtual & (anotado["tipo"] == TIPO_FUERA), "tipo"] = TIPO_VIRTUAL
     return anotado
 
 

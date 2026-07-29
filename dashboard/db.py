@@ -295,6 +295,114 @@ def get_operacion_ventanas() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_cancelaciones() -> pd.DataFrame:
+    """Subpedidos alistados que después se cancelaron (DEC-063)."""
+    if not _objeto_existe("v_cancelaciones_alistadas", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_cancelaciones_alistadas", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_alertas() -> pd.DataFrame:
+    """Excepciones abiertas y resueltas, con su antigüedad (DEC-059)."""
+    if not _objeto_existe("v_alertas", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_alertas", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_inventario_corridas() -> pd.DataFrame:
+    """Historial de corridas, para las tendencias del scorecard (DEC-059)."""
+    if not _objeto_existe("v_inventario_corridas", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_inventario_corridas ORDER BY id", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_conteos_archivos() -> pd.DataFrame:
+    """Hojas de conteo vistas alguna vez, activas o anuladas (DEC-058)."""
+    if not _objeto_existe("v_conteos_archivos", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_conteos_archivos", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_ira() -> pd.DataFrame:
+    """IRA por clase, calculado por el pipeline sobre los conteos (DEC-058)."""
+    if not _objeto_existe("v_conteos_ira", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_conteos_ira", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_ira_periodo() -> pd.DataFrame:
+    """Serie temporal del IRA por clase (DEC-062)."""
+    if not _objeto_existe("v_conteos_ira_periodo", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_conteos_ira_periodo ORDER BY periodo", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_conformidad() -> pd.DataFrame:
+    """Conformidad por posición, separada por tipo de ubicación (DEC-062)."""
+    if not _objeto_existe("v_conteos_conformidad", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_conteos_conformidad", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_conteos() -> pd.DataFrame:
+    """Historial de conteos físicos ingeridos desde Excel (DEC-058)."""
+    if not _objeto_existe("v_conteos", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_conteos", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_inventario_posiciones() -> pd.DataFrame:
+    """Posiciones activas del layout, ocupadas y vacías (DEC-061)."""
+    if not _objeto_existe("v_inventario_posiciones", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_inventario_posiciones", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def get_inventario_ubicaciones() -> pd.DataFrame:
     """Líneas SKU-posición con su prioridad de conteo (DEC-057)."""
     if not _objeto_existe("v_inventario_ubicaciones", "view"):

@@ -21,10 +21,12 @@ de montacarga se hayan registrado.
 import sqlite3
 from datetime import datetime
 
+import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from db import (
+    get_cancelaciones,
     get_inventario_anomalias,
     get_inventario_comparacion,
     get_inventario_corrida,
@@ -403,6 +405,87 @@ else:
                 "cantidad": st.column_config.NumberColumn("Unidades", format="%.0f"),
             },
         )
+
+st.divider()
+st.subheader("🚚 Mercancía alistada que terminó cancelada")
+
+try:
+    cancelaciones = get_cancelaciones()
+except sqlite3.OperationalError:
+    cancelaciones = pd.DataFrame()
+
+if cancelaciones.empty:
+    st.caption("Sin subpedidos alistados y cancelados en el alcance del plan.")
+else:
+    rezagadas = cancelaciones[cancelaciones["dias_hasta_cancelacion"] > 30]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Subpedidos", f"{len(cancelaciones):,}".replace(",", "."))
+    c2.metric("Unidades que salieron", f"{cancelaciones['unidades'].sum():,.0f}".replace(",", "."))
+    c3.metric(
+        "Con más de un mes de rezago",
+        f"{len(rezagadas) / len(cancelaciones) * 100:.0f}%",
+        help="Días entre el cierre del alistamiento y el registro de la cancelación.",
+    )
+
+    st.markdown(
+        "Mercancía que **salió de su posición y nunca se despachó**. La lectura "
+        "intuitiva —«se alistó y enseguida se canceló, está en el piso»— **no es la "
+        "que dicen los datos**: el rezago mediano entre cerrar el alistamiento y "
+        f"registrar la cancelación es de **{cancelaciones['dias_hasta_cancelacion'].median():.0f} "
+        "días**. No es una devolución pendiente de hoy, es mercancía que estuvo en "
+        "estado indeterminado durante meses — y por eso es una explicación candidata "
+        "de las diferencias que el conteo va a encontrar."
+    )
+
+    mensual = (
+        cancelaciones.groupby("mes", as_index=False)
+        .agg(subpedidos=("id_pedido", "size"), unidades=("unidades", "sum"))
+        .sort_values("mes")
+    )
+    fig_c = go.Figure(
+        go.Bar(
+            x=mensual["mes"],
+            y=mensual["unidades"],
+            marker={"color": GRAFICO_SERIES[2]},
+            hovertemplate="%{x}<br>%{y:,.0f} unidades<extra></extra>",
+        )
+    )
+    fig_c.update_layout(
+        height=260,
+        margin={"l": 10, "r": 10, "t": 20, "b": 10},
+        paper_bgcolor=BG_DEEP,
+        plot_bgcolor=BG_DEEP,
+        font={"color": TEXT_PRIMARY},
+        xaxis={"gridcolor": GRAFICO_GRID, "automargin": True, "type": "category"},
+        yaxis={"gridcolor": GRAFICO_GRID, "automargin": True, "title": "Unidades"},
+    )
+    st.plotly_chart(fig_c, width="stretch")
+
+    with st.expander(f"Ver los {len(cancelaciones)} subpedidos"):
+        st.dataframe(
+            cancelaciones.sort_values("unidades", ascending=False),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "id_pedido": st.column_config.TextColumn("Pedido", width="small"),
+                "numero_subpedido": st.column_config.TextColumn("Subpedido", width="small"),
+                "mes": st.column_config.TextColumn("Mes", width="small"),
+                "alistador": st.column_config.TextColumn("Alistó", width="medium"),
+                "cierre_alistamiento": st.column_config.TextColumn("Cerró alistamiento"),
+                "cancelado_en": st.column_config.TextColumn("Se canceló"),
+                "dias_hasta_cancelacion": st.column_config.NumberColumn(
+                    "Días de rezago", format="%.0f"
+                ),
+                "lineas": st.column_config.NumberColumn("Líneas", format="%d"),
+                "unidades": st.column_config.NumberColumn("Unidades", format="%.0f"),
+                "valor": st.column_config.NumberColumn("Valor", format="$%d"),
+            },
+        )
+    st.caption(
+        "Alcance del plan: excluye arena por tonelada y otros almacenes. Sin ese "
+        "filtro serían 147.435 unidades, pero el 79% es arena y tapa la señal real."
+    )
+
 
 st.caption(
     "Alcance: solo ubicaciones del layout de bodega. La mercancía recibida por peso "

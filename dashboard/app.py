@@ -67,9 +67,16 @@ paginas: dict[str, list[st.Page]] = {
     "Principal": [
         st.Page(
             "pages/inicio.py",
-            title="Inicio",
-            icon=":material/home:",
+            title="Estado del área",
+            icon=":material/dashboard:",
             default=True,
+        ),
+        # Transversal: agrega excepciones de Salud, Inventario, Plan de
+        # conteo y Tareas, así que no cuelga de ninguno de ellos.
+        st.Page(
+            "pages/alertas.py",
+            title="Centro de alertas",
+            icon=":material/notification_important:",
         ),
     ],
     "Pedidos": [
@@ -94,6 +101,11 @@ paginas: dict[str, list[st.Page]] = {
             "pages/clasificacion.py",
             title="Clasificación ABC-XYZ",
             icon=":material/category:",
+        ),
+        st.Page(
+            "pages/mapa.py",
+            title="Mapa de bodega",
+            icon=":material/grid_view:",
         ),
         st.Page(
             "pages/plan_conteo.py",

@@ -8,7 +8,7 @@
 Scraper asíncrono de pedidos para un sistema administrativo interno (SPA Vue.js + Element Plus)
 de una empresa colombiana que gestiona su propia operación logística. Extrae pedidos, subpedidos,
 líneas de producto, línea de tiempo de alistamiento y registros operacionales; los almacena en
-SQLite en 10 tablas normalizadas y sirve como base de datos para un dashboard de análisis
+SQLite en 28 tablas normalizadas y sirve como base de datos para un dashboard de análisis
 operacional. Los datos recopilados servirán como insumo para un futuro sistema de predicción
 de demanda.
 
@@ -26,7 +26,7 @@ analítica sobre:
 - **Diferencias en envíos:** frecuencia, montos y productos con mayor incidencia.
 - **Rendimiento por operador:** tiempos y volúmenes por alistador e inspector.
 
-Este scraper extrae esa información de forma automatizada, la normaliza en 10 tablas SQLite
+Este scraper extrae esa información de forma automatizada, la normaliza en 28 tablas SQLite
 y la deja lista para análisis y visualización.
 
 ---
@@ -69,7 +69,7 @@ scraper/scraper_principal.py
         data/pedidos.db (SQLite · modo WAL)
                 │
                 ▼
-        etl/etl_principal.py   ← normalización de montos + 11 VIEWs (7 analíticas + 4 dashboard)
+        etl/etl_principal.py   ← normalización de montos + VIEWs analíticas
 ```
 
 El pipeline continúa hacia `dashboard/app.py` (Streamlit), que consume `data/pedidos.db` directamente.
@@ -97,10 +97,30 @@ dashboard_pedidos/
 │   ├── pedidos.db            # Base de datos SQLite
 │   ├── debug/                # HTMLs de debug — pueden contener PII
 │   └── errors/               # Screenshots de errores del scraper
-├── dashboard/                # Etapa 3 — visualización
+├── dashboard/                # Etapa 3 — visualización (Streamlit)
 │   ├── __init__.py
-│   ├── app.py                # Aplicación Streamlit
-│   └── db.py                 # Capa de datos (consultas SQLite)
+│   ├── app.py                # Entry point: tema + st.navigation
+│   ├── theme.py              # Paleta e inyección de CSS global
+│   ├── db.py                 # Capa de lectura (VIEWs de SQLite)
+│   ├── tareas_db.py          # Tareas manuales — data/tareas.db
+│   ├── conteos_io.py         # Recibe y archiva las hojas de conteo
+│   ├── components/
+│   └── pages/                # 9 páginas: estado, alertas, pedidos,
+│                             # inventario, salud, ABC-XYZ, mapa,
+│                             # plan de conteo, operación y tareas
+├── inventario/               # Cruce bodega ↔ sistema y plan de conteo
+│   ├── layout.py             # Clasificación de ubicaciones del layout
+│   ├── normalizador.py       # Carga y normalización de las 3 fuentes
+│   ├── comparacion.py        # Cruce y cálculo de sobrante
+│   ├── ubicaciones.py        # Línea SKU-posición y mapa de bodega
+│   ├── clasificacion.py      # ABC-XYZ jerárquico + ABC global
+│   ├── salud.py              # Cobertura, movimiento y quiebres
+│   ├── operacion.py          # Tiempos de ciclo y capacidad del equipo
+│   ├── conteos.py            # Ingesta de conteos físicos desde Excel
+│   ├── cancelaciones.py      # Mercancía alistada que se canceló
+│   ├── hallazgos.py          # Detectores de calidad de datos
+│   ├── alertas.py            # Centro de excepciones
+│   └── persistencia.py       # Esquema, VIEWs y escritura transaccional
 ├── docs/                     # Contexto persistente del proyecto
 │   ├── integral.md           # Visión, problema y objetivo de negocio
 │   ├── structure.md          # Arquitectura técnica y esquema de datos
@@ -159,6 +179,13 @@ dashboard_pedidos/
 | `detalle_diferencias` | Desglose por producto de las diferencias detectadas |
 | `registro_operaciones` | Log de acciones realizadas sobre el pedido: quién hizo qué y cuándo |
 | `errores` | Pedidos que fallaron el scraping, disponibles para reintento automático |
+| `meta` | Watermark de la última corrida OK del incremental |
+
+Además, el módulo `inventario/` mantiene sus propias tablas derivadas
+(comparación bodega ↔ sistema, línea SKU-posición, mapa de posiciones,
+clasificación ABC-XYZ, salud, tiempos de operación, conteos físicos,
+alertas y hallazgos de calidad), todas reconstruidas en cada corrida del
+scheduler salvo las que guardan historia.
 
 ---
 

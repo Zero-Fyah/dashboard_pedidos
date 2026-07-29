@@ -68,3 +68,5 @@ Thumbs.db
 # Documentación interna de negocio — NO versionar mientras el repo sea público (DEC-017)
 docs/
 CLAUDE.md
+# Conteos físicos del área de inventarios (DEC-058) — datos operativos reales
+data/conteos/

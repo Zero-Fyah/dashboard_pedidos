@@ -170,6 +170,39 @@ _TABLAS = {
             corrida_id  INTEGER
         )
     """,
+    "cancelaciones_alistadas": """
+        CREATE TABLE IF NOT EXISTS cancelaciones_alistadas (
+            id_pedido              TEXT NOT NULL,
+            numero_subpedido       TEXT NOT NULL,
+            mes                    TEXT,
+            alistador              TEXT,
+            cierre_alistamiento    TEXT,
+            cancelado_en           TEXT,
+            dias_hasta_cancelacion REAL,
+            lineas                 INTEGER,
+            unidades               REAL,
+            valor                  REAL,
+            corrida_id             INTEGER,
+            PRIMARY KEY (id_pedido, numero_subpedido)
+        )
+    """,
+    "inventario_posiciones": """
+        CREATE TABLE IF NOT EXISTS inventario_posiciones (
+            ubicacion      TEXT PRIMARY KEY,
+            tipo           TEXT,
+            rack           TEXT,
+            posicion       INTEGER,
+            nivel          INTEGER,
+            lineas         INTEGER,
+            unidades       REAL,
+            valor          REAL,
+            clase_posicion TEXT,
+            ocupada        INTEGER,
+            ultimo_conteo  TEXT,
+            dias_desde_conteo REAL,
+            corrida_id     INTEGER
+        )
+    """,
     "inventario_ubicaciones": """
         CREATE TABLE IF NOT EXISTS inventario_ubicaciones (
             ubicacion         TEXT NOT NULL,
@@ -182,6 +215,7 @@ _TABLAS = {
             familia           TEXT,
             cantidad          REAL,
             clase             TEXT,
+            origen_clase      TEXT,
             xyz               TEXT,
             clase_posicion    TEXT,
             precio_unitario   REAL,
@@ -190,6 +224,86 @@ _TABLAS = {
             prioridad         INTEGER,
             corrida_id        INTEGER,
             PRIMARY KEY (ubicacion, id_especificacion)
+        )
+    """,
+    "alertas": """
+        CREATE TABLE IF NOT EXISTS alertas (
+            clave       TEXT PRIMARY KEY,
+            tipo        TEXT,
+            severidad   TEXT,
+            entidad     TEXT,
+            detalle     TEXT,
+            valor       REAL,
+            modulo      TEXT,
+            primera_vez TEXT,
+            visto_en    TEXT,
+            corrida_id  INTEGER
+        )
+    """,
+    "conteos_archivos": """
+        CREATE TABLE IF NOT EXISTS conteos_archivos (
+            archivo       TEXT PRIMARY KEY,
+            filas         INTEGER,
+            modificado_en TEXT,
+            primera_vez   TEXT,
+            visto_en      TEXT,
+            corrida_id    INTEGER
+        )
+    """,
+    "conteos_ira_periodo": """
+        CREATE TABLE IF NOT EXISTS conteos_ira_periodo (
+            periodo    TEXT NOT NULL,
+            clase      TEXT NOT NULL,
+            contadas   INTEGER,
+            exactas    INTEGER,
+            ira        REAL,
+            corrida_id INTEGER,
+            PRIMARY KEY (periodo, clase)
+        )
+    """,
+    "conteos_conformidad": """
+        CREATE TABLE IF NOT EXISTS conteos_conformidad (
+            tipo         TEXT PRIMARY KEY,
+            posiciones   INTEGER,
+            conformes    INTEGER,
+            conformidad  REAL,
+            ultima_fecha TEXT,
+            corrida_id   INTEGER
+        )
+    """,
+    "conteos_ira": """
+        CREATE TABLE IF NOT EXISTS conteos_ira (
+            clase        TEXT PRIMARY KEY,
+            contadas     INTEGER,
+            exactas      INTEGER,
+            ira          REAL,
+            ultima_fecha TEXT,
+            corrida_id   INTEGER
+        )
+    """,
+    "conteos": """
+        CREATE TABLE IF NOT EXISTS conteos (
+            ubicacion         TEXT NOT NULL,
+            id_especificacion TEXT NOT NULL,
+            fecha             TEXT NOT NULL,
+            contado_por       TEXT NOT NULL,
+            cantidad_contada  REAL,
+            cantidad_sistema  REAL,
+            diferencia        REAL,
+            diferencia_pct    REAL,
+            clase             TEXT,
+            tipo              TEXT,
+            causa             TEXT,
+            tolerancia        REAL,
+            exacta            INTEGER,
+            hallazgo          TEXT,
+            lote              TEXT,
+            vencimiento       TEXT,
+            actividad_origen  TEXT,
+            observacion       TEXT,
+            archivo           TEXT,
+            corrida_id        INTEGER,
+            PRIMARY KEY (ubicacion, id_especificacion, fecha, contado_por)
         )
     """,
     "inventario_anomalias": """
@@ -235,12 +349,59 @@ _VIEWS = {
                subpedidos, lineas, unidades, utilizable
         FROM operacion_ventanas
     """,
+    "v_cancelaciones_alistadas": """
+        SELECT id_pedido, numero_subpedido, mes, alistador,
+               cierre_alistamiento, cancelado_en, dias_hasta_cancelacion,
+               lineas, unidades, valor
+        FROM cancelaciones_alistadas
+    """,
+    "v_inventario_posiciones": """
+        SELECT ubicacion, tipo, rack, posicion, nivel,
+               lineas, unidades, valor, clase_posicion, ocupada,
+               ultimo_conteo, dias_desde_conteo
+        FROM inventario_posiciones
+    """,
     "v_inventario_ubicaciones": """
         SELECT ubicacion, tipo, rack, posicion, nivel,
                id_especificacion, referencia, familia, cantidad,
-               clase, xyz, clase_posicion,
+               clase, origen_clase, xyz, clase_posicion,
                precio_unitario, valor_linea, dias_sin_salida, prioridad
         FROM inventario_ubicaciones
+    """,
+    "v_alertas": """
+        SELECT a.clave, a.tipo, a.severidad, a.entidad, a.detalle, a.valor,
+               a.modulo, a.primera_vez, a.visto_en,
+               -- Activa = se volvió a emitir en la última corrida. Una alerta
+               -- que dejó de emitirse quedó resuelta, y su `visto_en` marca
+               -- cuándo: de ahí sale el tiempo de resolución.
+               --
+               -- Se compara por `corrida_id`, no por `visto_en`: el timestamp
+               -- tiene resolución de segundos, así que dos corridas seguidas
+               -- lo bastante rápido dejaban a TODAS las alertas como activas.
+               CASE WHEN a.corrida_id = (SELECT MAX(corrida_id) FROM alertas)
+                    THEN 1 ELSE 0 END AS activa
+        FROM alertas a
+    """,
+    "v_conteos_archivos": """
+        SELECT archivo, filas, modificado_en, primera_vez, visto_en
+        FROM conteos_archivos
+    """,
+    "v_conteos_ira_periodo": """
+        SELECT periodo, clase, contadas, exactas, ira FROM conteos_ira_periodo
+    """,
+    "v_conteos_conformidad": """
+        SELECT tipo, posiciones, conformes, conformidad, ultima_fecha
+        FROM conteos_conformidad
+    """,
+    "v_conteos_ira": """
+        SELECT clase, contadas, exactas, ira, ultima_fecha FROM conteos_ira
+    """,
+    "v_conteos": """
+        SELECT ubicacion, id_especificacion, fecha, contado_por,
+               cantidad_contada, cantidad_sistema, diferencia, diferencia_pct,
+               clase, tipo, causa, tolerancia, exacta, hallazgo,
+               lote, vencimiento, actividad_origen, observacion, archivo
+        FROM conteos
     """,
     "v_inventario_anomalias": """
         SELECT motivo, ubicacion, id_especificacion, cantidad
@@ -321,6 +482,34 @@ _COLUMNAS_ABC = (
     "politica",
 )
 
+_COLUMNAS_CANCELACIONES = (
+    "id_pedido",
+    "numero_subpedido",
+    "mes",
+    "alistador",
+    "cierre_alistamiento",
+    "cancelado_en",
+    "dias_hasta_cancelacion",
+    "lineas",
+    "unidades",
+    "valor",
+)
+
+_COLUMNAS_POSICIONES = (
+    "ubicacion",
+    "tipo",
+    "rack",
+    "posicion",
+    "nivel",
+    "lineas",
+    "unidades",
+    "valor",
+    "clase_posicion",
+    "ocupada",
+    "ultimo_conteo",
+    "dias_desde_conteo",
+)
+
 _COLUMNAS_UBICACIONES = (
     "ubicacion",
     "id_especificacion",
@@ -332,12 +521,41 @@ _COLUMNAS_UBICACIONES = (
     "familia",
     "cantidad",
     "clase",
+    "origen_clase",
     "xyz",
     "clase_posicion",
     "precio_unitario",
     "valor_linea",
     "dias_sin_salida",
     "prioridad",
+)
+
+_COLUMNAS_IRA_PERIODO = ("periodo", "clase", "contadas", "exactas", "ira")
+
+_COLUMNAS_CONFORMIDAD = ("tipo", "posiciones", "conformes", "conformidad", "ultima_fecha")
+
+_COLUMNAS_IRA = ("clase", "contadas", "exactas", "ira", "ultima_fecha")
+
+_COLUMNAS_CONTEOS = (
+    "ubicacion",
+    "id_especificacion",
+    "fecha",
+    "contado_por",
+    "cantidad_contada",
+    "cantidad_sistema",
+    "diferencia",
+    "diferencia_pct",
+    "clase",
+    "tipo",
+    "causa",
+    "tolerancia",
+    "exacta",
+    "hallazgo",
+    "lote",
+    "vencimiento",
+    "actividad_origen",
+    "observacion",
+    "archivo",
 )
 
 _COLUMNAS_SALUD = (
@@ -622,6 +840,14 @@ def persistir(
     operacion: pd.DataFrame | None = None,
     ventanas: pd.DataFrame | None = None,
     ubicaciones: pd.DataFrame | None = None,
+    conteos: pd.DataFrame | None = None,
+    ira: pd.DataFrame | None = None,
+    archivos: pd.DataFrame | None = None,
+    alertas: pd.DataFrame | None = None,
+    posiciones: pd.DataFrame | None = None,
+    ira_periodo: pd.DataFrame | None = None,
+    conformidad: pd.DataFrame | None = None,
+    cancelaciones: pd.DataFrame | None = None,
 ) -> int:
     """Escribe el snapshot de la corrida, reemplazando el anterior.
 
@@ -651,6 +877,24 @@ def persistir(
         ubicaciones: Resultado de
             `inventario.ubicaciones.calcular_ubicaciones()` (DEC-057). Si
             es None, `inventario_ubicaciones` queda intacta.
+        conteos: Resultado de `inventario.conteos.evaluar_conteos()`
+            (DEC-058). **Espejo de `data/conteos/`**: se reemplaza entera,
+            para que sacar una hoja de la carpeta deshaga su conteo. `None`
+            deja la tabla intacta (carpeta ausente ≠ carpeta vacía).
+        archivos: Resultado de `inventario.conteos.inventariar_archivos()`.
+            Este sí acumula: es la constancia de que una hoja existió.
+        alertas: Resultado de `inventario.alertas.generar_alertas()`
+            (DEC-059). Se upsertan conservando la fecha de aparición.
+        posiciones: Resultado de `inventario.ubicaciones.mapa_posiciones()`
+            (DEC-061). Incluye las posiciones vacías.
+        ira_periodo: Resultado de `inventario.conteos.ira_por_periodo()`
+            (DEC-062). Snapshot: se recalcula entero desde `conteos`.
+        conformidad: Resultado de
+            `inventario.conteos.conformidad_por_tipo()` (DEC-062).
+        cancelaciones: Resultado de
+            `inventario.cancelaciones.calcular_cancelaciones()` (DEC-063).
+        ira: Resultado de `inventario.conteos.calcular_ira()` (DEC-058).
+            Este sí es snapshot: se recalcula entero desde `conteos`.
 
     Returns:
         El `id` de la corrida registrada en `inventario_corridas`.
@@ -779,6 +1023,150 @@ def persistir(
                     ],
                 )
 
+            # Las dos series derivadas de `conteos` son snapshot por la
+            # misma razón que el IRA: se recalculan enteras.
+            for tabla, columnas, datos in (
+                ("conteos_ira_periodo", _COLUMNAS_IRA_PERIODO, ira_periodo),
+                ("conteos_conformidad", _COLUMNAS_CONFORMIDAD, conformidad),
+            ):
+                if datos is not None:
+                    con.execute(f"DELETE FROM {tabla}")  # noqa: S608 — nombre literal
+                    if len(datos):
+                        con.executemany(
+                            f"INSERT INTO {tabla} "  # noqa: S608
+                            f"({', '.join(columnas)}, corrida_id) "
+                            f"VALUES ({', '.join('?' * len(columnas))}, ?)",
+                            [
+                                (*_normalizar(fila), corrida_id)
+                                for fila in datos[list(columnas)].itertuples(index=False)
+                            ],
+                        )
+
+            # El IRA sí es snapshot: se deriva por completo de `conteos`,
+            # así que reemplazarlo no pierde nada.
+            if ira is not None:
+                con.execute("DELETE FROM conteos_ira")
+                con.executemany(
+                    f"INSERT INTO conteos_ira "
+                    f"({', '.join(_COLUMNAS_IRA)}, corrida_id) "
+                    f"VALUES ({', '.join('?' * len(_COLUMNAS_IRA))}, ?)",
+                    [
+                        (*_normalizar(fila), corrida_id)
+                        for fila in ira[list(_COLUMNAS_IRA)].itertuples(index=False)
+                    ],
+                )
+
+            # DEC-059: las alertas se upsertan conservando `primera_vez`.
+            # No se borran las que dejaron de emitirse: su `visto_en` viejo
+            # las marca como resueltas y permite medir cuánto tardaron.
+            if alertas is not None and len(alertas):
+                con.executemany(
+                    """INSERT INTO alertas
+                           (clave, tipo, severidad, entidad, detalle, valor, modulo,
+                            primera_vez, visto_en, corrida_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(clave) DO UPDATE SET
+                           tipo = excluded.tipo,
+                           severidad = excluded.severidad,
+                           entidad = excluded.entidad,
+                           detalle = excluded.detalle,
+                           valor = excluded.valor,
+                           modulo = excluded.modulo,
+                           visto_en = excluded.visto_en,
+                           corrida_id = excluded.corrida_id""",
+                    [
+                        (
+                            f.clave,
+                            f.tipo,
+                            f.severidad,
+                            f.entidad,
+                            f.detalle,
+                            None if pd.isna(f.valor) else float(f.valor),
+                            f.modulo,
+                            ejecutado_en,
+                            ejecutado_en,
+                            corrida_id,
+                        )
+                        for f in alertas.itertuples(index=False)
+                    ],
+                )
+
+            # DEC-058: `conteos` es un ESPEJO de `data/conteos/`, no un
+            # acumulado. Se reconstruye entera para que sacar una hoja de la
+            # carpeta deshaga su conteo — la operación de corrección que el
+            # área necesita y que un acumulado hacía imposible.
+            #
+            # El `None` sigue significando "no toques la tabla": es el caso
+            # de la carpeta ausente, distinto de la carpeta vacía.
+            if conteos is not None:
+                con.execute("DELETE FROM conteos")
+                if len(conteos):
+                    con.executemany(
+                        f"INSERT INTO conteos "
+                        f"({', '.join(_COLUMNAS_CONTEOS)}, corrida_id) "
+                        f"VALUES ({', '.join('?' * len(_COLUMNAS_CONTEOS))}, ?)",
+                        [
+                            (*_normalizar(fila), corrida_id)
+                            for fila in conteos[list(_COLUMNAS_CONTEOS)].itertuples(index=False)
+                        ],
+                    )
+
+            # El inventario de archivos SÍ acumula: es la constancia de que
+            # una hoja existió. `primera_vez` se conserva con COALESCE sobre
+            # el valor ya guardado, así el upsert no la pisa.
+            if archivos is not None and len(archivos):
+                con.executemany(
+                    """INSERT INTO conteos_archivos
+                           (archivo, filas, modificado_en, primera_vez, visto_en, corrida_id)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(archivo) DO UPDATE SET
+                           filas = excluded.filas,
+                           modificado_en = excluded.modificado_en,
+                           visto_en = excluded.visto_en,
+                           corrida_id = excluded.corrida_id""",
+                    [
+                        (
+                            fila.archivo,
+                            fila.filas,
+                            fila.modificado_en,
+                            fila.visto_en,
+                            fila.visto_en,
+                            corrida_id,
+                        )
+                        for fila in archivos.itertuples(index=False)
+                    ],
+                )
+
+            # DEC-063: snapshot — se recalcula entero desde subpedidos.
+            if cancelaciones is not None:
+                con.execute("DELETE FROM cancelaciones_alistadas")
+                if len(cancelaciones):
+                    con.executemany(
+                        f"INSERT INTO cancelaciones_alistadas "
+                        f"({', '.join(_COLUMNAS_CANCELACIONES)}, corrida_id) "
+                        f"VALUES ({', '.join('?' * len(_COLUMNAS_CANCELACIONES))}, ?)",
+                        [
+                            (*_normalizar(fila), corrida_id)
+                            for fila in cancelaciones[list(_COLUMNAS_CANCELACIONES)].itertuples(
+                                index=False
+                            )
+                        ],
+                    )
+
+            # DEC-061: el mapa de bodega — incluye las posiciones VACÍAS,
+            # que son la mitad de la información en un mapa de ocupación.
+            if posiciones is not None:
+                con.execute("DELETE FROM inventario_posiciones")
+                con.executemany(
+                    f"INSERT INTO inventario_posiciones "
+                    f"({', '.join(_COLUMNAS_POSICIONES)}, corrida_id) "
+                    f"VALUES ({', '.join('?' * len(_COLUMNAS_POSICIONES))}, ?)",
+                    [
+                        (*_normalizar(fila), corrida_id)
+                        for fila in posiciones[list(_COLUMNAS_POSICIONES)].itertuples(index=False)
+                    ],
+                )
+
             # DEC-057: líneas SKU-posición, la unidad de conteo del plan.
             if ubicaciones is not None:
                 con.execute("DELETE FROM inventario_ubicaciones")
@@ -854,8 +1242,19 @@ def main() -> int:
         0 si la corrida se persistió, 1 si faltó una fuente o falló la
         escritura.
     """
+    from inventario.alertas import generar_alertas
+    from inventario.cancelaciones import calcular_cancelaciones
     from inventario.clasificacion import calcular_clasificacion
     from inventario.comparacion import anomalias_layout, calcular_vendido_no_alistado, comparar
+    from inventario.conteos import (
+        RUTA_CONTEOS_DEFAULT,
+        calcular_ira,
+        cargar_conteos,
+        conformidad_por_tipo,
+        evaluar_conteos,
+        inventariar_archivos,
+        ira_por_periodo,
+    )
     from inventario.hallazgos import detectar_todos
     from inventario.layout import (
         RUTA_LAYOUT_DEFAULT,
@@ -866,7 +1265,7 @@ def main() -> int:
     from inventario.normalizador import cargar_admin, cargar_bochica, filtrar_alcance_admin
     from inventario.operacion import calcular_operacion, calcular_ventanas
     from inventario.salud import calcular_salud
-    from inventario.ubicaciones import calcular_ubicaciones
+    from inventario.ubicaciones import calcular_ubicaciones, mapa_posiciones
     from scraper.bochica import DESTINO_DEFAULT as BOCHICA_XLSX
     from scraper.inventario import DESTINO_DEFAULT as ADMIN_XLSX
 
@@ -897,9 +1296,19 @@ def main() -> int:
             abc = calcular_clasificacion(admin, lectura)
             operacion = calcular_operacion(lectura)
             ventanas = calcular_ventanas(lectura)
+            cancelaciones = calcular_cancelaciones(lectura, admin)
 
         # DEC-057: depende de abc y salud, por eso va tras el bloque de lectura.
         ubicaciones = calcular_ubicaciones(bochica, abc, admin, salud)
+        # DEC-058: los conteos se comparan contra las líneas recién calculadas.
+        # Carpeta ausente => None => la tabla no se toca. Carpeta vacía =>
+        # DataFrame vacío => el espejo queda vacío, que es lo correcto.
+        if RUTA_CONTEOS_DEFAULT.exists():
+            crudo_conteos = cargar_conteos()
+            conteos = evaluar_conteos(crudo_conteos, ubicaciones)
+            archivos = inventariar_archivos(crudo_conteos)
+        else:
+            conteos = archivos = None
 
         corrida_id = persistir(
             comparacion,
@@ -912,6 +1321,25 @@ def main() -> int:
             operacion=operacion,
             ventanas=ventanas,
             ubicaciones=ubicaciones,
+            # DEC-062: el mapa fecha el último conteo de cada posición,
+            # así que necesita los conteos ya evaluados.
+            posiciones=mapa_posiciones(ubicaciones, layout, conteos),
+            conteos=conteos,
+            ira=calcular_ira(conteos) if conteos is not None else None,
+            ira_periodo=ira_por_periodo(conteos) if conteos is not None else None,
+            conformidad=conformidad_por_tipo(conteos) if conteos is not None else None,
+            cancelaciones=cancelaciones,
+            alertas=generar_alertas(
+                salud,
+                comparacion,
+                ubicaciones,
+                conteos,
+                abc,
+                frescura,
+                hallazgos,
+                cancelaciones,
+            ),
+            archivos=archivos,
         )
     except FileNotFoundError as e:
         logger.error("inventario: falta una fuente — %s", e)

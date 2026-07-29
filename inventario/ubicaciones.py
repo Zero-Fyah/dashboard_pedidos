@@ -21,6 +21,7 @@ que se da, es **la priorización del trabajo de conteo y la verificación de
 los supuestos de dimensionamiento**.
 """
 
+import datetime as dt
 import logging
 
 import pandas as pd
@@ -39,6 +40,19 @@ SIN_ROTACION = "Sin rotación"
 # la posición de bajo movimiento y alto valor.
 ORDEN_CLASE = ("A", "B", "C", SIN_ROTACION)
 
+# Sufijo para la clase heredada de la referencia. Un ID que no está en el
+# puente de atribución (DEC-053) es **invisible** para el ABC por ID, y eso
+# no es lo mismo que no venderse: medido, el 92,3% de los ID que caían en
+# "Sin rotación" simplemente no eran atribuibles, y el 57,9% de esas líneas
+# pertenecía a referencias con ventas en los últimos 90 días. Tratarlos como
+# producto muerto los mandaba al fondo de la cola sin evidencia.
+#
+# La referencia sí se puede clasificar siempre (no necesita el puente), así
+# que se hereda su clase y se marca el origen para no fingir precisión que
+# no hay. La causa de fondo es el código de barras no único por ID, que ya
+# está en Tareas como hallazgo (DEC-047).
+SUFIJO_HEREDADA = " (por referencia)"
+
 _COLUMNAS = [
     "ubicacion",
     "tipo",
@@ -50,6 +64,7 @@ _COLUMNAS = [
     "familia",
     "cantidad",
     "clase",
+    "origen_clase",
     "xyz",
     "clase_posicion",
     "precio_unitario",
@@ -102,10 +117,28 @@ def calcular_ubicaciones(
         on="id_especificacion",
         how="left",
     )
-    # Un ID sin ventas en la ventana no aparece en el ABC. No es clase C:
-    # es "la operación no lo va a tocar sola", que es precisamente el caso
-    # que el barrido dirigido existe para cubrir.
+
+    # ── Respaldo por referencia, para los ID no atribuibles ──────────
+    # El nivel de referencia no depende del puente, así que cubre a los ID
+    # que el ABC por ID no puede ver. Se marca de dónde salió la clase.
+    refs = abc[abc["nivel"] == "referencia"][["clave", "abc"]].copy()
+    refs["clave"] = refs["clave"].astype(str)
+    lineas = lineas.merge(
+        refs.rename(columns={"clave": "referencia", "abc": "_clase_ref"}),
+        on="referencia",
+        how="left",
+    )
+    sin_clase_propia = lineas["clase"].isna()
+    heredable = sin_clase_propia & lineas["_clase_ref"].isin(["A", "B", "C"])
+    lineas.loc[heredable, "clase"] = lineas.loc[heredable, "_clase_ref"] + SUFIJO_HEREDADA
+    # Lo que queda sin clase por ningún camino sí es producto sin rotación:
+    # ni el ID ni su referencia vendieron. Es el caso que el barrido
+    # dirigido existe para cubrir, porque la operación no lo va a tocar sola.
     lineas["clase"] = lineas["clase"].fillna(SIN_ROTACION)
+    lineas["origen_clase"] = "ID"
+    lineas.loc[heredable, "origen_clase"] = "Referencia"
+    lineas.loc[lineas["clase"] == SIN_ROTACION, "origen_clase"] = "Sin ventas"
+    lineas = lineas.drop(columns="_clase_ref")
 
     # ── Valor de lo que hay en la posición ───────────────────────────
     precios = df_admin[["id_especificacion", "precio"]].copy()
@@ -136,11 +169,20 @@ def calcular_ubicaciones(
     # ── Clase de la posición: la más alta presente ───────────────────
     # Regla del plan de inventario: una sola línea A eleva toda la posición
     # a prioridad A, porque la visita física es a la posición, no a la línea.
-    rango = {clase: i for i, clase in enumerate(ORDEN_CLASE)}
-    lineas["_rango"] = lineas["clase"].map(rango).fillna(len(ORDEN_CLASE)).astype(int)
+    #
+    # La clase heredada va justo detrás de la propia: un "A por referencia"
+    # sigue siendo prioritario, pero con menos certeza que un A confirmado,
+    # así que no le gana el turno.
+    rango = {}
+    for base in ("A", "B", "C"):
+        rango[base] = len(rango)
+        rango[base + SUFIJO_HEREDADA] = len(rango)
+    rango[SIN_ROTACION] = len(rango)
+    orden_clases = sorted(rango, key=rango.get)
+    lineas["_rango"] = lineas["clase"].map(rango).fillna(len(rango)).astype(int)
     por_posicion = lineas.groupby("ubicacion")["_rango"].min()
     lineas["clase_posicion"] = (
-        lineas["ubicacion"].map(por_posicion).map(dict(enumerate(ORDEN_CLASE)))
+        lineas["ubicacion"].map(por_posicion).map(dict(enumerate(orden_clases)))
     )
 
     # ── Prioridad ────────────────────────────────────────────────────
@@ -156,7 +198,7 @@ def calcular_ubicaciones(
     # dos visitas a la misma posición son un desperdicio que el plan señala
     # explícitamente. Por eso el valor que ordena es el de la posición
     # completa, y dentro de ella las líneas van de mayor a menor.
-    lineas["_rango_pos"] = lineas["clase_posicion"].map(rango).fillna(len(ORDEN_CLASE)).astype(int)
+    lineas["_rango_pos"] = lineas["clase_posicion"].map(rango).fillna(len(rango)).astype(int)
     lineas["_valor_pos"] = lineas["ubicacion"].map(lineas.groupby("ubicacion")["valor_linea"].sum())
     lineas = lineas.sort_values(
         ["_rango_pos", "_valor_pos", "ubicacion", "valor_linea"],
@@ -168,11 +210,12 @@ def calcular_ubicaciones(
     altura = lineas[lineas["tipo"] == TIPO_ALTURA]
     logger.info(
         "calcular_ubicaciones: %d líneas SKU-posición (%d en altura sobre %d posiciones) · "
-        "A+B %.1f%% de altura · sin rotación %.1f%% · valorizadas %.1f%%",
+        "A+B %.1f%% de altura · heredadas %.1f%% · sin rotación %.1f%% · valorizadas %.1f%%",
         total,
         len(altura),
         altura["ubicacion"].nunique(),
-        altura["clase"].isin(["A", "B"]).mean() * 100 if len(altura) else 0,
+        altura["clase"].str.startswith(("A", "B")).mean() * 100 if len(altura) else 0,
+        (altura["origen_clase"] == "Referencia").mean() * 100 if len(altura) else 0,
         (altura["clase"] == SIN_ROTACION).mean() * 100 if len(altura) else 0,
         lineas["precio_unitario"].notna().mean() * 100,
     )
@@ -212,3 +255,93 @@ def resumen_cobertura(lineas: pd.DataFrame, layout: pd.DataFrame) -> pd.DataFram
             }
         )
     return pd.DataFrame(filas)
+
+
+def mapa_posiciones(
+    lineas: pd.DataFrame,
+    layout: pd.DataFrame,
+    conteos: pd.DataFrame | None = None,
+    hoy: dt.date | None = None,
+) -> pd.DataFrame:
+    """Una fila por posición **activa del layout**, ocupada o no.
+
+    `calcular_ubicaciones()` solo conoce lo que tiene inventario, así que no
+    puede responder "qué tan llena está la bodega": le falta el denominador.
+    Acá el universo lo pone el layout y las líneas aportan el contenido, de
+    modo que **las posiciones vacías existen como filas con cero** — que es
+    justamente la mitad de la información en un mapa de ocupación.
+
+    Args:
+        lineas: Resultado de `calcular_ubicaciones()`.
+        layout: Resultado de `layout.cargar_layout()`.
+        conteos: Resultado de `conteos.evaluar_conteos()`, para fechar el
+            último conteo de cada posición.
+        hoy: Fecha de referencia (inyectable para tests).
+
+    Returns:
+        Una fila por posición activa, con su contenido agregado y la
+        antigüedad de su último conteo.
+    """
+    columnas = [
+        "ubicacion",
+        "tipo",
+        "rack",
+        "posicion",
+        "nivel",
+        "lineas",
+        "unidades",
+        "valor",
+        "clase_posicion",
+        "ocupada",
+        "ultimo_conteo",
+        "dias_desde_conteo",
+    ]
+    if layout.empty:
+        return pd.DataFrame(columns=columnas)
+
+    activas = layout[layout["activa"].astype(str).str.strip().str.upper().isin({"SI", "SÍ"})][
+        ["ubicacion", "tipo", "rack", "posicion", "altura"]
+    ].copy()
+    activas = activas.rename(columns={"altura": "nivel"})
+
+    if lineas.empty:
+        contenido = pd.DataFrame(
+            columns=["ubicacion", "lineas", "unidades", "valor", "clase_posicion"]
+        )
+    else:
+        contenido = lineas.groupby("ubicacion", as_index=False).agg(
+            lineas=("id_especificacion", "count"),
+            unidades=("cantidad", "sum"),
+            valor=("valor_linea", "sum"),
+            clase_posicion=("clase_posicion", "first"),
+        )
+
+    mapa = activas.merge(contenido, on="ubicacion", how="left")
+    for columna in ("lineas", "unidades", "valor"):
+        mapa[columna] = mapa[columna].fillna(0.0)
+    mapa["ocupada"] = (mapa["lineas"] > 0).astype(int)
+    mapa["clase_posicion"] = mapa["clase_posicion"].fillna("Vacía")
+
+    # ── Antigüedad del último conteo (KPI de la sección 12 del plan) ──
+    # Una posición nunca contada queda en NaN, **no en un número grande**:
+    # "hace 9.999 días" entraría en cualquier promedio y lo arruinaría, y
+    # "nunca" no es un valor de la misma escala que "hace 30 días".
+    referencia = pd.Timestamp(hoy or dt.date.today())
+    if conteos is not None and not conteos.empty:
+        ultimo = conteos.groupby("ubicacion")["fecha"].max()
+        mapa["ultimo_conteo"] = mapa["ubicacion"].map(ultimo)
+        fechas = pd.to_datetime(mapa["ultimo_conteo"], errors="coerce")
+        mapa["dias_desde_conteo"] = (referencia - fechas).dt.days
+    else:
+        mapa["ultimo_conteo"] = None
+        mapa["dias_desde_conteo"] = pd.NA
+
+    ocupadas = int(mapa["ocupada"].sum())
+    logger.info(
+        "mapa_posiciones: %d posiciones activas · %d ocupadas (%.1f%%) · %d vacías",
+        len(mapa),
+        ocupadas,
+        ocupadas / len(mapa) * 100 if len(mapa) else 0,
+        len(mapa) - ocupadas,
+    )
+    return mapa[columnas]

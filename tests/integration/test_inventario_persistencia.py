@@ -17,6 +17,8 @@ import pytest
 
 from inventario.comparacion import calcular_vendido_no_alistado
 from inventario.persistencia import (
+    _COLUMNAS_CONTEOS,
+    _SNAPSHOTS_RECREABLES,
     UMBRAL_DESACTUALIZADO_H,
     init_schema,
     medir_frescura,
@@ -642,3 +644,287 @@ def test_la_fecha_de_la_tendencia_usa_hora_colombia(db):
     ]
     con.close()
     assert dia == "2026-07-20"
+
+
+# ─────────────────────────────────────────────
+# conteos: tabla con historia (DEC-058)
+# ─────────────────────────────────────────────
+
+
+def _conteo(ubicacion="A_1_5", archivo="hoja.xlsx", quien="ANA", cantidad=100.0):
+    return {
+        "ubicacion": ubicacion,
+        "id_especificacion": "1",
+        "fecha": "2026-07-27",
+        "contado_por": quien,
+        "cantidad_contada": cantidad,
+        "cantidad_sistema": 100.0,
+        "diferencia": cantidad - 100.0,
+        "diferencia_pct": 0.0,
+        "clase": "A",
+        "tipo": "Altura",
+        "causa": None,
+        "tolerancia": 0.01,
+        "exacta": 1,
+        "hallazgo": "Coincide",
+        "lote": None,
+        "vencimiento": None,
+        "actividad_origen": "Conteo dirigido",
+        "observacion": None,
+        "archivo": archivo,
+    }
+
+
+def test_sacar_una_hoja_deshace_su_conteo(db):
+    """La operación de corrección que DEC-058 tenía que habilitar.
+
+    `conteos` es un espejo de `data/conteos/`: si la hoja de Luis sale de la
+    carpeta, su conteo desaparece del cálculo. Con la tabla acumulativa
+    original esto era imposible y un archivo mal cargado ensuciaba el IRA
+    para siempre.
+    """
+    dos = pd.DataFrame([_conteo(archivo="ana.xlsx"), _conteo("B_2_6", "luis.xlsx", "LUIS")])
+    persistir(_comparacion(), _anomalias(), _FRESCURA_OK, db_path=db, conteos=dos)
+
+    # Segunda corrida: la carpeta ya solo tiene la hoja de Ana.
+    una = pd.DataFrame([_conteo(archivo="ana.xlsx")])
+    persistir(_comparacion(), _anomalias(), _FRESCURA_OK, db_path=db, conteos=una)
+
+    con = sqlite3.connect(db)
+    quedan = [r[0] for r in con.execute("SELECT contado_por FROM conteos")]
+    assert quedan == ["ANA"]
+
+
+def test_corregir_una_cantidad_reemplaza_el_valor(db):
+    """Editar el Excel y re-ingerir no deja las dos versiones conviviendo."""
+    persistir(
+        _comparacion(),
+        _anomalias(),
+        _FRESCURA_OK,
+        db_path=db,
+        conteos=pd.DataFrame([_conteo(cantidad=50.0)]),
+    )
+    persistir(
+        _comparacion(),
+        _anomalias(),
+        _FRESCURA_OK,
+        db_path=db,
+        conteos=pd.DataFrame([_conteo(cantidad=120.0)]),
+    )
+
+    con = sqlite3.connect(db)
+    assert con.execute("SELECT cantidad_contada FROM conteos").fetchall() == [(120.0,)]
+
+
+def test_carpeta_ausente_no_borra_los_conteos(db):
+    """`None` significa 'no toques la tabla', y es distinto de 'carpeta vacía'.
+
+    Si el disco de red no monta, la corrida no puede vaciar el historial.
+    """
+    persistir(
+        _comparacion(),
+        _anomalias(),
+        _FRESCURA_OK,
+        db_path=db,
+        conteos=pd.DataFrame([_conteo()]),
+    )
+    persistir(_comparacion(), _anomalias(), _FRESCURA_OK, db_path=db, conteos=None)
+
+    con = sqlite3.connect(db)
+    assert con.execute("SELECT COUNT(*) FROM conteos").fetchone()[0] == 1
+
+
+def test_carpeta_vacia_si_vacia_el_espejo(db):
+    """Distinto del caso anterior: acá el usuario sacó las hojas a propósito."""
+    persistir(
+        _comparacion(),
+        _anomalias(),
+        _FRESCURA_OK,
+        db_path=db,
+        conteos=pd.DataFrame([_conteo()]),
+    )
+    persistir(
+        _comparacion(),
+        _anomalias(),
+        _FRESCURA_OK,
+        db_path=db,
+        conteos=pd.DataFrame(columns=list(_COLUMNAS_CONTEOS)),
+    )
+
+    con = sqlite3.connect(db)
+    assert con.execute("SELECT COUNT(*) FROM conteos").fetchone()[0] == 0
+
+
+def test_el_rastro_del_archivo_sobrevive_a_su_anulacion(db):
+    """Sacar una hoja no puede ser una pérdida silenciosa.
+
+    `conteos_archivos` acumula: aunque el conteo salga del cálculo, queda
+    constancia de que ese archivo existió y cuándo se vio por última vez.
+    """
+    archivos = pd.DataFrame(
+        [
+            {
+                "archivo": "ana.xlsx",
+                "filas": 8,
+                "modificado_en": "2026-07-27T10:00:00+00:00",
+                "visto_en": "2026-07-27T10:05:00+00:00",
+            },
+            {
+                "archivo": "luis.xlsx",
+                "filas": 8,
+                "modificado_en": "2026-07-27T10:00:00+00:00",
+                "visto_en": "2026-07-27T10:05:00+00:00",
+            },
+        ]
+    )
+    persistir(_comparacion(), _anomalias(), _FRESCURA_OK, db_path=db, archivos=archivos)
+    # Luis se anula: la siguiente corrida ya no lo trae.
+    persistir(
+        _comparacion(),
+        _anomalias(),
+        _FRESCURA_OK,
+        db_path=db,
+        conteos=pd.DataFrame(columns=list(_COLUMNAS_CONTEOS)),
+        archivos=archivos.head(1),
+    )
+
+    con = sqlite3.connect(db)
+    registrados = {r[0] for r in con.execute("SELECT archivo FROM conteos_archivos")}
+    assert registrados == {"ana.xlsx", "luis.xlsx"}
+
+
+def test_primera_vez_no_se_pisa_en_las_reingestas(db):
+    """Es la fecha en que la hoja entró, no la de la última corrida."""
+    base = {"archivo": "ana.xlsx", "filas": 8, "modificado_en": "2026-07-27T10:00:00+00:00"}
+    persistir(
+        _comparacion(),
+        _anomalias(),
+        _FRESCURA_OK,
+        db_path=db,
+        archivos=pd.DataFrame([{**base, "visto_en": "2026-07-27T10:00:00+00:00"}]),
+    )
+    persistir(
+        _comparacion(),
+        _anomalias(),
+        _FRESCURA_OK,
+        db_path=db,
+        archivos=pd.DataFrame([{**base, "visto_en": "2026-07-28T15:00:00+00:00"}]),
+    )
+
+    con = sqlite3.connect(db)
+    primera, visto = con.execute("SELECT primera_vez, visto_en FROM conteos_archivos").fetchone()
+    assert primera.startswith("2026-07-27")
+    assert visto.startswith("2026-07-28")
+
+
+def test_conteos_archivos_no_esta_en_la_lista_de_tablas_recreables():
+    """El rastro de archivos sí es historia: un DROP la perdería."""
+    assert "conteos_archivos" not in _SNAPSHOTS_RECREABLES
+
+
+def test_lo_que_calculan_los_modulos_es_lo_que_se_persiste():
+    """Guard estructural: una columna nueva en el módulo pero no en el DDL.
+
+    `CREATE TABLE IF NOT EXISTS` no agrega columnas y `_migrar_columnas()`
+    solo migra lo que el DDL declara, así que una columna añadida al
+    cálculo y olvidada en el esquema se pierde en silencio hasta que el
+    dashboard la pide y revienta. Pasó con `origen_clase`.
+    """
+    from inventario.conteos import _COLUMNAS as COLS_CONTEOS
+    from inventario.persistencia import _COLUMNAS_CONTEOS, _COLUMNAS_UBICACIONES
+    from inventario.ubicaciones import _COLUMNAS as COLS_UBICACIONES
+
+    assert set(COLS_UBICACIONES) == set(_COLUMNAS_UBICACIONES)
+    assert set(COLS_CONTEOS) == set(_COLUMNAS_CONTEOS)
+
+
+def test_las_columnas_persistidas_existen_en_la_tabla(db):
+    """La tupla de INSERT y el DDL tienen que hablar del mismo esquema."""
+    from inventario.persistencia import _COLUMNAS_CONTEOS, _COLUMNAS_UBICACIONES
+
+    con = sqlite3.connect(db)
+    init_schema(con)
+    for tabla, columnas in (
+        ("inventario_ubicaciones", _COLUMNAS_UBICACIONES),
+        ("conteos", _COLUMNAS_CONTEOS),
+    ):
+        reales = {r[1] for r in con.execute(f"PRAGMA table_info({tabla})")}
+        assert set(columnas) <= reales, f"{tabla}: faltan {set(columnas) - reales}"
+    con.close()
+
+
+# ─────────────────────────────────────────────
+# alertas (DEC-059)
+# ─────────────────────────────────────────────
+
+
+def _alerta(clave="quiebre:PA01", severidad="Crítica", valor=500.0):
+    return {
+        "clave": clave,
+        "tipo": "Quiebre de stock",
+        "severidad": severidad,
+        "entidad": "PA01",
+        "detalle": "sin disponible",
+        "valor": valor,
+        "modulo": "Salud",
+    }
+
+
+def test_la_alerta_conserva_su_fecha_de_aparicion(db):
+    """De esto depende la antigüedad: si `primera_vez` se pisara en cada
+    corrida, toda alerta parecería recién nacida y el indicador no mediría
+    nada."""
+    persistir(
+        _comparacion(),
+        _anomalias(),
+        _FRESCURA_OK,
+        db_path=db,
+        alertas=pd.DataFrame([_alerta()]),
+    )
+    con = sqlite3.connect(db)
+    primera = con.execute("SELECT primera_vez FROM alertas").fetchone()[0]
+    con.close()
+
+    # Segunda corrida: la misma alerta sigue abierta, con otro valor.
+    persistir(
+        _comparacion(),
+        _anomalias(),
+        _FRESCURA_OK,
+        db_path=db,
+        alertas=pd.DataFrame([_alerta(valor=900.0)]),
+    )
+    con = sqlite3.connect(db)
+    fila = con.execute("SELECT primera_vez, visto_en, valor FROM alertas").fetchone()
+    con.close()
+
+    assert fila[0] == primera  # la aparición no se movió
+    assert fila[1] >= primera  # la última vez sí avanzó
+    assert fila[2] == 900.0  # el valor se actualizó
+
+
+def test_la_alerta_que_deja_de_emitirse_queda_como_resuelta(db):
+    """No se borra: su `visto_en` viejo la marca, y de ahí sale el tiempo
+    de resolución."""
+    persistir(
+        _comparacion(),
+        _anomalias(),
+        _FRESCURA_OK,
+        db_path=db,
+        alertas=pd.DataFrame([_alerta("quiebre:PA01"), _alerta("quiebre:PB02")]),
+    )
+    # PB02 se resolvió: la siguiente corrida ya no la emite.
+    persistir(
+        _comparacion(),
+        _anomalias(),
+        _FRESCURA_OK,
+        db_path=db,
+        alertas=pd.DataFrame([_alerta("quiebre:PA01")]),
+    )
+
+    con = sqlite3.connect(db)
+    activas = {r[0] for r in con.execute("SELECT clave FROM v_alertas WHERE activa = 1")}
+    todas = {r[0] for r in con.execute("SELECT clave FROM v_alertas")}
+    con.close()
+
+    assert activas == {"quiebre:PA01"}
+    assert todas == {"quiebre:PA01", "quiebre:PB02"}

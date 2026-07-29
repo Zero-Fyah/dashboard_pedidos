@@ -21,6 +21,7 @@ from inventario.hallazgos import (
     estados_sin_clasificar,
     lineas_sin_id_producto,
     personal_duplicado,
+    productos_en_bodega_sin_precio,
     referencias_con_espacios,
 )
 
@@ -295,3 +296,76 @@ def test_personal_duplicado_ignora_placeholder():
     con = _con_personal([("1", "-"), ("2", "-")])
 
     assert personal_duplicado(con).cantidad == 0
+
+
+# ─────────────────────────────────────────────
+# productos_en_bodega_sin_precio (DEC-061)
+# ─────────────────────────────────────────────
+
+
+def _con_ubicaciones(filas):
+    con = sqlite3.connect(":memory:")
+    con.execute(
+        "CREATE TABLE inventario_ubicaciones "
+        "(ubicacion TEXT, id_especificacion TEXT, cantidad REAL)"
+    )
+    con.executemany("INSERT INTO inventario_ubicaciones VALUES (?,?,?)", filas)
+    return con
+
+
+def _admin_precios(filas):
+    return pd.DataFrame(
+        filas, columns=["id_especificacion", "referencia", "nombre_comercial", "precio"]
+    )
+
+
+def test_solo_alerta_lo_que_esta_en_una_posicion():
+    """Un ID sin precio y sin existencias es una ficha incompleta de algo
+    que no está: no compite por la atención de nadie."""
+    admin = _admin_precios(
+        [
+            ("1", "PA01", "En bodega sin precio", 0),
+            ("2", "PA02", "Sin precio y sin stock", 0),
+            ("3", "PA03", "Con precio", 5000),
+        ]
+    )
+    con = _con_ubicaciones([("A_1_5", "1", 100.0), ("A_1_5", "3", 50.0)])
+    h = productos_en_bodega_sin_precio(admin, con)
+
+    assert h.cantidad == 1
+    assert list(h.filas["ID"]) == ["1"]
+
+
+def test_agrega_posiciones_y_unidades_por_producto():
+    admin = _admin_precios([("1", "PA01", "Sin precio", None)])
+    con = _con_ubicaciones([("A_1_5", "1", 100.0), ("B_2_6", "1", 44.0)])
+    h = productos_en_bodega_sin_precio(admin, con)
+
+    assert h.filas.iloc[0]["Posiciones"] == 2
+    assert h.filas.iloc[0]["Unidades"] == 144.0
+
+
+def test_el_precio_cero_cuenta_como_sin_precio():
+    """El catálogo usa 0 y vacío indistintamente para 'no tiene precio'."""
+    admin = _admin_precios([("1", "PA01", "Cero", 0), ("2", "PA02", "Nulo", None)])
+    con = _con_ubicaciones([("A_1_5", "1", 10.0), ("A_1_5", "2", 10.0)])
+
+    assert productos_en_bodega_sin_precio(admin, con).cantidad == 2
+
+
+def test_sin_la_tabla_de_ubicaciones_no_explota():
+    """Los detectores corren ANTES de que la corrida persista sus tablas:
+    en una base nueva `inventario_ubicaciones` todavía no existe."""
+    h = productos_en_bodega_sin_precio(
+        _admin_precios([("1", "PA01", "x", 0)]), sqlite3.connect(":memory:")
+    )
+
+    assert h.cantidad == 0
+    assert h.filas.empty
+
+
+def test_todo_con_precio_no_reporta_nada():
+    admin = _admin_precios([("1", "PA01", "Con precio", 9000)])
+    con = _con_ubicaciones([("A_1_5", "1", 10.0)])
+
+    assert productos_en_bodega_sin_precio(admin, con).cantidad == 0

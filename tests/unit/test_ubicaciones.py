@@ -3,7 +3,12 @@
 import pandas as pd
 import pytest
 
-from inventario.ubicaciones import SIN_ROTACION, calcular_ubicaciones, resumen_cobertura
+from inventario.ubicaciones import (
+    SIN_ROTACION,
+    calcular_ubicaciones,
+    mapa_posiciones,
+    resumen_cobertura,
+)
 
 
 @pytest.fixture
@@ -201,3 +206,113 @@ def test_resumen_no_cuenta_las_posiciones_vacias(bochica, abc, admin, salud):
     assert res.loc["Altura", "posiciones_vacias"] == 1
     assert res.loc["Altura", "lineas"] == 3
     assert res.loc["Altura", "lineas_por_ocupada"] == 1.5
+
+
+# ─────────────────────────────────────────────
+# mapa_posiciones (DEC-061)
+# ─────────────────────────────────────────────
+
+
+@pytest.fixture
+def layout_activo():
+    return pd.DataFrame(
+        [
+            {
+                "ubicacion": "A_1_5",
+                "tipo": "Altura",
+                "rack": "A",
+                "posicion": 1,
+                "altura": 5,
+                "activa": "SI",
+            },
+            {
+                "ubicacion": "A_2_6",
+                "tipo": "Altura",
+                "rack": "A",
+                "posicion": 2,
+                "altura": 6,
+                "activa": "SI",
+            },
+            {
+                "ubicacion": "A_3_7",
+                "tipo": "Altura",
+                "rack": "A",
+                "posicion": 3,
+                "altura": 7,
+                "activa": "SI",
+            },
+            {
+                "ubicacion": "B_1_1",
+                "tipo": "Picking",
+                "rack": "B",
+                "posicion": 1,
+                "altura": 1,
+                "activa": "SI",
+            },
+            {
+                "ubicacion": "Z_9_9",
+                "tipo": "Altura",
+                "rack": "Z",
+                "posicion": 9,
+                "altura": 9,
+                "activa": "NO",
+            },
+        ]
+    )
+
+
+def test_el_mapa_incluye_las_posiciones_vacias(bochica, abc, admin, salud, layout_activo):
+    """Es la mitad de la información en un mapa de ocupación.
+
+    `calcular_ubicaciones()` solo conoce lo que tiene inventario, así que
+    por sí solo no puede decir qué tan llena está la bodega: le falta el
+    denominador.
+    """
+    r = calcular_ubicaciones(bochica, abc, admin, salud)
+    mapa = mapa_posiciones(r, layout_activo).set_index("ubicacion")
+
+    assert "A_3_7" in mapa.index  # vacía, pero existe como fila
+    assert mapa.loc["A_3_7", "ocupada"] == 0
+    assert mapa.loc["A_3_7", "lineas"] == 0
+    assert mapa.loc["A_1_5", "ocupada"] == 1
+
+
+def test_el_mapa_ignora_las_posiciones_inactivas(bochica, abc, admin, salud, layout_activo):
+    r = calcular_ubicaciones(bochica, abc, admin, salud)
+    mapa = mapa_posiciones(r, layout_activo)
+
+    assert "Z_9_9" not in set(mapa["ubicacion"])
+    assert len(mapa) == 4
+
+
+def test_el_mapa_agrega_el_contenido_de_cada_posicion(bochica, abc, admin, salud, layout_activo):
+    """A_1_5 tiene dos líneas SKU-posición: se suman, no se duplica la fila."""
+    r = calcular_ubicaciones(bochica, abc, admin, salud)
+    mapa = mapa_posiciones(r, layout_activo).set_index("ubicacion")
+
+    assert mapa.loc["A_1_5", "lineas"] == 2
+    assert mapa.loc["A_1_5", "unidades"] == 15  # 10 + 5
+    assert mapa.loc["A_1_5", "valor"] == 10250.0  # 10*1000 + 5*50
+
+
+def test_las_vacias_no_heredan_clase(bochica, abc, admin, salud, layout_activo):
+    """Una posición sin nada no es clase C ni sin rotación: está vacía."""
+    r = calcular_ubicaciones(bochica, abc, admin, salud)
+    mapa = mapa_posiciones(r, layout_activo).set_index("ubicacion")
+
+    assert mapa.loc["A_3_7", "clase_posicion"] == "Vacía"
+
+
+def test_el_mapa_sin_layout_no_explota(bochica, abc, admin, salud):
+    r = calcular_ubicaciones(bochica, abc, admin, salud)
+
+    assert mapa_posiciones(r, pd.DataFrame()).empty
+
+
+def test_el_mapa_sin_inventario_devuelve_todo_vacio(layout_activo):
+    """El caso 'todavía no llegó Bochica': el layout sigue siendo el universo."""
+    mapa = mapa_posiciones(pd.DataFrame(), layout_activo)
+
+    assert len(mapa) == 4
+    assert (mapa["ocupada"] == 0).all()
+    assert (mapa["unidades"] == 0).all()

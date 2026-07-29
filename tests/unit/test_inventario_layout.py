@@ -23,6 +23,7 @@ from inventario.layout import (
     TIPO_FUERA,
     TIPO_PASO,
     TIPO_PICKING,
+    TIPO_VIRTUAL,
     cargar_layout,
     clasificar_ubicaciones,
     resumen_por_tipo,
@@ -176,7 +177,7 @@ def _bochica(ubicaciones, cantidades):
 
 def test_clasificar_ubicaciones_marca_fuera_de_layout(layout):
     """Lo que no está en el layout no se descarta: queda visible y marcado."""
-    bochica = _bochica(["A_1_1", "A_1_5", "B_25_2", "Q_1_1"], [10, 20, 30, 40])
+    bochica = _bochica(["A_1_1", "A_1_5", "B_25_2", "Cali_1_1"], [10, 20, 30, 40])
     clasificado = clasificar_ubicaciones(bochica, layout)
     assert list(clasificado["tipo"]) == [TIPO_PICKING, TIPO_ALTURA, TIPO_PASO, TIPO_FUERA]
     assert clasificado["tipo"].notna().all()
@@ -189,7 +190,7 @@ def test_clasificar_ubicaciones_no_normaliza_mayusculas(layout):
 
 
 def test_solo_layout_descarta_lo_de_afuera(layout):
-    bochica = _bochica(["A_1_1", "A_1_5", "B_25_2", "Q_1_1"], [10, 20, 30, 40])
+    bochica = _bochica(["A_1_1", "A_1_5", "B_25_2", "Cali_1_1"], [10, 20, 30, 40])
     dentro = solo_layout(clasificar_ubicaciones(bochica, layout))
     assert len(dentro) == 3
     assert TIPO_FUERA not in set(dentro["tipo"])
@@ -203,8 +204,55 @@ def test_solo_layout_conserva_paso_montacarga(layout):
 
 
 def test_resumen_por_tipo_agrega_filas_y_unidades(layout):
-    bochica = _bochica(["A_1_1", "A_2_1", "Q_1_1"], [10, 5, 40])
+    bochica = _bochica(["A_1_1", "A_2_1", "Cali_1_1"], [10, 5, 40])
     resumen = resumen_por_tipo(clasificar_ubicaciones(bochica, layout))
     assert resumen.loc[TIPO_PICKING, "filas"] == 2
     assert resumen.loc[TIPO_PICKING, "unidades"] == 15
     assert resumen.loc[TIPO_FUERA, "unidades"] == 40
+
+
+def test_los_racks_virtuales_no_se_confunden_con_fuera_de_layout(layout):
+    """Confirmadas por el Arquitecto como ubicaciones lógicas (DEC-058).
+
+    Mezclarlas con `FUERA_LAYOUT` esconde las que sí hay que investigar:
+    otros almacenes y mercancía por peso son un problema distinto de una
+    ubicación que se sabe que no existe físicamente.
+    """
+    bochica = _bochica(["Q_1_1", "YU_1_1", "O_51_1", "Cali_1_1"], [10, 20, 30, 40])
+    clasificado = clasificar_ubicaciones(bochica, layout)
+
+    assert list(clasificado["tipo"]) == [
+        TIPO_VIRTUAL,
+        TIPO_VIRTUAL,
+        TIPO_VIRTUAL,
+        TIPO_FUERA,
+    ]
+
+
+def test_el_layout_gana_sobre_la_lista_de_virtuales(layout):
+    """Si el layout llegara a declarar uno de esos racks, manda el layout."""
+    ampliado = pd.concat(
+        [
+            layout,
+            pd.DataFrame(
+                [
+                    {
+                        "cedi": "MOSQUERA",
+                        "subbodega": "bodega4",
+                        "ubicacion": "Q_1_1",
+                        "tipo": TIPO_ALTURA,
+                        "empresa": "miempresa",
+                        "activa": "SI",
+                        "rack": "Q",
+                        "posicion": 1,
+                        "altura": 1,
+                        "estiba_completa": False,
+                    }
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    clasificado = clasificar_ubicaciones(_bochica(["Q_1_1"], [10]), ampliado)
+
+    assert clasificado.iloc[0]["tipo"] == TIPO_ALTURA

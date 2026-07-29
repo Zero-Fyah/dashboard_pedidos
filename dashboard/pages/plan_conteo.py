@@ -16,20 +16,41 @@ Responde dos preguntas que el plan deja explícitamente abiertas:
    y antigüedad, pero marca la clasificación ABC como pendiente. Ya está
    construida, así que la cola de trabajo se puede emitir hoy.
 
-**Lo que esta vista NO calcula, a propósito:** exactitud de inventario
-(IRA), estado de madurez de la ubicación y score de confiabilidad. Los tres
-se alimentan de *eventos de conteo físico* — quién contó, cuándo, qué
-encontró — que viven en el registro del área y no entran a este pipeline.
-Mostrarlos acá sería inventar el dato que el plan existe para construir.
+Desde DEC-058 el ciclo se cierra: la hoja de conteo sale de acá, se llena en
+campo, vuelve como Excel a `data/conteos/` y el scheduler la ingiere. Con
+eso sí hay **IRA** y cobertura reales, calculados sobre conteos de verdad.
+
+**Lo que sigue sin calcularse, a propósito:** el score de confiabilidad y
+los estados de madurez de la ubicación. Ambos exigen una serie de conteos
+*coincidentes consecutivos* por línea; con el historial recién arrancando no
+hay con qué, y publicarlos vacíos o inventados sería peor que no tenerlos.
+Se habilitan solos cuando el historial dé.
 """
 
+import io
 import sqlite3
 
+import conteos_io
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from db import get_inventario_ubicaciones
+from comun import (
+    CAUSAS_DISCREPANCIA,
+    COLUMNAS_CONTEO_REQUERIDAS,
+    COLUMNAS_HOJA_CONTEO,
+    META_ANTIGUEDAD_CONTEO_DIAS,
+    META_IRA_POR_CLASE,
+)
+from db import (
+    get_conformidad,
+    get_conteos,
+    get_conteos_archivos,
+    get_inventario_posiciones,
+    get_inventario_ubicaciones,
+    get_ira,
+    get_ira_periodo,
+)
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
 
 st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_html=True)
@@ -53,8 +74,8 @@ ORDEN_CLASE = ["A", "B", "C", "Sin rotación"]
 altura = df[df["tipo"] == "Altura"]
 picking = df[df["tipo"] == "Picking"]
 
-tab_dim, tab_cola, tab_pick = st.tabs(
-    ["Dimensionamiento", "Cola de conteo", "Auditoría de picking"]
+tab_dim, tab_cola, tab_reg, tab_pick = st.tabs(
+    ["Dimensionamiento", "Cola de conteo", "Conteos e IRA", "Auditoría de picking"]
 )
 
 
@@ -66,17 +87,27 @@ with tab_dim:
 
     lineas_alt = len(altura)
     ocupadas = altura["ubicacion"].nunique()
-    ab = altura["clase"].isin(["A", "B"]).sum()
+    ab = altura["clase"].str.startswith(("A", "B")).sum()
+    heredadas = (altura["origen_clase"] == "Referencia").sum()
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Líneas SKU-posición en altura", f"{lineas_alt:,}".replace(",", "."))
     c2.metric("Posiciones ocupadas", f"{ocupadas:,}".replace(",", "."))
     c3.metric("Líneas por posición ocupada", f"{lineas_alt / ocupadas:.2f}" if ocupadas else "—")
-    c4.metric("Son clase A o B", f"{ab / lineas_alt * 100:.1f}%" if lineas_alt else "—")
+    c4.metric(
+        "Son clase A o B",
+        f"{ab / lineas_alt * 100:.1f}%" if lineas_alt else "—",
+        help="Incluye las clases heredadas de la referencia.",
+    )
 
     st.caption(
         "La unidad es la línea SKU-posición: un ID dentro de una posición. "
-        "Es lo que efectivamente se cuenta cuando alguien sube a verificar una estiba."
+        "Es lo que efectivamente se cuenta cuando alguien sube a verificar una estiba. "
+        "**{}** de esas líneas ({:.0f}%) heredan la clase de su referencia porque el ID "
+        "no es atribuible: el código de barras no es único por ID, que es el riesgo "
+        "crítico que el propio plan señala.".format(
+            f"{heredadas:,}".replace(",", "."), heredadas / lineas_alt * 100 if lineas_alt else 0
+        )
     )
 
     st.markdown("##### Contraste con los supuestos del plan")
@@ -287,6 +318,427 @@ with tab_cola:
         "por la que la Fase 3 existe: sin barrido dirigido nunca llegarían a "
         "auditarse.".replace(",", ".")
     )
+
+
+# ─────────────────────────────────────────────
+# Conteos e IRA
+# ─────────────────────────────────────────────
+with tab_reg:
+    st.subheader("1 · Sacar la hoja de conteo")
+    st.markdown(
+        "Formato del **Anexo A** del plan. **No lleva la cantidad del sistema**: un "
+        "conteo que muestra lo esperado deja de ser un conteo, porque quien cuenta "
+        "ancla en ese número y confirma en vez de verificar."
+    )
+
+    h1, h2 = st.columns(2)
+    cuantas = h1.number_input(
+        "Posiciones a incluir", min_value=10, max_value=500, value=40, step=10
+    )
+    quien = h2.text_input("Asignada a", placeholder="Nombre del asistente")
+
+    # Se corta por posición, no por línea: la hoja no puede terminar a mitad
+    # de una estiba.
+    pendientes = altura.sort_values("prioridad")
+    ubic = pendientes["ubicacion"].drop_duplicates().head(int(cuantas))
+    seleccion = pendientes[pendientes["ubicacion"].isin(set(ubic))]
+    # La hoja se arma desde el contrato compartido (`comun/`), no desde
+    # una lista local: el pipeline valida contra esas mismas columnas.
+    hoja = pd.DataFrame(columns=list(COLUMNAS_HOJA_CONTEO))
+    hoja["ubicacion"] = seleccion["ubicacion"].to_numpy()
+    hoja["id_especificacion"] = seleccion["id_especificacion"].to_numpy()
+    hoja["referencia"] = seleccion["referencia"].to_numpy()
+    hoja["fecha"] = pd.Timestamp.today().date().isoformat()
+    hoja["actividad_origen"] = "Conteo dirigido"
+    hoja["contado_por"] = quien or pd.NA
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        hoja.to_excel(writer, index=False, sheet_name="conteo")
+    st.download_button(
+        f"⬇️ Descargar hoja de conteo ({len(ubic)} posiciones · {len(hoja)} líneas)",
+        buffer.getvalue(),
+        file_name=f"hoja_conteo_{pd.Timestamp.today():%Y%m%d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+    st.caption(
+        "Llenar la columna **cantidad_contada** y volver a subirla en el paso 2. "
+        "Las demás columnas son opcionales."
+    )
+    with st.expander("La columna «causa» — qué poner"):
+        st.markdown(
+            "Se llena **solo cuando la cantidad no coincide**, y con uno de estos "
+            "valores exactos. Es una lista cerrada a propósito: en texto libre, "
+            "*«error de despacho»*, *«mal despachado»* y *«despacho»* serían tres "
+            "causas distintas y el análisis mensual no podría agrupar nada.\n\n"
+            + "\n".join(f"- `{c}`" for c in CAUSAS_DISCREPANCIA)
+            + "\n\nPuede llenarse después, cuando se investigue: se corrige la hoja "
+            "y se vuelve a subir con el mismo nombre."
+        )
+
+    st.divider()
+    st.subheader("2 · Subir la hoja llena")
+
+    subidas = st.file_uploader(
+        "Arrastrá acá el Excel del conteo",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        help="Se pueden subir varias hojas a la vez.",
+    )
+
+    if subidas:
+        for archivo in subidas:
+            st.markdown(f"**{archivo.name}**")
+            try:
+                revision = pd.read_excel(io.BytesIO(archivo.getvalue()))
+                revision.columns = [str(c).strip().lower() for c in revision.columns]
+            except Exception as e:  # noqa: BLE001 — el archivo lo eligió el usuario
+                st.error(f"No se pudo leer el archivo: {e}")
+                continue
+
+            # Se valida ANTES de guardar. Si no, el error recién aparecería
+            # cuando el scheduler corriera, hasta una hora después, y para
+            # entonces quien contó ya se fue.
+            faltantes = [c for c in COLUMNAS_CONTEO_REQUERIDAS if c not in revision.columns]
+            if faltantes:
+                st.error(
+                    f"Le faltan columnas obligatorias: **{', '.join(faltantes)}**. "
+                    "El archivo se rechazaría entero, así que no se guarda. "
+                    "Descargá la hoja del paso 1 y volvé a llenarla."
+                )
+                continue
+
+            cantidades = pd.to_numeric(revision["cantidad_contada"], errors="coerce")
+            sin_contar = int(cantidades.isna().sum())
+            claves = set(zip(df["ubicacion"], df["id_especificacion"].astype(str), strict=True))
+            en_sistema = sum(
+                (str(u).strip().upper(), str(i).strip()) in claves
+                for u, i in zip(revision["ubicacion"], revision["id_especificacion"], strict=True)
+            )
+
+            v1, v2, v3 = st.columns(3)
+            v1.metric("Filas", len(revision))
+            v2.metric("Con cantidad", len(revision) - sin_contar)
+            v3.metric("Cruzan con el sistema", en_sistema)
+
+            if sin_contar:
+                st.warning(
+                    f"**{sin_contar} filas sin cantidad.** Se descartan al ingerir: si la "
+                    "posición se revisó y estaba vacía, va **0**, no en blanco — no es lo mismo "
+                    "«no había nada» que «no se contó»."
+                )
+            if en_sistema < len(revision):
+                st.info(
+                    f"{len(revision) - en_sistema} filas no cruzan con ninguna línea del "
+                    "sistema. Se ingieren igual y salen como **sobrante** con cantidad "
+                    "esperada cero, que es lo correcto si apareció producto donde no debía."
+                )
+            if conteos_io.existe(archivo.name):
+                st.warning(
+                    f"Ya existe una hoja llamada `{archivo.name}`. Guardarla la **reemplaza** "
+                    "— que es lo correcto si estás corrigiendo esa misma hoja."
+                )
+
+            if st.button(f"💾 Guardar «{archivo.name}»", key=f"guardar_{archivo.name}"):
+                try:
+                    destino = conteos_io.guardar(archivo.name, archivo.getvalue())
+                except ValueError as e:
+                    st.error(str(e))
+                else:
+                    st.success(
+                        f"Guardada como `{destino.name}`. El scheduler la ingiere en su "
+                        "próxima corrida (cada hora) y el IRA se actualiza solo."
+                    )
+                    st.cache_data.clear()
+
+    with st.expander("¿Y si una hoja se cargó mal?"):
+        st.markdown(
+            "La carpeta manda: lo que está en `data/conteos/` es lo que cuenta.\n\n"
+            "- **Deshacer una hoja entera** → el botón *Anular* en la lista de hojas, "
+            "al final de esta pestaña. Sale del cálculo y **el archivo no se borra**.\n"
+            "- **Corregir una fila** → editar el Excel y volver a subirlo con el mismo "
+            "nombre. El valor nuevo reemplaza al anterior, no se suma.\n"
+            "- **Recontar la misma posición otro día** → hoja nueva. Los dos conteos "
+            "conviven, que es lo que necesita la doble verificación.\n\n"
+            "⚠️ `data/conteos/` es el único original de los conteos y no está "
+            "versionada: conviene respaldarla aparte."
+        )
+
+    st.divider()
+    st.subheader("3 · Resultado")
+
+    try:
+        conteos = get_conteos()
+    except sqlite3.OperationalError:
+        conteos = pd.DataFrame()
+
+    if conteos.empty:
+        st.info(
+            "Todavía no se ha ingerido ningún conteo. Apenas aparezca el primer archivo "
+            "en `data/conteos/`, acá salen el IRA por clase y la cobertura."
+        )
+    else:
+        ira = get_ira()
+        global_ = ira[ira["clase"] == "Global"].iloc[0]
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("IRA global", f"{global_['ira']:.1f}%")
+        k2.metric("Líneas contadas", f"{int(global_['contadas']):,}".replace(",", "."))
+        k3.metric(
+            "Posiciones auditadas",
+            f"{conteos['ubicacion'].nunique():,}".replace(",", "."),
+        )
+        cobertura = conteos["ubicacion"].nunique() / max(altura["ubicacion"].nunique(), 1) * 100
+        k4.metric("Cobertura de altura", f"{cobertura:.1f}%")
+
+        st.markdown("##### IRA por clase, contra la meta del plan")
+        tabla = ira[ira["clase"] != "Global"].copy()
+        tabla["Meta"] = tabla["clase"].map(META_IRA_POR_CLASE)
+        tabla["Cumple"] = [
+            "✅" if pd.notna(m) and v >= m else ("—" if pd.isna(m) else "❌")
+            for v, m in zip(tabla["ira"], tabla["Meta"], strict=True)
+        ]
+        st.dataframe(
+            tabla.rename(
+                columns={
+                    "clase": "Clase",
+                    "contadas": "Contadas",
+                    "exactas": "Exactas",
+                    "ira": "IRA %",
+                    "ultima_fecha": "Último conteo",
+                }
+            ),
+            hide_index=True,
+            width="stretch",
+        )
+        st.caption(
+            "«Exacta» es coincidencia perfecta **o dentro de la tolerancia de su clase** "
+            "(A ±1%, B ±2%, C ±5%), según la sección 4 del plan. Las metas son las de "
+            "su sección 12."
+        )
+
+        # ── Evolución del IRA ──────────────────────────────────────
+        serie = get_ira_periodo()
+        if len(serie["periodo"].unique()) > 1:
+            st.markdown("##### Cómo evoluciona la exactitud")
+            fig_ira = go.Figure()
+            colores = dict(zip(["A", "B", "C"], GRAFICO_SERIES, strict=False))
+            for clase in ["Global", "A", "B", "C"]:
+                datos = serie[serie["clase"] == clase]
+                if datos.empty:
+                    continue
+                fig_ira.add_trace(
+                    go.Scatter(
+                        x=datos["periodo"],
+                        y=datos["ira"],
+                        mode="lines+markers",
+                        name=clase,
+                        line={
+                            "color": colores.get(clase, TEXT_SECONDARY),
+                            "width": 3 if clase == "Global" else 2,
+                            "dash": "solid" if clase == "Global" else "dot",
+                        },
+                        hovertemplate="%{x}<br>IRA %{y:.1f}%<extra>" + clase + "</extra>",
+                    )
+                )
+            fig_ira.update_layout(
+                height=300,
+                margin={"l": 10, "r": 10, "t": 20, "b": 10},
+                paper_bgcolor=BG_DEEP,
+                plot_bgcolor=BG_DEEP,
+                font={"color": TEXT_PRIMARY},
+                legend={"orientation": "h", "y": -0.25, "font": {"color": TEXT_SECONDARY}},
+                xaxis={"gridcolor": GRAFICO_GRID, "automargin": True, "type": "category"},
+                yaxis={"gridcolor": GRAFICO_GRID, "automargin": True, "title": "IRA %"},
+            )
+            st.plotly_chart(fig_ira, width="stretch")
+        elif len(serie):
+            st.caption(
+                f"La evolución aparece con el segundo período contado (hoy hay "
+                f"{len(serie['periodo'].unique())})."
+            )
+
+        # ── Pareto de causas ───────────────────────────────────────
+        st.markdown("##### Por qué se producen las diferencias")
+        con_causa = conteos[(conteos["exacta"] == 0) & conteos["causa"].notna()]
+        malas_total = int((conteos["exacta"] == 0).sum())
+        if malas_total:
+            con_causa_pct = len(con_causa) / malas_total * 100
+            st.metric(
+                "Discrepancias con causa identificada",
+                f"{con_causa_pct:.0f}%",
+                delta="Meta: 80%" if con_causa_pct < 80 else "Cumple la meta",
+                delta_color="inverse" if con_causa_pct < 80 else "normal",
+            )
+        if len(con_causa):
+            pareto = (
+                con_causa.groupby("causa", as_index=False)
+                .agg(casos=("causa", "size"), unidades=("diferencia", lambda s: s.abs().sum()))
+                .sort_values("casos", ascending=False)
+            )
+            fig_causa = go.Figure(
+                go.Bar(
+                    x=pareto["casos"],
+                    y=pareto["causa"],
+                    orientation="h",
+                    marker={"color": GRAFICO_SERIES[0]},
+                    hovertemplate="%{y}<br>%{x} discrepancias<extra></extra>",
+                )
+            )
+            fig_causa.update_layout(
+                height=60 * len(pareto) + 120,
+                margin={"l": 10, "r": 10, "t": 20, "b": 10},
+                paper_bgcolor=BG_DEEP,
+                plot_bgcolor=BG_DEEP,
+                font={"color": TEXT_PRIMARY},
+                xaxis={"title": "Discrepancias", "gridcolor": GRAFICO_GRID, "automargin": True},
+                yaxis={"gridcolor": GRAFICO_GRID, "automargin": True, "autorange": "reversed"},
+            )
+            st.plotly_chart(fig_causa, width="stretch")
+            st.caption(
+                "Separar faltantes de sobrantes antes de buscar el patrón acota la "
+                "búsqueda: un faltante recurrente apunta a merma, daño no registrado o "
+                "error de despacho; un sobrante, a mala ubicación o error de etiquetado."
+            )
+        elif malas_total:
+            st.info(
+                f"Hay **{malas_total} discrepancias sin causa asignada**. La causa se "
+                "llena en la columna `causa` de la hoja y puede completarse después de "
+                "investigar: se corrige el Excel y se vuelve a subir."
+            )
+
+        # ── Conformidad por tipo ───────────────────────────────────
+        conformidad = get_conformidad()
+        if len(conformidad):
+            st.markdown("##### Conformidad por posición")
+            st.markdown(
+                "Se mide **por posición, no por línea**: una posición con cinco líneas "
+                "y una sola mal no es «80% conforme», es una posición no conforme. Es "
+                "como el plan define la *Tasa de Conformidad en Auditoría de Picking*, "
+                "que se le reporta a Bodega."
+            )
+            st.dataframe(
+                conformidad.rename(
+                    columns={
+                        "tipo": "Tipo de ubicación",
+                        "posiciones": "Auditadas",
+                        "conformes": "Sin discrepancia",
+                        "conformidad": "Conformidad %",
+                        "ultima_fecha": "Última auditoría",
+                    }
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+
+        # ── Antigüedad del último conteo ───────────────────────────
+        try:
+            posiciones = get_inventario_posiciones()
+        except sqlite3.OperationalError:
+            posiciones = pd.DataFrame()
+        if len(posiciones) and posiciones["dias_desde_conteo"].notna().any():
+            st.markdown("##### Antigüedad del último conteo")
+            contadas = posiciones[posiciones["dias_desde_conteo"].notna()]
+            clase_a = contadas[contadas["clase_posicion"].astype(str).str.startswith("A")]
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Posiciones con algún conteo", f"{len(contadas):,}".replace(",", "."))
+            a2.metric("Antigüedad mediana", f"{contadas['dias_desde_conteo'].median():.0f} días")
+            if len(clase_a):
+                media_a = clase_a["dias_desde_conteo"].mean()
+                a3.metric(
+                    "Clase A — antigüedad media",
+                    f"{media_a:.0f} días",
+                    delta=f"Meta: <{META_ANTIGUEDAD_CONTEO_DIAS}",
+                    delta_color="normal" if media_a < META_ANTIGUEDAD_CONTEO_DIAS else "inverse",
+                )
+            st.caption(
+                "Solo cuenta posiciones **con al menos un conteo**. Las que nunca se "
+                "contaron no entran como «hace mucho»: no son un número de la misma "
+                "escala, y meterlas arruinaría el promedio. Su seguimiento es la "
+                "cobertura, no la antigüedad."
+            )
+
+        st.markdown("##### Discrepancias por resolver")
+        malas = conteos[conteos["exacta"] == 0].sort_values("diferencia", key=abs, ascending=False)
+        if malas.empty:
+            st.success("Todos los conteos ingeridos cayeron dentro de tolerancia.")
+        else:
+            st.dataframe(
+                malas[
+                    [
+                        "fecha",
+                        "ubicacion",
+                        "id_especificacion",
+                        "clase",
+                        "cantidad_sistema",
+                        "cantidad_contada",
+                        "diferencia",
+                        "hallazgo",
+                        "contado_por",
+                    ]
+                ],
+                hide_index=True,
+                width="stretch",
+                height=320,
+                column_config={
+                    "fecha": st.column_config.TextColumn("Fecha", width="small"),
+                    "ubicacion": st.column_config.TextColumn("Ubicación", width="small"),
+                    "id_especificacion": st.column_config.TextColumn("ID", width="medium"),
+                    "clase": st.column_config.TextColumn("Clase", width="small"),
+                    "cantidad_sistema": st.column_config.NumberColumn("Sistema", format="%d"),
+                    "cantidad_contada": st.column_config.NumberColumn("Contado", format="%d"),
+                    "diferencia": st.column_config.NumberColumn("Dif.", format="%d"),
+                    "hallazgo": st.column_config.TextColumn("Hallazgo", width="small"),
+                    "contado_por": st.column_config.TextColumn("Contó", width="medium"),
+                },
+            )
+
+    st.divider()
+    st.markdown("##### Hojas registradas")
+    try:
+        hojas = get_conteos_archivos()
+    except sqlite3.OperationalError:
+        hojas = pd.DataFrame()
+    if hojas.empty:
+        st.caption("Ninguna hoja ingerida todavía.")
+    else:
+        activas = set(conteos["archivo"]) if not conteos.empty else set()
+        hojas = hojas.assign(
+            estado=["✅ Activa" if a in activas else "🚫 Anulada" for a in hojas["archivo"]]
+        )
+        st.dataframe(
+            hojas[["archivo", "estado", "filas", "primera_vez", "visto_en"]],
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "archivo": st.column_config.TextColumn("Archivo", width="medium"),
+                "estado": st.column_config.TextColumn("Estado", width="small"),
+                "filas": st.column_config.NumberColumn("Filas", format="%d"),
+                "primera_vez": st.column_config.TextColumn("Primera vez", width="medium"),
+                "visto_en": st.column_config.TextColumn("Visto por última vez", width="medium"),
+            },
+        )
+        st.caption(
+            "Una hoja anulada **queda registrada acá para siempre**: sacarla de la "
+            "carpeta la excluye del cálculo, no borra que existió."
+        )
+
+        anulables = conteos_io.listar_activas()
+        if anulables:
+            a1, a2 = st.columns([3, 1])
+            elegida = a1.selectbox("Anular una hoja", anulables, key="anular_hoja")
+            if a2.button("🚫 Anular", key="btn_anular"):
+                try:
+                    destino = conteos_io.anular(elegida)
+                except FileNotFoundError:
+                    st.error(f"`{elegida}` ya no está activa.")
+                else:
+                    st.success(
+                        f"Movida a `anulados/{destino.name}`. Sale del cálculo en la "
+                        "próxima corrida; el archivo sigue en disco."
+                    )
+                    st.cache_data.clear()
 
 
 # ─────────────────────────────────────────────
