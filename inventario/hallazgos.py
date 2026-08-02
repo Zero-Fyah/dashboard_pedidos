@@ -724,6 +724,14 @@ def vocabulario_nuevo_en_origen(con: sqlite3.Connection) -> Hallazgo:
 # positivo permanente, y una que legítimamente solo aplica a veces
 # —`conductor`, que solo viene con método 'Ruta'— se compara contra sí misma
 # mes a mes, no contra el 100%.
+# Campos que solo tienen sentido en un pedido ENTREGADO. Medirlos sobre
+# "cerrados" mezcla los cancelados —que nunca tuvieron tarjeta de entrega— y
+# ensucia la base: sobre cerrados dan 79-83%, sobre entregados dan **100%**.
+# Con una línea base limpia, cualquier caída es inequívoca.
+_SOLO_ENTREGADOS: frozenset[str] = frozenset(
+    {"despachador", "hora_entrega", "obs_entrega", "conductor", "vehiculo_entrega"}
+)
+
 _CAMPOS_VIGILADOS: tuple[tuple[str, str], ...] = (
     ("pedidos", "despachador"),
     ("pedidos", "hora_entrega"),
@@ -787,9 +795,61 @@ def cobertura_de_campos_cayendo(con: sqlite3.Connection) -> Hallazgo:
     }
     filas: list[dict[str, object]] = []
 
+    # El conjunto de entregados se calcula UNA vez, no por campo y por mes:
+    # como subconsulta correlacionada la función tardaba minutos (misma
+    # trampa que DEC-067). Es una tabla temporal de la conexión, así que no
+    # toca el esquema ni deja rastro.
+    try:
+        con.execute("DROP TABLE IF EXISTS _entregados_tmp")
+        con.execute(
+            "CREATE TEMP TABLE _entregados_tmp AS "
+            "SELECT DISTINCT id_pedido FROM timeline_pedido "
+            "WHERE titulo = 'Recibido y recibido'"
+        )
+        con.execute("CREATE INDEX _ix_entregados ON _entregados_tmp (id_pedido)")
+        hay_entregados = True
+    except sqlite3.Error:
+        # Base recién creada: sin timeline no hay nada que restringir.
+        hay_entregados = False
+
+    # Lo mismo con los cerrados: el `NOT EXISTS` sobre subpedidos se evaluaba
+    # fila por fila para cada uno de los 20 campos vigilados, y `lineas_pedido`
+    # tiene 864k filas.
+    try:
+        con.execute("DROP TABLE IF EXISTS _cerrados_tmp")
+        con.execute(
+            f"""CREATE TEMP TABLE _cerrados_tmp AS
+                SELECT id_pedido FROM subpedidos GROUP BY id_pedido
+                 HAVING SUM(CASE WHEN LOWER(estado) NOT IN {_CERRADOS_SQL}
+                            THEN 1 ELSE 0 END) = 0"""  # noqa: S608
+        )
+        con.execute("CREATE INDEX _ix_cerrados ON _cerrados_tmp (id_pedido)")
+        hay_cerrados = True
+    except sqlite3.Error:
+        hay_cerrados = False
+    if not hay_cerrados:
+        return Hallazgo(
+            clave="cobertura_de_campos_cayendo",
+            titulo="El origen dejó de mostrar un campo",
+            explicacion="",
+            categoria="Cambios del sistema origen",
+            prioridad="Alta",
+            origen="pedidos.db",
+            unidad="campos",
+            cantidad=0,
+            filas=pd.DataFrame(columns=list(columnas)).rename(columns=columnas),
+        )
+
     for tabla, columna in _CAMPOS_VIGILADOS:
         join = "" if tabla == "pedidos" else "JOIN pedidos p ON p.id_pedido = t.id_pedido"
         fecha = "t.fecha" if tabla == "pedidos" else "p.fecha"
+        # Los campos de la tarjeta de entrega solo aplican si el pedido se
+        # entregó; el resto, sobre cualquier pedido cerrado.
+        entregado = (
+            " AND t.id_pedido IN (SELECT id_pedido FROM _entregados_tmp)"
+            if columna in _SOLO_ENTREGADOS and hay_entregados
+            else ""
+        )
         sql = f"""
             SELECT STRFTIME('%Y-%m', {fecha}) AS mes,
                    COUNT(*) AS n,
@@ -798,11 +858,7 @@ def cobertura_de_campos_cayendo(con: sqlite3.Connection) -> Hallazgo:
                             THEN 1 ELSE 0 END) AS con
               FROM {tabla} t {join}
              WHERE {fecha} >= DATE('now', '-4 months')
-               AND NOT EXISTS (
-                     SELECT 1 FROM subpedidos s
-                      WHERE s.id_pedido = t.id_pedido
-                        AND LOWER(s.estado) NOT IN {_CERRADOS_SQL}
-                   )
+               AND t.id_pedido IN (SELECT id_pedido FROM _cerrados_tmp){entregado}
           GROUP BY 1 ORDER BY 1
         """  # noqa: S608
         try:

@@ -202,6 +202,10 @@ async def init_db(db_path: str) -> None:
             "ALTER TABLE pedidos ADD COLUMN inspector_pedido      TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN movil_cliente         TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN despachador           TEXT    DEFAULT NULL",
+            # DEC-093: franja PACTADA de entrega ("2026-08-03 03:00 ~ 04:00"),
+            # no el momento en que se entregó. Se conoce al confirmar el
+            # pedido; `despachador`/`conductor`/`vehiculo_entrega` se llenan
+            # después, al despachar de verdad.
             "ALTER TABLE pedidos ADD COLUMN hora_entrega          TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN obs_entrega           TEXT    DEFAULT NULL",
             # DEC-023: la SPA solo renderiza estos dos campos con

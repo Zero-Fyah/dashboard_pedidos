@@ -841,6 +841,11 @@ _ETIQUETAS_ENTREGA: dict[str, str] = {
     "Método de entrega": "entrega_metodo_texto",
     "Despachador": "despachador",
     "Conductor": "conductor",
+    # DEC-093: es la franja PACTADA con el cliente, no el momento en que se
+    # entregó. Medido: nunca es anterior a la fecha del pedido (mediana +4
+    # días), 331 pedidos la tienen en el futuro ahora mismo, y cuando
+    # `obs_entrega` trae una fecha coincide con ella —373/373 en formato ISO
+    # y 4.172/4.275 escrita en español—.
     "Hora de entrega": "hora_entrega",
     "Vehículo de entrega": "vehiculo_entrega",
     "Observaciones": "obs_entrega",
