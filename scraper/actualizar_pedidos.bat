@@ -45,6 +45,29 @@ REM y dejó el Excel viejo, la corrida se marca datos_desactualizados=1 y
 REM el dashboard lo advierte en vez de mostrar un número que parece fresco.
 %PYEXE% -m inventario.persistencia >> %LOGFILE% 2>&1
 
+REM DEC-092: pasada mensual de mantenimiento — el día 1, una sola vez.
+REM
+REM Va DENTRO de este .bat y no como tarea aparte por una razón medida: el
+REM ciclo horario ocupa 44-47 min de cada 60, así que no queda ventana libre
+REM y dos procesos escribiendo pedidos.db a la vez se pelean el lock (una
+REM corrida de prueba cayó al 71% de éxito por eso). Acá corre en secuencia,
+REM después del scraper y ANTES del ETL, para que el mismo ciclo normalice a
+REM _num lo que la pasada acaba de capturar.
+REM
+REM La ventana de fechas la calcula el propio modo: mes calendario recién
+REM cerrado más 4 meses de retroceso (el 20-32% de los pedidos se entrega en
+REM un mes posterior al de su fecha).
+REM
+REM IMPORTANTE: la tarea de Windows debe estar configurada como "No iniciar
+REM una nueva instancia" si la anterior sigue corriendo. El día 1 este ciclo
+REM dura ~60 min en vez de ~45 y se solaparía con el siguiente.
+for /f %%i in ('powershell -NoProfile -Command "(Get-Date).Day"') do set DIA_MES=%%i
+for /f %%i in ('powershell -NoProfile -Command "(Get-Date).Hour"') do set HORA_DIA=%%i
+if "%DIA_MES%"=="1" if "%HORA_DIA%"=="5" (
+    echo [mantenimiento] pasada mensual — dia 1 >> %LOGFILE%
+    %PYEXE% scraper/scraper_principal.py --modo mantenimiento >> %LOGFILE% 2>&1
+)
+
 REM Ejecutar el ETL después del scraper — como módulo (E-7, DEC-018:
 REM el paquete editable resuelve los imports, sin hack de sys.path)
 %PYEXE% -m etl.etl_principal >> %LOGFILE% 2>&1
