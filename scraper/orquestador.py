@@ -141,19 +141,53 @@ async def obtener_ids_activos(db_path: str) -> list[str]:
 # producción, y eso es correcto: no queda nada recuperable.
 _CAMPOS_ENTREGA = ("despachador", "hora_entrega", "obs_entrega")
 
-# Ventana de la pasada de mantenimiento, en días de antigüedad del pedido.
-# El borde inferior deja que la entrega ocurra y quede registrada; el superior
-# deja un mes de margen antes de que el origen esconda la tarjeta —medido en
-# ~6 meses y moviéndose un día por día (DEC-091)—.
-MANTENIMIENTO_DIAS_MIN = 25
-MANTENIMIENTO_DIAS_MAX = 150
+# Cuántos meses hacia atrás mira la pasada, además del mes recién cerrado.
+#
+# El Arquitecto la fijó para el día 1 de cada mes, cubriendo el mes anterior
+# completo. Ese corte solo no alcanza: **el 20-32% de los pedidos se entrega
+# en un mes posterior al de su fecha** (media 9,2 días, máximo 79), así que el
+# día 1 una cuarta parte del mes recién cerrado todavía no se entregó. El
+# selector los saltaría con razón —no hay tarjeta que leer— y sin el
+# retroceso no volverían a mirarse nunca.
+#
+# Cuatro meses deja ~5 de cobertura total, dentro de los ~6 que el origen
+# conserva la tarjeta (DEC-091). Barrer de más no cuesta: el selector filtra
+# por "le faltan los tres campos", así que un mes ya completo no aporta IDs.
+MANTENIMIENTO_MESES_ATRAS = 4
+
+
+def ventana_mantenimiento(hoy: date | None = None) -> tuple[str, str]:
+    """Rango de fechas de pedido que cubre la pasada de mantenimiento.
+
+    Va desde `MANTENIMIENTO_MESES_ATRAS` meses antes del inicio del mes
+    anterior, hasta el último día de ese mes anterior. Corriendo el día 1, el
+    mes recién cerrado queda cubierto de punta a punta —que es el requisito—
+    y los pedidos que se entregaron tarde entran por el retroceso.
+
+    El borde superior es el fin del mes anterior y no "hoy": los pedidos del
+    mes en curso son demasiado nuevos para haberse entregado, y mirarlos sería
+    gastar navegador para no encontrar nada.
+
+    Args:
+        hoy: Fecha de referencia; por defecto la de hoy. Inyectable para test.
+
+    Returns:
+        `(desde, hasta)` en formato YYYY-MM-DD, ambos inclusive.
+    """
+    hoy = hoy or date.today()
+    fin_mes_anterior = hoy.replace(day=1) - timedelta(days=1)
+    inicio_mes_anterior = fin_mes_anterior.replace(day=1)
+    inicio = inicio_mes_anterior
+    for _ in range(MANTENIMIENTO_MESES_ATRAS):
+        inicio = (inicio - timedelta(days=1)).replace(day=1)
+    return inicio.isoformat(), fin_mes_anterior.isoformat()
 
 
 async def obtener_ids_para_recuperar(
     db_path: str,
     *,
-    dias_min: int = MANTENIMIENTO_DIAS_MIN,
-    dias_max: int = MANTENIMIENTO_DIAS_MAX,
+    desde: str | None = None,
+    hasta: str | None = None,
 ) -> list[str]:
     """IDs de pedidos entregados a los que les falta la información de entrega.
 
@@ -176,12 +210,17 @@ async def obtener_ids_para_recuperar(
 
     Args:
         db_path: Ruta a la base de datos SQLite.
-        dias_min: Antigüedad mínima en días.
-        dias_max: Antigüedad máxima en días.
+        desde: Fecha inicial inclusive; por defecto la de
+            `ventana_mantenimiento()`.
+        hasta: Fecha final inclusive; por defecto la de
+            `ventana_mantenimiento()`.
 
     Returns:
         Lista de id_pedido a re-extraer en modo completo.
     """
+    _defecto = ventana_mantenimiento()
+    _desde = desde or _defecto[0]
+    _hasta = hasta or _defecto[1]
     _cerr_ph = ",".join("?" * len(ESTADOS_CERRADOS))
     falta = " AND ".join(f"(p.{c} IS NULL OR TRIM(p.{c}) IN ('', '-'))" for c in _CAMPOS_ENTREGA)
     async with aiosqlite.connect(db_path) as db:
@@ -190,8 +229,7 @@ async def obtener_ids_para_recuperar(
                 f"""
                 SELECT DISTINCT p.id_pedido
                   FROM pedidos p
-                 WHERE p.fecha <= DATE('now', '-' || ? || ' days')
-                   AND p.fecha >= DATE('now', '-' || ? || ' days')
+                 WHERE p.fecha BETWEEN ? AND ?
                    AND ({falta})
                    AND EXISTS (SELECT 1 FROM timeline_pedido t
                                 WHERE t.id_pedido = p.id_pedido
@@ -201,7 +239,7 @@ async def obtener_ids_para_recuperar(
                                       AND LOWER(s.estado) NOT IN ({_cerr_ph}))
               ORDER BY p.fecha
             """,  # noqa: S608
-                (dias_min, dias_max, *tuple(ESTADOS_CERRADOS)),
+                (_desde, _hasta, *tuple(ESTADOS_CERRADOS)),
             )
         ).fetchall()
     return [r[0] for r in rows]
@@ -435,12 +473,12 @@ async def main(args: argparse.Namespace) -> int:
             # nada que decir sobre la cobertura de pedidos nuevos: mover el
             # watermark acá lo adelantaría sin haber mirado una sola página.
             fecha_cobertura = None
+            _v_desde, _v_hasta = ventana_mantenimiento()
             log_event(
                 "mantenimiento_seleccionados",
                 msg=(
                     f"Pedidos entregados sin información de entrega: "
-                    f"{len(ids_pendientes)} | ventana: "
-                    f"{MANTENIMIENTO_DIAS_MIN}-{MANTENIMIENTO_DIAS_MAX} días"
+                    f"{len(ids_pendientes)} | ventana: {_v_desde} .. {_v_hasta}"
                 ),
             )
 

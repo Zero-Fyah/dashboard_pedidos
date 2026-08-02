@@ -9,12 +9,15 @@ julio es demasiado reciente— así que **el comportamiento se fija acá**: un
 detector que devuelve cero no prueba que funcione.
 """
 
+from datetime import date, timedelta
+
 import aiosqlite
 import pytest
 
 from scraper.orquestador import (
     marcar_para_recuperacion,
     obtener_ids_para_recuperar,
+    ventana_mantenimiento,
 )
 
 
@@ -99,16 +102,25 @@ async def test_no_elige_al_que_sigue_abierto(tmp_path):
 
 @pytest.mark.integration
 async def test_respeta_los_dos_bordes_de_la_ventana(tmp_path):
-    """Demasiado nuevo: la entrega puede no haber ocurrido. Demasiado viejo:
-    el origen ya escondió la tarjeta y re-scrapear no trae nada —medido con
-    808 pedidos de febrero, 100% de éxito y CERO recuperados."""
+    """Los bordes se pasan explícitos para no depender del día en que corra
+    la suite: con ventana por mes calendario, "hace 5 días" cae dentro o
+    fuera según sea 2 o 20 del mes.
+
+    El borde superior importa tanto como el inferior: un pedido demasiado
+    viejo ya no tiene tarjeta que leer —808 pedidos de febrero re-extraídos
+    al 100% recuperaron cero— y uno demasiado nuevo no se ha entregado.
+    """
     db = str(tmp_path / "m.db")
     await _crear(db)
-    await _pedido(db, "MUY_NUEVO", dias=5)
-    await _pedido(db, "EN_VENTANA", dias=60)
-    await _pedido(db, "MUY_VIEJO", dias=300)
+    await _pedido(db, "ANTES", dias=200)
+    await _pedido(db, "DENTRO", dias=60)
+    await _pedido(db, "DESPUES", dias=2)
 
-    assert await obtener_ids_para_recuperar(db) == ["EN_VENTANA"]
+    hoy = date.today()
+    desde = (hoy - timedelta(days=120)).isoformat()
+    hasta = (hoy - timedelta(days=20)).isoformat()
+
+    assert await obtener_ids_para_recuperar(db, desde=desde, hasta=hasta) == ["DENTRO"]
 
 
 @pytest.mark.integration
@@ -152,3 +164,42 @@ async def test_no_reelige_al_que_el_origen_dejo_de_poblar(tmp_path):
     await _pedido(db, "LEIDO_SIN_DESPACHADOR", dias=60, hora_entrega="2026-06-01 08:00 ~ 10:00")
 
     assert await obtener_ids_para_recuperar(db) == []
+
+
+# -- La ventana por mes calendario (decisión del Arquitecto) -----------------
+
+
+def test_cubre_el_mes_recien_cerrado_completo():
+    """Corriendo el día 1, el mes anterior queda cubierto de punta a punta."""
+    desde, hasta = ventana_mantenimiento(date(2026, 9, 1))
+
+    assert hasta == "2026-08-31"
+    assert desde <= "2026-08-01"
+
+
+def test_no_toca_el_mes_en_curso():
+    """Los pedidos del mes corriente son demasiado nuevos para haberse
+    entregado: mirarlos gastaría navegador para no encontrar nada."""
+    _, hasta = ventana_mantenimiento(date(2026, 9, 15))
+
+    assert hasta == "2026-08-31"
+
+
+def test_retrocede_para_atrapar_a_los_entregados_tarde():
+    """El 20-32% de los pedidos se entrega en un mes posterior al de su fecha
+    (media 9,2 días, máximo 79). Sin retroceso, esa cuarta parte de cada mes
+    no volvería a mirarse nunca."""
+    desde, hasta = ventana_mantenimiento(date(2026, 9, 1))
+
+    assert desde == "2026-04-01"
+    assert hasta == "2026-08-31"
+
+
+def test_cruza_el_cambio_de_año():
+    assert ventana_mantenimiento(date(2026, 1, 1)) == ("2025-08-01", "2025-12-31")
+
+
+def test_respeta_el_ultimo_dia_de_febrero():
+    """El fin de mes se deriva restando un día al primero del mes actual, así
+    que no hay que saber cuántos días tiene febrero."""
+    assert ventana_mantenimiento(date(2026, 3, 1))[1] == "2026-02-28"
