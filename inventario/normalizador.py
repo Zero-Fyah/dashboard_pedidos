@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from comun import VIGENCIA_ACTIVO, VIGENCIA_DESCONTINUADO
+
 logger = logging.getLogger("inventario.normalizador")
 
 # Placeholders de Bochica que no representan inventario real (DEC-039
@@ -47,6 +49,14 @@ ALMACEN_BODEGA = "Bogotá"
 # categoría.
 CATEGORIA_AVERIA = "Outlet %"
 _PATRON_AVERIA = r"\sAVER[ÍI]A$"
+
+# Los dos valores crudos de `producto_activo` en el export del admin
+# (DEC-065). Vocabulario del sistema origen, así que vive acá; las
+# etiquetas que se publican hacia el dashboard son `comun.VIGENCIA_*`,
+# porque son contrato entre etapas. Qué significa cada uno —y cómo se
+# estableció— está en `vigencia_por_referencia()`.
+ADMIN_ACTIVO = "Fue"
+ADMIN_DESCONTINUADO = "No hay"
 
 
 def cargar_admin(path: Path) -> pd.DataFrame:
@@ -186,6 +196,58 @@ def marcar_averias(df_admin: pd.DataFrame) -> pd.Series:
             CATEGORIA_AVERIA,
         )
     return por_categoria | por_referencia
+
+
+def vigencia_por_referencia(df_admin: pd.DataFrame) -> pd.Series:
+    """Clasifica cada referencia en vigente o descontinuada (DEC-065).
+
+    El export del admin trae la vigencia en `producto_activo` con dos
+    valores, `Fue` y `No hay`, que son artefactos de traducción automática
+    del sistema origen (el mismo export trae una columna "Código China").
+    **Cuál es cuál se estableció midiendo, no leyendo la etiqueta:**
+
+    | Valor | Filas con inventario | Refs con demanda 90d |
+    |---|---|---|
+    | `Fue` | 69% | 94% |
+    | `No hay` | 6% | 15% |
+
+    La separación no deja lugar a duda, pero la etiqueta sola no la
+    habría dado: "Fue" en español sugiere pasado, justo lo contrario.
+
+    Una referencia agrupa varias especificaciones y **basta una vigente
+    para que la referencia lo sea**. Es el criterio conservador: mantiene
+    la referencia dentro del universo de salud en vez de esconderla.
+    Medido hoy: ninguna referencia del alcance tiene marcas mezcladas, así
+    que la regla no cambia ningún caso actual — cubre el que aparezca.
+
+    Args:
+        df_admin: Resultado de `cargar_admin()`, filtrado o no.
+
+    Returns:
+        Serie indexada por `referencia` con `Activo` o `Descontinuado`.
+    """
+    df = df_admin[["referencia", "producto_activo"]].copy()
+    df["referencia"] = df["referencia"].astype(str).str.strip()
+    activo = df["producto_activo"].astype(str).str.strip() == ADMIN_ACTIVO
+
+    desconocidos = set(df["producto_activo"].astype(str).str.strip()) - {
+        ADMIN_ACTIVO,
+        ADMIN_DESCONTINUADO,
+    }
+    if desconocidos:
+        # Un valor nuevo cae del lado "descontinuado" por el == de arriba y
+        # sacaría referencias del universo de salud sin que nadie lo note.
+        logger.warning(
+            "vigencia_por_referencia: valores de producto_activo fuera de "
+            "los conocidos %s — se tratan como descontinuados: %s",
+            (ADMIN_ACTIVO, ADMIN_DESCONTINUADO),
+            sorted(desconocidos),
+        )
+
+    por_referencia = activo.groupby(df["referencia"]).any()
+    return por_referencia.map({True: VIGENCIA_ACTIVO, False: VIGENCIA_DESCONTINUADO}).rename(
+        "vigencia"
+    )
 
 
 def filtrar_alcance_admin(df_admin: pd.DataFrame) -> pd.DataFrame:

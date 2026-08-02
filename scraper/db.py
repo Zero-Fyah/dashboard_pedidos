@@ -162,7 +162,39 @@ async def init_db(db_path: str) -> None:
                 id                INTEGER PRIMARY KEY CHECK (id = 1),
                 ultima_corrida_ok TEXT
             );
+
+            -- DEC-087: tabla «Registros de pago» del detalle del pedido.
+            -- Es 1:N (un pedido puede tener varios comprobantes), por eso
+            -- tabla propia; la tarjeta «Operación de pago» es 1:1 y va como
+            -- columnas de `pedidos`.
+            CREATE TABLE IF NOT EXISTS registros_pago (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_pedido          TEXT NOT NULL,
+                secuencia          TEXT,
+                metodo_pago        TEXT,
+                cuenta_receptora   TEXT,
+                monto_comprobante  TEXT,
+                monto_pago         TEXT,
+                hora_pago          TEXT,
+                comprobante        TEXT,
+                fecha_envio        TEXT,
+                estado_revision    TEXT,
+                fecha_revision     TEXT,
+                revisor            TEXT,
+                observaciones      TEXT,
+                FOREIGN KEY (id_pedido) REFERENCES pedidos(id_pedido)
+            );
         """)
+
+        # Un pedido no repite secuencia de comprobante. Sin esto, un
+        # re-scrape acumularía duplicados: la persistencia borra y reinserta,
+        # pero el índice deja el invariante escrito en el esquema y no en la
+        # buena voluntad del que escriba el próximo INSERT (mismo criterio
+        # que AUD-B9 en gestion_diferencias).
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_registros_pago_unico "
+            "ON registros_pago (id_pedido, secuencia)"
+        )
 
         for ddl in (
             "ALTER TABLE pedidos ADD COLUMN hora                  TEXT    DEFAULT NULL",
@@ -206,6 +238,16 @@ async def init_db(db_path: str) -> None:
             "ALTER TABLE pedidos ADD COLUMN dias_credito         TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN inicio_credito       TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN vencimiento_credito  TEXT    DEFAULT NULL",
+            # DEC-087: tarjeta «Operación de pago», que la SPA agregó en la
+            # ola de release del 2026-07-16. Trae el estado y el SALDO
+            # calculados por el propio origen — hasta ahora había que
+            # derivarlos de `estadisticas_monto`, y esa derivación es la que
+            # dejó tres cifras de cartera sin publicar (DEC-082/084/086).
+            "ALTER TABLE pedidos ADD COLUMN pago_estado          TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN pago_total           TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN pago_pagado          TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN pago_saldo           TEXT    DEFAULT NULL",
+            "ALTER TABLE pedidos ADD COLUMN pago_progreso        TEXT    DEFAULT NULL",
         ):
             try:
                 await db.execute(ddl)

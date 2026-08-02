@@ -39,8 +39,14 @@ from comun import (
     CAUSAS_DISCREPANCIA,
     COLUMNAS_CONTEO_REQUERIDAS,
     COLUMNAS_HOJA_CONTEO,
+    DIAS_PARA_RECUENTO,
+    ESTADO_CONTEO_CONFIRMADO,
+    ESTADO_CONTEO_PENDIENTE,
+    ESTADOS_CICLO_CONTEO,
     META_ANTIGUEDAD_CONTEO_DIAS,
     META_IRA_POR_CLASE,
+    SUFIJO_CLASE_HEREDADA,
+    VIGENCIA_DESCONTINUADO,
 )
 from db import (
     get_conformidad,
@@ -50,6 +56,7 @@ from db import (
     get_inventario_ubicaciones,
     get_ira,
     get_ira_periodo,
+    get_sin_ubicacion,
 )
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
 
@@ -245,11 +252,37 @@ with tab_cola:
 
     f1, f2, f3 = st.columns(3)
     tipos = f1.multiselect("Tipo de ubicación", ["Altura", "Picking"], default=["Altura"])
-    clases = f2.multiselect("Clase del producto", ORDEN_CLASE, default=["A", "B"])
+    clases = f2.multiselect("Clase de la posición", ORDEN_CLASE, default=["A", "B"])
     racks_disp = sorted(df["rack"].dropna().astype(str).unique())
     racks = f3.multiselect("Rack", racks_disp, default=[])
 
-    cola = df[df["tipo"].isin(tipos) & df["clase"].isin(clases)]
+    # DEC-067: se filtra por la clase de la POSICIÓN y se traen todas sus
+    # líneas. Filtrar por la clase de la línea partía la posición: mandaba al
+    # contador a una ubicación y le pedía contar solo algunas de las líneas
+    # que tiene enfrente. Medido, eso dejaba fuera 1.384 líneas (131.730
+    # unidades, $1.993 M) en posiciones que igual hay que visitar, y 301
+    # posiciones no aparecían nunca. Una posición contada a medias además no
+    # permite afirmar que esté correcta: invalida su propio IRA.
+    #
+    # La clase heredada ("A (por referencia)") cuenta como A: el criterio
+    # está en `comun.es_conteo_prioritario`, aplicado sobre `clase_posicion`.
+    seleccion = {c + SUFIJO_CLASE_HEREDADA for c in clases} | set(clases)
+    cola = df[df["tipo"].isin(tipos) & df["clase_posicion"].isin(seleccion)]
+
+    # DEC-072: el alcance de trabajo son los ID que publica el catálogo del
+    # admin. Lo que Bochica reporta bajo un ID que el catálogo no tiene no se
+    # puede contar —nadie sabe qué producto es— así que no va a la hoja. Sale
+    # de la cola pero **no del mapa**: ocupa espacio físico de verdad.
+    if "en_catalogo" in cola.columns:
+        fuera_catalogo = int((cola["en_catalogo"] == 0).sum())
+        cola = cola[cola["en_catalogo"] == 1]
+        if fuera_catalogo:
+            st.caption(
+                f"Se excluyeron **{fuera_catalogo} líneas** cuyo ID no está en el "
+                "catálogo del sistema administrativo: no se pueden identificar ni "
+                "clasificar, así que no entran a la hoja de conteo. Están "
+                "cuantificadas en Tareas."
+            )
     if racks:
         cola = cola[cola["rack"].astype(str).isin(racks)]
     cola = cola.sort_values("prioridad")
@@ -268,6 +301,7 @@ with tab_cola:
             "id_especificacion",
             "cantidad",
             "clase",
+            "clase_posicion",
             "xyz",
             "valor_linea",
             "dias_sin_salida",
@@ -285,7 +319,17 @@ with tab_cola:
             "referencia": st.column_config.TextColumn("Referencia", width="small"),
             "id_especificacion": st.column_config.TextColumn("ID", width="medium"),
             "cantidad": st.column_config.NumberColumn("Unidades", format="%d"),
-            "clase": st.column_config.TextColumn("Clase", width="small"),
+            "clase": st.column_config.TextColumn(
+                "Clase línea",
+                width="small",
+                help="Clase del producto de esta línea. Puede ser más baja que la de "
+                "la posición: se cuenta igual porque el contador ya está ahí.",
+            ),
+            "clase_posicion": st.column_config.TextColumn(
+                "Clase posición",
+                width="small",
+                help="La más alta de la posición — es la que manda el turno (DEC-067).",
+            ),
             "xyz": st.column_config.TextColumn("XYZ", width="small"),
             "valor_linea": st.column_config.NumberColumn("Valor", format="$%d"),
             "dias_sin_salida": st.column_config.NumberColumn("Días sin salida", format="%d"),
@@ -331,17 +375,39 @@ with tab_reg:
         "ancla en ese número y confirma en vez de verificar."
     )
 
-    h1, h2 = st.columns(2)
+    h1, h2, h3 = st.columns(3)
     cuantas = h1.number_input(
         "Posiciones a incluir", min_value=10, max_value=500, value=40, step=10
     )
     quien = h2.text_input("Asignada a", placeholder="Nombre del asistente")
+    # DEC-073: el conteo tiene que poder registrar lo que el sistema no ve.
+    # Sin filas en blanco, el asistente que encuentra un producto que no está
+    # en la hoja no tiene dónde anotarlo — y ese hallazgo es justamente el que
+    # más vale, porque nadie lo estaba buscando.
+    en_blanco = h3.number_input(
+        "Filas en blanco",
+        min_value=0,
+        max_value=100,
+        value=10,
+        step=5,
+        help="Para anotar lo que se encuentre y no esté en la hoja: producto en "
+        "una posición donde el sistema no lo tiene, o un ID que no figura. La "
+        "ingesta lo trata como sobrante, con cantidad esperada cero.",
+    )
 
     # Se corta por posición, no por línea: la hoja no puede terminar a mitad
     # de una estiba.
     pendientes = altura.sort_values("prioridad")
     ubic = pendientes["ubicacion"].drop_duplicates().head(int(cuantas))
     seleccion = pendientes[pendientes["ubicacion"].isin(set(ubic))]
+
+    # DEC-078: **se elige por prioridad y se camina por ruta.** Las dos cosas
+    # no compiten — la prioridad decide qué entra a la hoja, el recorrido
+    # decide el orden de las filas. Ordenar la hoja por prioridad mandaba al
+    # asistente a cruzar la bodega de punta a punta: la posición más valiosa
+    # puede estar en el rack A y la siguiente en el P.
+    if "orden_recorrido" in seleccion.columns:
+        seleccion = seleccion.sort_values("orden_recorrido")
     # La hoja se arma desde el contrato compartido (`comun/`), no desde
     # una lista local: el pipeline valida contra esas mismas columnas.
     hoja = pd.DataFrame(columns=list(COLUMNAS_HOJA_CONTEO))
@@ -351,6 +417,17 @@ with tab_reg:
     hoja["fecha"] = pd.Timestamp.today().date().isoformat()
     hoja["actividad_origen"] = "Conteo dirigido"
     hoja["contado_por"] = quien or pd.NA
+
+    if en_blanco:
+        extra = pd.DataFrame(
+            {
+                "fecha": [pd.Timestamp.today().date().isoformat()] * int(en_blanco),
+                "actividad_origen": ["Hallazgo no previsto"] * int(en_blanco),
+                "contado_por": [quien or pd.NA] * int(en_blanco),
+            },
+            columns=list(COLUMNAS_HOJA_CONTEO),
+        )
+        hoja = pd.concat([hoja, extra], ignore_index=True)
 
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -375,6 +452,61 @@ with tab_reg:
             + "\n".join(f"- `{c}`" for c in CAUSAS_DISCREPANCIA)
             + "\n\nPuede llenarse después, cuando se investigue: se corrige la hoja "
             "y se vuelve a subir con el mismo nombre."
+        )
+
+    st.divider()
+    # ── Lo que el sistema no ve (DEC-073) ────────────────────────────────
+    try:
+        sin_ubic = get_sin_ubicacion()
+    except sqlite3.OperationalError:
+        sin_ubic = pd.DataFrame()
+
+    if not sin_ubic.empty:
+        st.divider()
+        st.subheader("Producto que el catálogo declara y nadie puede ubicar")
+        unidades = pd.to_numeric(sin_ubic["inventario"], errors="coerce").fillna(0)
+        vig = sin_ubic["vigencia"].value_counts()
+
+        st.markdown(
+            f"El sistema administrativo dice que existen **{len(sin_ubic):,} productos** "
+            f"con **{unidades.sum():,.0f} unidades**, y no aparecen en ninguna posición "
+            "de Bochica. La cola de conteo **no puede encontrarlos**: manda gente a "
+            "posiciones donde el sistema ya ve algo. Estos hay que salir a buscarlos.".replace(
+                ",", "."
+            )
+        )
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Productos", f"{len(sin_ubic):,}".replace(",", "."))
+        s2.metric("Unidades declaradas", f"{unidades.sum():,.0f}".replace(",", "."))
+        s3.metric(
+            "Descontinuados",
+            f"{int(vig.get(VIGENCIA_DESCONTINUADO, 0)):,}".replace(",", "."),
+            help="Entran igual: que una referencia esté descontinuada no la hace "
+            "menos física. Son los que nadie va a mirar si no están en una lista.",
+        )
+        st.dataframe(
+            sin_ubic,
+            hide_index=True,
+            height=260,
+            column_config={
+                "id_especificacion": st.column_config.TextColumn("ID", width="medium"),
+                "referencia": st.column_config.TextColumn("Referencia", width="small"),
+                "nombre_comercial": st.column_config.TextColumn("Producto", width="large"),
+                "vigencia": st.column_config.TextColumn("Vigencia", width="small"),
+                "inventario": st.column_config.NumberColumn("Unidades", format="%.0f"),
+            },
+        )
+        st.download_button(
+            "⬇️ Descargar lista de búsqueda (CSV)",
+            sin_ubic.to_csv(index=False).encode("utf-8-sig"),
+            file_name="productos_sin_ubicacion.csv",
+            mime="text/csv",
+        )
+        st.caption(
+            "Dos lecturas posibles y hay que distinguirlas contando: el producto "
+            "**está** en bodega y Bochica no lo registra (error de ubicación), o "
+            "**no está** y el catálogo tiene inventario fantasma (error de stock). "
+            "Las dos son hallazgos; la segunda además infla el inventario teórico."
         )
 
     st.divider()
@@ -491,6 +623,84 @@ with tab_reg:
         )
         cobertura = conteos["ubicacion"].nunique() / max(altura["ubicacion"].nunique(), 1) * 100
         k4.metric("Cobertura de altura", f"{cobertura:.1f}%")
+
+        # ── Cierre del ciclo (DEC-070) ──────────────────────────────────
+        # El IRA dice qué tan exacto está el inventario. Esto dice qué pasó
+        # con lo que salió inexacto, que es lo que el ciclo anterior no
+        # respondía: nadie podía saber si una diferencia se corrigió.
+        if "estado_ciclo" in conteos.columns and conteos["estado_ciclo"].notna().any():
+            st.markdown("##### En qué quedó cada diferencia")
+            abierto = conteos[
+                conteos["estado_ciclo"].isin([ESTADO_CONTEO_PENDIENTE, ESTADO_CONTEO_CONFIRMADO])
+            ]
+            resumen = (
+                conteos["estado_ciclo"]
+                .value_counts()
+                .reindex(ESTADOS_CICLO_CONTEO)
+                .fillna(0)
+                .astype(int)
+            )
+
+            c1, c2 = st.columns([1, 1.4])
+            with c1:
+                for estado in ESTADOS_CICLO_CONTEO:
+                    st.markdown(f"**{resumen[estado]:,}** · {estado}".replace(",", "."))
+                st.caption(
+                    "«Ajuste aplicado» no lo registra nadie: se deduce de que el "
+                    "sistema hoy dice lo que se contó. El dashboard no escribe en "
+                    "el sistema administrativo, así que el ajuste se **observa**."
+                )
+            with c2:
+                if len(abierto):
+                    vencidos = abierto[abierto["dias_abierto"] > DIAS_PARA_RECUENTO]
+                    if len(vencidos):
+                        st.error(
+                            f"**{len(vencidos)} diferencias llevan más de "
+                            f"{DIAS_PARA_RECUENTO} días sin recontar ni ajustar.** "
+                            "Una diferencia que no se cierra no es un hallazgo: es "
+                            "una posición que sigue mintiendo.",
+                            icon="⏳",
+                        )
+                    st.dataframe(
+                        abierto.sort_values("dias_abierto", ascending=False)[
+                            [
+                                "ubicacion",
+                                "id_especificacion",
+                                "clase",
+                                "cantidad_contada",
+                                "cantidad_sistema",
+                                "diferencia",
+                                "causa",
+                                "estado_ciclo",
+                                "dias_abierto",
+                            ]
+                        ],
+                        hide_index=True,
+                        height=260,
+                        column_config={
+                            "ubicacion": st.column_config.TextColumn("Ubicación", width="small"),
+                            "id_especificacion": st.column_config.TextColumn("ID", width="medium"),
+                            "clase": st.column_config.TextColumn("Clase", width="small"),
+                            "cantidad_contada": st.column_config.NumberColumn(
+                                "Contado", format="%.0f"
+                            ),
+                            "cantidad_sistema": st.column_config.NumberColumn(
+                                "Sistema", format="%.0f"
+                            ),
+                            "diferencia": st.column_config.NumberColumn("Dif.", format="%.0f"),
+                            "causa": st.column_config.TextColumn("Causa", width="medium"),
+                            "estado_ciclo": st.column_config.TextColumn("Estado", width="medium"),
+                            "dias_abierto": st.column_config.NumberColumn(
+                                "Días abierto", format="%.0f"
+                            ),
+                        },
+                    )
+                else:
+                    st.success(
+                        "No hay diferencias abiertas: todo lo contado coincide, se "
+                        "recontó o ya se ajustó.",
+                        icon="✅",
+                    )
 
         st.markdown("##### IRA por clase, contra la meta del plan")
         tabla = ira[ira["clase"] != "Global"].copy()

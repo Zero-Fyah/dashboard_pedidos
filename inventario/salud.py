@@ -15,6 +15,12 @@ en vez de dejar índices que solo agregan peso a la escritura.
 
 **Alcance:** el mismo que el cruce de inventario — catálogo sin `Arena` y
 almacén Bogotá (DEC-041), para que las dos vistas hablen de lo mismo.
+
+**Vigencia (DEC-065):** cada referencia se marca `Activo` o
+`Descontinuado` según el propio admin. Se calcula para todas, pero la
+salud se lee sobre las vigentes: el producto apagado no es un problema de
+abastecimiento y mezclarlo hacía que la categoría más grande de la página
+—564 referencias, 39% del catálogo— fuera 96% catálogo muerto.
 """
 
 import datetime as dt
@@ -23,7 +29,14 @@ import sqlite3
 
 import pandas as pd
 
-from comun import familia_de
+from comun import (
+    COBERTURA_ALTA_D,
+    COBERTURA_RIESGO_D,
+    VIGENCIA_ACTIVO,
+    VIGENCIA_DESCONTINUADO,
+    familia_de,
+)
+from inventario.normalizador import vigencia_por_referencia
 
 logger = logging.getLogger("inventario.salud")
 
@@ -32,12 +45,27 @@ logger = logging.getLogger("inventario.salud")
 VENTANA_DEMANDA_D = 90
 VENTANA_CORTA_D = 30
 
-# Umbrales de cobertura, en días. Son **valores por defecto**, no una
-# política de inventario: el negocio no tiene definido un stock objetivo
-# por referencia (por eso no existe un indicador de "exceso sobre el
-# máximo", que sí pedía la propuesta original).
-COBERTURA_RIESGO_D = 15
-COBERTURA_ALTA_D = 90
+# Los umbrales de cobertura viven en `comun/` desde DEC-066: dejaron de ser
+# defaults de implementación y pasaron a ser política de negocio, y la página
+# de Salud los cita al usuario. Se reexportan acá porque este módulo es donde
+# se clasifica con ellos, y para no romper a quien ya los importaba de acá.
+#
+# Sigue sin existir un indicador de "exceso sobre el máximo objetivo": eso
+# necesita un stock objetivo por referencia, que el negocio no tiene definido.
+__all__ = [
+    "COBERTURA_ALTA_D",
+    "COBERTURA_RIESGO_D",
+    "ESTADO_ALTA",
+    "ESTADO_NORMAL",
+    "ESTADO_QUIEBRE",
+    "ESTADO_RIESGO",
+    "ESTADO_SIN_DEMANDA",
+    "ESTADO_SIN_STOCK_NI_DEMANDA",
+    "SIN_MOVIMIENTO_D",
+    "VENTANA_CORTA_D",
+    "VENTANA_DEMANDA_D",
+    "calcular_salud",
+]
 
 # Un producto sin salidas en este plazo entra en la lista de detenidos.
 SIN_MOVIMIENTO_D = 180
@@ -108,8 +136,11 @@ def calcular_salud(
         hoy: Fecha de referencia (inyectable para tests).
 
     Returns:
-        DataFrame por `referencia` con disponible, valor, demanda de ambas
-        ventanas, cobertura, antigüedad de la última salida y estado.
+        DataFrame por `referencia` con vigencia, disponible, valor, demanda
+        de ambas ventanas, cobertura, antigüedad de la última salida y
+        estado. Incluye las descontinuadas: la separación es del consumidor
+        (la página muestra las vigentes y las otras en un bloque aparte),
+        no de esta función, que no borra datos medidos.
     """
     referencia_hoy = hoy or _hoy_colombia()
     desde_larga = (referencia_hoy - dt.timedelta(days=VENTANA_DEMANDA_D)).isoformat()
@@ -140,6 +171,15 @@ def calcular_salud(
     for col in ("demanda_90d", "demanda_30d"):
         df[col] = df[col].fillna(0)
 
+    # DEC-065: el producto descontinuado no es un problema de salud de
+    # inventario, y mezclarlo con el vigente rompía la página. Medido: 540
+    # de las 564 referencias en "Sin stock ni demanda" ya estaban marcadas
+    # como descontinuadas en el propio admin — el 96% de la categoría más
+    # grande era catálogo apagado presentado como alarma.
+    df["vigencia"] = (
+        df["referencia"].map(vigencia_por_referencia(admin)).fillna(VIGENCIA_DESCONTINUADO)
+    )
+
     df["familia"] = df["referencia"].map(familia_de)
     df["demanda_diaria"] = df["demanda_90d"] / VENTANA_DEMANDA_D
     # Sin demanda no hay cobertura que calcular: dejarlo en NULL es honesto,
@@ -161,17 +201,25 @@ def calcular_salud(
         )
     ]
 
+    # DEC-065: los conteos se reportan sobre el universo vigente, que es el
+    # que la página muestra. Contarlos sobre el total mezclaba producto
+    # apagado y hacía ver el quiebre más grande de lo que es.
+    vigente = df[df["vigencia"] == VIGENCIA_ACTIVO]
     logger.info(
-        "calcular_salud: %d referencias · %d en quiebre · %d en riesgo · %d sin movimiento >%dd",
+        "calcular_salud: %d referencias vigentes de %d "
+        "(%d descontinuadas) · %d en quiebre · %d en riesgo · %d sin movimiento >%dd",
+        len(vigente),
         len(df),
-        int((df["estado"] == ESTADO_QUIEBRE).sum()),
-        int((df["estado"] == ESTADO_RIESGO).sum()),
-        int((df["dias_sin_salida"] > SIN_MOVIMIENTO_D).sum()),
+        int((df["vigencia"] == VIGENCIA_DESCONTINUADO).sum()),
+        int((vigente["estado"] == ESTADO_QUIEBRE).sum()),
+        int((vigente["estado"] == ESTADO_RIESGO).sum()),
+        int((vigente["dias_sin_salida"] > SIN_MOVIMIENTO_D).sum()),
         SIN_MOVIMIENTO_D,
     )
     return df[
         [
             "referencia",
+            "vigencia",
             "familia",
             "disponible",
             "valor_venta",

@@ -1347,6 +1347,210 @@ _JS_SUBPEDIDOS = """
 _PATRON_TOTAL_SUBPEDIDOS = re.compile(r"Total\s+(\d+)\s+subpedidos", re.IGNORECASE)
 
 
+# ── DEC-087: «Operación de pago» y «Registros de pago» ────────────────────────
+#
+# Ambas secciones se leen POR NOMBRE, nunca por posición. Es la lección de
+# DEC-023, que costó 10.696 pedidos mal poblados: `extraer_info_entrega`
+# indexaba columnas por índice y la SPA insertó filas nuevas, así que la hora
+# de entrega terminó guardando el nombre del conductor. Una columna nueva del
+# origen desplaza índices; no desplaza nombres.
+
+_JS_OPERACION_PAGO = """
+() => {
+    const card = document.querySelector('.payment-progress-card');
+    if (!card) return null;
+    const campos = {};
+    for (const item of card.querySelectorAll('.pay-info-item')) {
+        const l = item.querySelector('.pay-info-label');
+        const v = item.querySelector('.pay-info-value');
+        if (l && v) campos[l.textContent.trim()] = v.textContent.trim();
+    }
+    // El estado vive en un el-tag suelto del card, fuera de .pay-info-row.
+    const tag = card.querySelector('.el-tag__content');
+    return { estado: tag ? tag.textContent.trim() : '', campos: campos };
+}
+"""
+
+# Etiqueta del origen → columna de `pedidos`. Dict explícito y no derivación
+# de nombres: si el origen renombra una etiqueta, el campo queda NULL y el
+# WARNING lo dice, en vez de que una heurística lo mapee a otra columna.
+_ETIQUETAS_PAGO = {
+    "Monto total del pedido": "pago_total",
+    "Monto pagado": "pago_pagado",
+    "Saldo pendiente": "pago_saldo",
+    "Progreso de pago": "pago_progreso",
+}
+
+_JS_REGISTROS_PAGO = """
+() => {
+    const card = document.querySelector('.payment-records-card');
+    if (!card) return null;
+    const tabla = card.querySelector('.el-table');
+    if (!tabla) return [];
+    const encabezados = Array.from(
+        tabla.querySelectorAll('.el-table__header thead th')
+    ).map((th) => {
+        const c = th.querySelector('.cell');
+        return c ? c.textContent.trim() : '';
+    });
+    // La tabla intercala filas de SUBTOTAL por envío ('Subtotal del envío 1:'),
+    // que el origen marca con `subtotal-row`. Tienen 4 celdas contra las 12 de
+    // un comprobante, así que su monto cae en la posición de otra columna: sin
+    // este filtro se guardarían como comprobantes con la cuenta receptora
+    // pisada por un total.
+    const filas = Array.from(
+        tabla.querySelectorAll('.el-table__body tbody tr')
+    ).filter((fila) => !fila.classList.contains('subtotal-row'));
+    return filas.map((fila) => {
+        const celdas = Array.from(fila.querySelectorAll('td'));
+        const reg = {};
+        celdas.forEach((td, i) => {
+            const nombre = encabezados[i];
+            if (!nombre) return;
+            const c = td.querySelector('.cell');
+            reg[nombre] = (c ? c.textContent : td.textContent).trim();
+        });
+        return reg;
+    });
+}
+"""
+
+# La secuencia de un comprobante real es `envío-consecutivo` (`1-1`, `2-3`).
+# Las filas de subtotal traen texto en su lugar.
+_SECUENCIA_COMPROBANTE = re.compile(r"^\d+-\d+$")
+
+# Encabezado del origen → columna de `registros_pago`.
+_COLUMNAS_REGISTRO_PAGO = {
+    "Secuencia": "secuencia",
+    "Método de pago": "metodo_pago",
+    "Cuenta receptora": "cuenta_receptora",
+    "Monto del comprobante": "monto_comprobante",
+    "Monto de pago": "monto_pago",
+    "Hora de pago": "hora_pago",
+    "Comprobante": "comprobante",
+    "Fecha de envío": "fecha_envio",
+    "Estado de revisión": "estado_revision",
+    "Fecha de revisión": "fecha_revision",
+    "Revisor": "revisor",
+    "Observaciones": "observaciones",
+}
+
+
+async def extraer_operacion_pago(page: Page, id_pedido: str) -> dict | None:
+    """Extrae la tarjeta «Operación de pago» (DEC-087).
+
+    Trae el estado y el **saldo pendiente calculados por el origen**. Hasta
+    ahora había que derivarlos de `estadisticas_monto`, y esa derivación es
+    la que dejó tres cifras de cartera sin publicar (DEC-082/084/086).
+
+    La tarjeta apareció en la ola de release del 2026-07-16, así que en
+    pedidos viejos puede no renderizar. Eso NO es un error: devuelve `None` y
+    el llamador deja las columnas como están.
+
+    Returns:
+        Dict con `pago_estado` y las columnas de monto, o `None` si la
+        tarjeta no existe en la página.
+    """
+    try:
+        datos = await page.evaluate(_JS_OPERACION_PAGO)
+    except Exception as exc:
+        log_event(
+            "operacion_pago_error",
+            id_pedido=id_pedido,
+            level="WARNING",
+            msg=str(exc),
+        )
+        return None
+
+    if not datos:
+        return None
+
+    resultado: dict = {"pago_estado": datos.get("estado", "")}
+    campos = datos.get("campos") or {}
+    for etiqueta, valor in campos.items():
+        columna = _ETIQUETAS_PAGO.get(etiqueta)
+        if columna:
+            resultado[columna] = valor
+        else:
+            # Mismo criterio que DEC-032: una etiqueta que no se reconoce se
+            # avisa en vez de descartarse en silencio. Así se enteró DEC-033
+            # de los campos de crédito.
+            log_event(
+                "pago_etiqueta_desconocida",
+                id_pedido=id_pedido,
+                level="WARNING",
+                msg=f"Etiqueta nueva en «Operación de pago» — sin capturar: {etiqueta!r}",
+            )
+    return resultado
+
+
+async def extraer_registros_pago(page: Page, id_pedido: str) -> list[dict]:
+    """Extrae la tabla «Registros de pago» (DEC-087).
+
+    Una fila por comprobante, con banco, cuenta, revisor y estado de
+    revisión. `Monto del comprobante` y `Monto de pago` son columnas
+    **distintas**: la hipótesis registrada en DEC-087 es que la segunda es lo
+    imputado a este pedido y la primera el valor total del comprobante, lo
+    que explicaría los pagos de 107 veces el pedido que DEC-084 tuvo que
+    apartar. Se guardan las dos para poder falsarlo.
+
+    Returns:
+        Lista de dicts lista para insertar; vacía si la tabla no existe o no
+        tiene filas.
+    """
+    try:
+        filas = await page.evaluate(_JS_REGISTROS_PAGO)
+    except Exception as exc:
+        log_event(
+            "registros_pago_error",
+            id_pedido=id_pedido,
+            level="WARNING",
+            msg=str(exc),
+        )
+        return []
+
+    if not filas:
+        return []
+
+    desconocidos: set[str] = set()
+    descartadas = 0
+    resultado: list[dict] = []
+    for fila in filas:
+        # Segunda guarda, deliberadamente redundante con el filtro por clase
+        # del JS: la secuencia de un comprobante real tiene forma `envío-N`.
+        # El origen cambió 18 veces entre enero y julio (DEC-081), así que un
+        # renombre de `subtotal-row` no debe volver a meter totales como si
+        # fueran pagos.
+        if not _SECUENCIA_COMPROBANTE.match(str(fila.get("Secuencia", "")).strip()):
+            descartadas += 1
+            continue
+        reg: dict = {"id_pedido": id_pedido}
+        for encabezado, valor in fila.items():
+            columna = _COLUMNAS_REGISTRO_PAGO.get(encabezado)
+            if columna:
+                reg[columna] = valor
+            elif encabezado:
+                desconocidos.add(encabezado)
+        resultado.append(reg)
+
+    if descartadas:
+        log_event(
+            "registros_pago_fila_descartada",
+            id_pedido=id_pedido,
+            level="INFO",
+            msg=f"{descartadas} fila(s) sin secuencia de comprobante (subtotales) descartadas",
+        )
+
+    if desconocidos:
+        log_event(
+            "registros_pago_columna_desconocida",
+            id_pedido=id_pedido,
+            level="WARNING",
+            msg=f"Columnas nuevas en «Registros de pago» — sin capturar: {sorted(desconocidos)}",
+        )
+    return resultado
+
+
 async def extraer_total_subpedidos(page: Page) -> int | None:
     """Lee el contador de subpedidos que declara el origen (seguimiento DEC-021).
 

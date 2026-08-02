@@ -56,7 +56,9 @@ _TABLAS = {
             sobrante_referencias   INTEGER,
             sobrante_unidades      REAL,
             anomalias_filas        INTEGER,
-            anomalias_unidades     REAL
+            anomalias_unidades     REAL,
+            fuera_layout_lineas    INTEGER,
+            fuera_layout_unidades  REAL
         )
     """,
     "inventario_comparacion": """
@@ -90,6 +92,7 @@ _TABLAS = {
     "inventario_salud": """
         CREATE TABLE IF NOT EXISTS inventario_salud (
             referencia     TEXT PRIMARY KEY,
+            vigencia       TEXT,
             familia        TEXT,
             disponible     REAL,
             valor_venta    REAL,
@@ -186,6 +189,16 @@ _TABLAS = {
             PRIMARY KEY (id_pedido, numero_subpedido)
         )
     """,
+    "inventario_sin_ubicacion": """
+        CREATE TABLE IF NOT EXISTS inventario_sin_ubicacion (
+            id_especificacion TEXT PRIMARY KEY,
+            referencia        TEXT,
+            nombre_comercial  TEXT,
+            vigencia          TEXT,
+            inventario        REAL,
+            corrida_id        INTEGER
+        )
+    """,
     "inventario_posiciones": """
         CREATE TABLE IF NOT EXISTS inventario_posiciones (
             ubicacion      TEXT PRIMARY KEY,
@@ -213,6 +226,7 @@ _TABLAS = {
             nivel             INTEGER,
             referencia        TEXT,
             familia           TEXT,
+            en_catalogo       INTEGER,
             cantidad          REAL,
             clase             TEXT,
             origen_clase      TEXT,
@@ -222,6 +236,7 @@ _TABLAS = {
             valor_linea       REAL,
             dias_sin_salida   REAL,
             prioridad         INTEGER,
+            orden_recorrido   INTEGER,
             corrida_id        INTEGER,
             PRIMARY KEY (ubicacion, id_especificacion)
         )
@@ -302,6 +317,9 @@ _TABLAS = {
             actividad_origen  TEXT,
             observacion       TEXT,
             archivo           TEXT,
+            intento           INTEGER,
+            estado_ciclo      TEXT,
+            dias_abierto      REAL,
             corrida_id        INTEGER,
             PRIMARY KEY (ubicacion, id_especificacion, fecha, contado_por)
         )
@@ -327,7 +345,7 @@ _VIEWS = {
         FROM inventario_comparacion
     """,
     "v_inventario_salud": """
-        SELECT referencia, familia, disponible, valor_venta,
+        SELECT referencia, vigencia, familia, disponible, valor_venta,
                demanda_30d, demanda_90d, demanda_diaria,
                dias_cobertura, ultima_salida, dias_sin_salida, estado
         FROM inventario_salud
@@ -355,6 +373,10 @@ _VIEWS = {
                lineas, unidades, valor
         FROM cancelaciones_alistadas
     """,
+    "v_inventario_sin_ubicacion": """
+        SELECT id_especificacion, referencia, nombre_comercial, vigencia, inventario
+        FROM inventario_sin_ubicacion
+    """,
     "v_inventario_posiciones": """
         SELECT ubicacion, tipo, rack, posicion, nivel,
                lineas, unidades, valor, clase_posicion, ocupada,
@@ -363,9 +385,10 @@ _VIEWS = {
     """,
     "v_inventario_ubicaciones": """
         SELECT ubicacion, tipo, rack, posicion, nivel,
-               id_especificacion, referencia, familia, cantidad,
+               id_especificacion, referencia, familia, en_catalogo, cantidad,
                clase, origen_clase, xyz, clase_posicion,
-               precio_unitario, valor_linea, dias_sin_salida, prioridad
+               precio_unitario, valor_linea, dias_sin_salida, prioridad,
+               orden_recorrido
         FROM inventario_ubicaciones
     """,
     "v_alertas": """
@@ -400,7 +423,8 @@ _VIEWS = {
         SELECT ubicacion, id_especificacion, fecha, contado_por,
                cantidad_contada, cantidad_sistema, diferencia, diferencia_pct,
                clase, tipo, causa, tolerancia, exacta, hallazgo,
-               lote, vencimiento, actividad_origen, observacion, archivo
+               lote, vencimiento, actividad_origen, observacion, archivo,
+               intento, estado_ciclo, dias_abierto
         FROM conteos
     """,
     "v_inventario_anomalias": """
@@ -414,7 +438,8 @@ _VIEWS = {
                referencias, disponible_venta, vendido_no_alistado,
                inventario_teorico, bochica_altura, bochica_picking, bochica_paso,
                picking_estimado, sobrante_referencias, sobrante_unidades,
-               anomalias_filas, anomalias_unidades
+               anomalias_filas, anomalias_unidades,
+               fuera_layout_lineas, fuera_layout_unidades
         FROM inventario_corridas
     """,
 }
@@ -519,6 +544,8 @@ _COLUMNAS_UBICACIONES = (
     "nivel",
     "referencia",
     "familia",
+    # DEC-072: alcance de trabajo — ID reconocido por el catálogo del admin.
+    "en_catalogo",
     "cantidad",
     "clase",
     "origen_clase",
@@ -528,6 +555,16 @@ _COLUMNAS_UBICACIONES = (
     "valor_linea",
     "dias_sin_salida",
     "prioridad",
+    # DEC-078: orden de visita física.
+    "orden_recorrido",
+)
+
+_COLUMNAS_SIN_UBICACION = (
+    "id_especificacion",
+    "referencia",
+    "nombre_comercial",
+    "vigencia",
+    "inventario",
 )
 
 _COLUMNAS_IRA_PERIODO = ("periodo", "clase", "contadas", "exactas", "ira")
@@ -556,10 +593,15 @@ _COLUMNAS_CONTEOS = (
     "actividad_origen",
     "observacion",
     "archivo",
+    # DEC-070: cierre del ciclo — recuento y ajuste.
+    "intento",
+    "estado_ciclo",
+    "dias_abierto",
 )
 
 _COLUMNAS_SALUD = (
     "referencia",
+    "vigencia",
     "familia",
     "disponible",
     "valor_venta",
@@ -833,6 +875,7 @@ def persistir(
     anomalias: pd.DataFrame,
     frescura: dict[str, object],
     db_path: str | None = None,
+    fuera_layout: dict[str, object] | None = None,
     catalogo: pd.DataFrame | None = None,
     hallazgos: list | None = None,
     salud: pd.DataFrame | None = None,
@@ -840,6 +883,7 @@ def persistir(
     operacion: pd.DataFrame | None = None,
     ventanas: pd.DataFrame | None = None,
     ubicaciones: pd.DataFrame | None = None,
+    sin_ubicacion: pd.DataFrame | None = None,
     conteos: pd.DataFrame | None = None,
     ira: pd.DataFrame | None = None,
     archivos: pd.DataFrame | None = None,
@@ -901,7 +945,14 @@ def persistir(
     """
     resumen = _resumir(comparacion, anomalias)
     ejecutado_en = dt.datetime.now(tz=dt.timezone.utc).isoformat(timespec="seconds")
-    fila_corrida = {"ejecutado_en": ejecutado_en, **frescura, **resumen}
+    # DEC-076: `fuera_layout` va aparte de `resumen` porque no describe lo
+    # comparado sino lo que quedó afuera — el 47% de Bochica.
+    fila_corrida = {
+        "ejecutado_en": ejecutado_en,
+        **frescura,
+        **resumen,
+        **(fuera_layout or {}),
+    }
 
     con = sqlite3.connect(db_path or get_db_path(), timeout=30)
     try:
@@ -1153,6 +1204,23 @@ def persistir(
                         ],
                     )
 
+            # DEC-073: producto que el admin declara y nadie puede ubicar.
+            # Es lo que el plan de conteo por construcción no puede
+            # descubrir: solo manda gente donde el sistema ya ve algo.
+            if sin_ubicacion is not None:
+                con.execute("DELETE FROM inventario_sin_ubicacion")
+                con.executemany(
+                    f"INSERT INTO inventario_sin_ubicacion "
+                    f"({', '.join(_COLUMNAS_SIN_UBICACION)}, corrida_id) "
+                    f"VALUES ({', '.join('?' * len(_COLUMNAS_SIN_UBICACION))}, ?)",
+                    [
+                        (*_normalizar(fila), corrida_id)
+                        for fila in sin_ubicacion[list(_COLUMNAS_SIN_UBICACION)].itertuples(
+                            index=False
+                        )
+                    ],
+                )
+
             # DEC-061: el mapa de bodega — incluye las posiciones VACÍAS,
             # que son la mitad de la información en un mapa de ocupación.
             if posiciones is not None:
@@ -1258,6 +1326,7 @@ def main() -> int:
     from inventario.hallazgos import detectar_todos
     from inventario.layout import (
         RUTA_LAYOUT_DEFAULT,
+        cargar_distribucion,
         cargar_layout,
         clasificar_ubicaciones,
         solo_layout,
@@ -1265,7 +1334,11 @@ def main() -> int:
     from inventario.normalizador import cargar_admin, cargar_bochica, filtrar_alcance_admin
     from inventario.operacion import calcular_operacion, calcular_ventanas
     from inventario.salud import calcular_salud
-    from inventario.ubicaciones import calcular_ubicaciones, mapa_posiciones
+    from inventario.ubicaciones import (
+        calcular_ubicaciones,
+        mapa_posiciones,
+        sin_ubicacion_conocida,
+    )
     from scraper.bochica import DESTINO_DEFAULT as BOCHICA_XLSX
     from scraper.inventario import DESTINO_DEFAULT as ADMIN_XLSX
 
@@ -1280,10 +1353,24 @@ def main() -> int:
 
         admin = filtrar_alcance_admin(catalogo_completo)
         layout = cargar_layout()
-        bochica = solo_layout(clasificar_ubicaciones(cargar_bochica(BOCHICA_XLSX), layout))
+        _clasificado = clasificar_ubicaciones(cargar_bochica(BOCHICA_XLSX), layout)
+        bochica = solo_layout(_clasificado)
+        # DEC-076: cuánto queda fuera del layout, para poder decirlo en el
+        # dashboard en vez de dejarlo solo en el log. Es el 47% de Bochica:
+        # que la regla sea deliberada no la hace menos grande.
+        _fuera = _clasificado[~_clasificado.index.isin(bochica.index)]
+        fuera_layout = {
+            "fuera_layout_lineas": int(len(_fuera)),
+            "fuera_layout_unidades": float(
+                pd.to_numeric(_fuera["cantidad"], errors="coerce").fillna(0).sum()
+            ),
+        }
 
         comparacion = comparar(admin, bochica, calcular_vendido_no_alistado())
-        anomalias = anomalias_layout(bochica)
+        # DEC-077: la política de slotting habilita el cuarto motivo
+        # (`familia_fuera_de_rack`). Si la hoja no está, los otros tres
+        # siguen funcionando igual.
+        anomalias = anomalias_layout(bochica, cargar_distribucion())
 
         # DEC-047: los detectores leen el estado actual de la DB y del
         # catálogo recién descargado, así que cada corrida refleja lo más
@@ -1300,6 +1387,8 @@ def main() -> int:
 
         # DEC-057: depende de abc y salud, por eso va tras el bloque de lectura.
         ubicaciones = calcular_ubicaciones(bochica, abc, admin, salud)
+        # DEC-073: la otra mitad — lo que el admin declara y no se ve.
+        sin_ubic = sin_ubicacion_conocida(admin, ubicaciones)
         # DEC-058: los conteos se comparan contra las líneas recién calculadas.
         # Carpeta ausente => None => la tabla no se toca. Carpeta vacía =>
         # DataFrame vacío => el espejo queda vacío, que es lo correcto.
@@ -1314,6 +1403,7 @@ def main() -> int:
             comparacion,
             anomalias,
             frescura,
+            fuera_layout=fuera_layout,
             catalogo=catalogo,
             hallazgos=hallazgos,
             salud=salud,
@@ -1324,6 +1414,7 @@ def main() -> int:
             # DEC-062: el mapa fecha el último conteo de cada posición,
             # así que necesita los conteos ya evaluados.
             posiciones=mapa_posiciones(ubicaciones, layout, conteos),
+            sin_ubicacion=sin_ubic,
             conteos=conteos,
             ira=calcular_ira(conteos) if conteos is not None else None,
             ira_periodo=ira_por_periodo(conteos) if conteos is not None else None,

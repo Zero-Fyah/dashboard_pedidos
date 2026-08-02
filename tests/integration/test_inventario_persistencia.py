@@ -672,6 +672,10 @@ def _conteo(ubicacion="A_1_5", archivo="hoja.xlsx", quien="ANA", cantidad=100.0)
         "actividad_origen": "Conteo dirigido",
         "observacion": None,
         "archivo": archivo,
+        # DEC-070: cierre del ciclo — recuento y ajuste.
+        "intento": 1,
+        "estado_ciclo": "Coincide",
+        "dias_abierto": None,
     }
 
 

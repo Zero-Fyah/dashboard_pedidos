@@ -23,6 +23,7 @@ from inventario.hallazgos import (
     personal_duplicado,
     productos_en_bodega_sin_precio,
     referencias_con_espacios,
+    sku_en_bodega_fuera_de_catalogo,
 )
 
 pytestmark = pytest.mark.unit
@@ -369,3 +370,102 @@ def test_todo_con_precio_no_reporta_nada():
     con = _con_ubicaciones([("A_1_5", "1", 10.0)])
 
     assert productos_en_bodega_sin_precio(admin, con).cantidad == 0
+
+
+def test_cuenta_productos_no_filas_de_catalogo():
+    """DEC-064: el admin trae una fila por (producto, almacén) —12 almacenes—
+    y el detector contaba filas del merge. Un producto de presencia nacional
+    aportaba 12 al total y una sola alta movía la cifra en 12."""
+    admin = _admin_precios(
+        [("1", "PA01", "Nacional sin precio", 0) for _ in range(12)]
+        + [("2", "PA02", "Solo Bogotá sin precio", 0)]
+    )
+    con = _con_ubicaciones([("A_1_5", "1", 100.0), ("B_2_6", "2", 50.0)])
+    h = productos_en_bodega_sin_precio(admin, con)
+
+    assert h.cantidad == 2  # antes: 13
+    assert list(h.filas["ID"]) == ["1", "2"]
+
+
+def test_no_duplica_las_filas_del_detalle_por_almacen():
+    """`Posiciones` y `Unidades` vienen del lado de bodega, que es una sola:
+    las 12 filas por almacén eran duplicados idénticos en la tabla."""
+    admin = _admin_precios([("1", "PA01", "Sin precio", 0)] * 12)
+    con = _con_ubicaciones([("A_1_5", "1", 100.0), ("B_2_6", "1", 44.0)])
+    h = productos_en_bodega_sin_precio(admin, con)
+
+    assert len(h.filas) == 1
+    assert h.filas.iloc[0]["Posiciones"] == 2
+    assert h.filas.iloc[0]["Unidades"] == 144.0
+
+
+def test_con_precio_en_un_solo_almacen_no_esta_sin_precio():
+    """Un producto está sin precio solo si NINGUNA de sus filas tiene precio.
+    Hoy no hay IDs contradictorios en el catálogo real; el max los aguanta."""
+    admin = _admin_precios(
+        [
+            ("1", "PA01", "Precio en Medellín, cero en el resto", 0),
+            ("1", "PA01", "Precio en Medellín, cero en el resto", 7500),
+            ("2", "PA02", "Cero en todos", 0),
+            ("2", "PA02", "Cero en todos", None),
+        ]
+    )
+    con = _con_ubicaciones([("A_1_5", "1", 10.0), ("A_1_6", "2", 10.0)])
+    h = productos_en_bodega_sin_precio(admin, con)
+
+    assert h.cantidad == 1
+    assert list(h.filas["ID"]) == ["2"]
+
+
+# ─────────────────────────────────────────────
+# sku_en_bodega_fuera_de_catalogo (DEC-072)
+# ─────────────────────────────────────────────
+
+
+def _con_ubicaciones_ref(filas):
+    """filas: (ubicacion, id, referencia, cantidad)."""
+    con = sqlite3.connect(":memory:")
+    con.execute(
+        "CREATE TABLE inventario_ubicaciones "
+        "(ubicacion TEXT, id_especificacion TEXT, referencia TEXT, cantidad REAL)"
+    )
+    con.executemany("INSERT INTO inventario_ubicaciones VALUES (?,?,?,?)", filas)
+    return con
+
+
+def _admin_ids(ids):
+    return pd.DataFrame({"id_especificacion": [str(i) for i in ids]})
+
+
+def test_reporta_los_id_que_el_catalogo_no_reconoce():
+    """DEC-072: el alcance son los ID del admin; lo que queda afuera tiene que
+    quedar contado o la exclusión se vuelve invisible."""
+    con = _con_ubicaciones_ref([("A_1_5", "1", "PA01", 10.0), ("B_2_6", "999", "M140-A021", 500.0)])
+    h = sku_en_bodega_fuera_de_catalogo(_admin_ids(["1"]), con)
+
+    assert h.cantidad == 1
+    assert list(h.filas["ID"]) == ["999"]
+    assert h.filas.iloc[0]["Unidades"] == 500.0
+
+
+def test_agrega_posiciones_y_unidades_por_id():
+    con = _con_ubicaciones_ref([("A_1_5", "999", "X", 100.0), ("B_2_6", "999", "X", 50.0)])
+    h = sku_en_bodega_fuera_de_catalogo(_admin_ids(["1"]), con)
+
+    assert h.filas.iloc[0]["Posiciones"] == 2
+    assert h.filas.iloc[0]["Unidades"] == 150.0
+
+
+def test_si_el_catalogo_los_reconoce_a_todos_no_hay_hallazgo():
+    """El detector se apaga solo cuando el admin publica los ID faltantes —
+    la mecánica de auto-cierre de DEC-047."""
+    con = _con_ubicaciones_ref([("A_1_5", "1", "PA01", 10.0)])
+
+    assert sku_en_bodega_fuera_de_catalogo(_admin_ids(["1", "2"]), con).cantidad == 0
+
+
+def test_fuera_de_catalogo_sin_la_tabla_de_ubicaciones_no_explota():
+    h = sku_en_bodega_fuera_de_catalogo(_admin_ids(["1"]), sqlite3.connect(":memory:"))
+
+    assert h.cantidad == 0
+    assert h.filas.empty

@@ -125,19 +125,104 @@ def familia_de(referencia: str | None) -> str | None:
     return prefijo if prefijo in FAMILIAS_PRODUCTO else None
 
 
-# Acciones de staff que cuentan para el rendimiento de operadores
-# (VIEW v_rendimiento_operadores del ETL — HAL-008, extraídas en Fase 6).
-# Verificadas contra registro_operaciones en DB real el 2026-07-17: son
-# exactamente las 4 acciones existentes. Tupla — no frozenset — para SQL
-# determinístico. Si el sistema origen renombra una acción, el check
-# etl_view_vacia solo detecta el caso "todas desaparecieron": mantener
-# esta lista alineada con el origen.
-ACCIONES_RENDIMIENTO: tuple[str, ...] = (
-    "Alistamiento sin diferencia",
-    "Alistamiento con faltantes",
-    "Inspección sin diferencia",
-    "Inspección con diferencia",
+# Vigencia comercial de una referencia (DEC-065). Es un contrato entre
+# etapas: `inventario/salud.py` escribe estas etiquetas en
+# `inventario_salud.vigencia` y el dashboard las lee de la VIEW, así que
+# viven acá y no en ninguna de las dos. Los valores crudos del export del
+# admin que las originan (`Fue`/`No hay`) son vocabulario del sistema
+# origen y se quedan en `inventario/normalizador.py`.
+VIGENCIA_ACTIVO = "Activo"
+VIGENCIA_DESCONTINUADO = "Descontinuado"
+
+
+# Umbrales de cobertura, en días — **política de inventario**, no defaults
+# de implementación (DEC-066, definidos por el Arquitecto el 2026-07-30).
+# Viven acá porque `inventario/salud.py` clasifica con ellos y el pie de la
+# página de Salud los cita al usuario: con el número en un solo lugar, la
+# prosa se interpola en vez de repetirlo y no puede quedar contradiciendo
+# a la clasificación.
+#
+# 390 es el percentil 80 de la cobertura del catálogo vigente (medido: p50
+# 132, p75 304, p80 392, p90 832). El 90 anterior venía de DEC-049, antes
+# de medir la distribución, y dejaba al 57% del catálogo vigente en la
+# categoría — una alarma que contiene a la mayoría no informa.
+#
+# En el negocio, 390 días es más de un año de inventario al ritmo de venta
+# de los últimos 90 días: laxo a propósito, porque la operación importa por
+# mar y un ciclo de reposición largo justifica coberturas que en otra
+# operación serían absurdas.
+#
+# Consecuencia conocida: la banda "Normal" queda ancha (15 a 390 días) y no
+# distingue 30 de 300. Partirla exige una segunda definición de negocio que
+# no está tomada — ver DEC-066.
+COBERTURA_RIESGO_D = 15
+COBERTURA_ALTA_D = 390
+
+# Subpedidos que efectivamente se despacharon (DEC-069). Es
+# `ESTADOS_CERRADOS` menos `cancelado`: un subpedido cancelado no salió
+# corto, no salió. Medido, incluirlo sumaba 101 líneas al faltante que no
+# son incumplimiento de despacho sino cancelaciones.
+#
+# `comentado` se incluye porque el proyecto lo trata como cerrado desde
+# siempre, pero su definición sigue **pendiente del Arquitecto** y pesa:
+# aporta 1.196 de las 4.782 líneas con faltante. Si resulta no ser un
+# despacho, el fill rate por línea sube.
+ESTADOS_DESPACHADOS: frozenset[str] = ESTADOS_CERRADOS - {"cancelado"}
+
+
+# Vocabulario de clases de la línea SKU-posición y del conteo (DEC-067).
+# Vive acá porque `inventario/` lo produce y el dashboard decide con él qué
+# entra a la cola de conteo: antes había dos definiciones distintas de "A/B"
+# —una por línea, otra por posición— que daban 1.516 contra 1.817 posiciones
+# para el mismo concepto.
+#
+# Un ID que el puente de atribución no alcanza hereda la clase de su
+# referencia y se marca con este sufijo, para no fingir una precisión que no
+# hay (ver `inventario/ubicaciones.py`).
+SUFIJO_CLASE_HEREDADA = " (por referencia)"
+
+# Clases que obligan a visitar la posición en la Fase 3 del plan. Se compara
+# contra un conjunto explícito y no con `startswith(("A","B"))`: hoy dan lo
+# mismo, pero una clase futura llamada "Ampliado" o "Bloqueado" entraría sola
+# a la cola de conteo sin que nadie lo note.
+CLASES_CONTEO_PRIORITARIO: frozenset[str] = frozenset(
+    {"A", "B", "A" + SUFIJO_CLASE_HEREDADA, "B" + SUFIJO_CLASE_HEREDADA}
 )
+
+
+def es_conteo_prioritario(clase: object) -> bool:
+    """True si la clase obliga a contar la posición (DEC-067).
+
+    Se aplica sobre `clase_posicion`, no sobre `clase`: la regla del plan es
+    que **una sola línea A eleva toda la posición**, porque la visita física
+    es a la posición y no a la línea. Contar una posición a medias no solo
+    desperdicia la visita — invalida su IRA, porque no permite afirmar que la
+    posición esté correcta.
+
+    La comparación es sobre `str(clase)` y eso ya cubre los ausentes sin
+    necesitar pandas acá: `None`, `nan` y `pd.NA` se convierten a `"None"`,
+    `"nan"` y `"<NA>"`, que no están en el conjunto. Se probó antes con
+    `clase != clase` para detectar NaN y **reventaba con `pd.NA`**, cuyo `!=`
+    no devuelve un booleano.
+
+    Args:
+        clase: Valor de `clase_posicion`; tolera None, NaN y pd.NA.
+
+    Returns:
+        True si la posición entra al alcance prioritario de conteo.
+    """
+    return str(clase) in CLASES_CONTEO_PRIORITARIO
+
+
+# DEC-065: acá vivía ACCIONES_RENDIMIENTO, la lista de 4 acciones de staff
+# que HAL-008 extrajo a comun/ en la Fase 6. Su único consumidor era la
+# VIEW v_rendimiento_operadores, retirada en DEC-065 por publicar una
+# comparación entre personas que DEC-054 midió como inválida. Sin la view
+# la constante quedaba huérfana, así que se fue con ella.
+#
+# Las 4 acciones verificadas contra registro_operaciones el 2026-07-17
+# quedan documentadas en decisions.md (HAL-008 y DEC-065); si alguna vez
+# vuelve a hacer falta la lista, son cinco líneas.
 
 
 # ─────────────────────────────────────────────
@@ -328,3 +413,178 @@ CAUSAS_DISCREPANCIA: tuple[str, ...] = (
 
 # Meta de antigüedad del último conteo para clase A, sección 12 del plan.
 META_ANTIGUEDAD_CONTEO_DIAS: int = 45
+
+
+# ─────────────────────────────────────────────
+# CIERRE DEL CICLO DE CONTEO (DEC-070)
+# ─────────────────────────────────────────────
+# El ciclo de DEC-058/060 termina en la detección: cuenta, compara, calcula
+# IRA. Falta el tramo que exige cualquier norma de inventario cíclico —
+# recuento, ajuste, verificación—, y sin él nadie puede responder "¿esta
+# diferencia se corrigió?".
+#
+# El dashboard **no escribe en el sistema administrativo** (integral.md), así
+# que el ajuste ocurre fuera y el pipeline no puede confirmarlo:
+# `inventario_ubicaciones` y `conteos` son snapshots (DELETE + INSERT en cada
+# corrida), así que `cantidad_sistema` **siempre es la de hoy**, no la del día
+# del conteo. Cuando una diferencia desaparece, el conteo vuelve a evaluarse
+# como `Coincide` y no hay forma de distinguir "se ajustó" de "el conteo
+# estaba bien y el stock se movió".
+#
+# Se intentó un estado `Ajuste aplicado` comparando lo contado contra el
+# sistema actual y **no puede dispararse nunca**: ambas cifras salen del mismo
+# snapshot. Se eliminó en vez de dejarlo de adorno. Distinguirlo exige
+# conservar la cantidad del sistema del día del conteo — ver DEC-070.
+#
+# Mientras tanto el cierre sí queda registrado por otra vía: la alerta
+# `discrepancia:...` desaparece cuando el caso se resuelve, y `alertas`
+# conserva `primera_vez` y la marca como resuelta (DEC-047/059).
+ESTADO_CONTEO_COINCIDE = "Coincide"
+ESTADO_CONTEO_PENDIENTE = "Pendiente de recuento"
+ESTADO_CONTEO_CONFIRMADO = "Recuento confirma"
+ESTADO_CONTEO_DESCARTADO = "Recuento corrige"
+
+ESTADOS_CICLO_CONTEO: tuple[str, ...] = (
+    ESTADO_CONTEO_COINCIDE,
+    ESTADO_CONTEO_DESCARTADO,
+    ESTADO_CONTEO_CONFIRMADO,
+    ESTADO_CONTEO_PENDIENTE,
+)
+
+# ─────────────────────────────────────────────
+# VOCABULARIO DEL SISTEMA ORIGEN (DEC-081)
+# ─────────────────────────────────────────────
+# La vista del pedido en la SPA **cambia sola**: medido sobre 7 meses, entre
+# 2026-01-01 y 2026-07-31 aparecieron 18 valores nuevos en cuatro
+# vocabularios distintos, y ninguno lo detectó el pipeline — se encontraron
+# de casualidad al revisar el DOM.
+#
+# Estas listas son el **acuse de recibo**: lo que está acá se conoce y no
+# alerta; lo que el origen emita y no esté, sale como hallazgo de calidad.
+# Reconocer un valor nuevo es agregarlo acá, igual que con
+# `ESTADOS_CONOCIDOS`.
+#
+# Congeladas el 2026-07-31 con lo que había en la base.
+TIMELINE_CONOCIDO: frozenset[str] = frozenset(
+    {
+        "Alistamiento",
+        "Esperando a ser recogido",  # apareció 2026-03-26
+        "Listo para enviar",
+        "Pendiente de pago",
+        "Recibido y recibido",
+        "confirmando",
+        "pdt despachar",
+        "pdt recibir",
+        "pdt verificacion",
+        "pedido cancelado",
+    }
+)
+
+ACCIONES_CONOCIDAS: frozenset[str] = frozenset(
+    {
+        "Actualizar hora de entrega",
+        "Alistamiento con faltantes",
+        "Alistamiento sin diferencia",
+        "Auditoría de pago",
+        "Cambiar vehículo",  # apareció 2026-07-24
+        "Cancelar entrega",
+        "Cancelar pedido",
+        "Comentario",  # apareció 2026-04-16
+        "Confirmar pedido",
+        "Entrega",
+        "Faltantes aprobados",
+        "Faltantes no aprobados",
+        "Inspección con diferencia",
+        "Inspección sin diferencia",
+        "Modificar cantidad de entrega manualmente",
+        "Pedido enviado",
+        # Clave de traducción cruda que la SPA filtró a la interfaz el
+        # 2026-06-22. Se declara porque existe, no porque esté bien.
+        "REGISTER_UNRATED",
+        "Subir comprobante de pago",
+        "Usuario realizó pedido",
+    }
+)
+
+CONCEPTOS_MONTO_CONOCIDOS: frozenset[str] = frozenset(
+    {
+        "Descuento auto-recogida",  # apareció 2026-02-28
+        "Descuento empleado",  # apareció 2026-05-28
+        "Descuento miembro/promoción",
+        "Descuento por tasa",  # apareció 2026-02-28
+        "Flete",
+        "IVA accesorios",
+        "IVA alimentos",
+        "IVA arena para gatos",
+        "Monto pagado",
+        "Total IVA",
+        "Total a pagar / Total final a pagar",
+        "Total antes de IVA",
+        "Total descuento",
+        "Total después del descuento",
+        "Total precio original",
+    }
+)
+
+# Veredicto de `Auditoría de pago`, en `registro_operaciones.referencia`
+# (DEC-083). El origen empezó a registrarlo el 2026-04-10 y nadie se enteró:
+# el detector de DEC-081 vigilaba `accion`, no `referencia`.
+#
+# Se vigila **solo la referencia de las auditorías**, no la de todas las
+# acciones: en `Cancelar pedido` la misma columna guarda el motivo en texto
+# libre —con emojis y variantes de mayúsculas— y ahí no hay vocabulario
+# cerrado que declarar. Acá sí: son dos valores.
+VEREDICTOS_AUDITORIA: frozenset[str] = frozenset(
+    {
+        "Aprobado",
+        "Rechazado",
+    }
+)
+
+
+def formato_miles(valor: float, decimales: int = 0) -> str:
+    """Formatea un número a la convención colombiana: punto de miles, coma decimal.
+
+    Existe para reemplazar el idiom `f"{n:,}".replace(",", ".")`, que es
+    correcto solo cuando la cadena es **exclusivamente** el número. Escrito
+    junto a prosa se vuelve un error silencioso:
+
+        >>> f"En {1234:,} pedidos, con coma".replace(",", ".")
+        'En 1.234 pedidos. con coma'
+
+    La concatenación implícita de literales ocurre antes que la llamada al
+    método, así que el `.replace()` se aplica a la frase entera y se come los
+    signos de puntuación. Es un defecto que ya se coló una vez en la prosa de
+    la página de inventario.
+
+    Args:
+        valor: El número a formatear.
+        decimales: Cuántos decimales conservar. Por defecto ninguno.
+
+    Returns:
+        El número como texto, con `.` de miles y `,` decimal.
+    """
+    crudo = f"{valor:,.{decimales}f}"
+    return crudo.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+
+
+# ─────────────────────────────────────────────
+# REPOSICIÓN (DEC-071)
+# ─────────────────────────────────────────────
+# Factor de seguridad por clase ABC, para el stock de seguridad del punto de
+# reorden. Es la tabla estándar de la normal: se protege más lo que más pesa.
+#
+#   A → 98% de nivel de servicio (Z = 2,05)
+#   B → 95% (Z = 1,65)
+#   C → 90% (Z = 1,28)
+#
+# Son **valores por defecto de la práctica**, no una política acordada por el
+# negocio: nadie definió todavía qué nivel de servicio quiere sostener por
+# clase. Cambiarlos es una decisión de Gerencia, no de código.
+NIVEL_SERVICIO_Z: dict[str, float] = {"A": 2.05, "B": 1.65, "C": 1.28}
+Z_SERVICIO_DEFECTO: float = 1.28
+
+# Días que una discrepancia puede quedar sin recuento antes de alertar. No
+# sale del plan: es un default explícito, a la espera de que el área fije su
+# propio acuerdo de servicio para el recuento.
+DIAS_PARA_RECUENTO: int = 7

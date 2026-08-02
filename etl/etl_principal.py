@@ -22,10 +22,8 @@ import aiosqlite
 # AUD-M5 (auditoría 2026-07-01): importar del módulo común — el ETL ya no
 # carga el scraper (ni Playwright, ni sus efectos secundarios de import).
 from comun import (
-    ACCIONES_RENDIMIENTO,
     COLUMNAS_GUION_ES_CERO,
     ESTADOS_ACTIVOS_INVENTARIO,
-    ESTADOS_CERRADOS,
     ESTADOS_CONOCIDOS,
     es_placeholder,
     get_db_path,
@@ -58,12 +56,33 @@ def _sql_literal(texto: str) -> str:
 
 # AUD-M8 (auditoría 2026-07-01): literales SQL generados desde las
 # constantes del módulo común — único origen de verdad para
-# "cerrado"/"activo" en las VIEWs. sorted() para SQL determinístico.
-_CERRADOS_SQL = ",".join(_sql_literal(e) for e in sorted(ESTADOS_CERRADOS))
+# "cerrado"/"activo" en las VIEWs.
+#
+# DEC-065: quedó uno solo. `_CERRADOS_SQL` y `_ACCIONES_RENDIMIENTO_SQL`
+# existían para interpolarse en las views retiradas (ver `_VIEWS_RETIRADAS`)
+# y se fueron con ellas.
 _ACTIVOS_INVENTARIO_SQL = ",".join(_sql_literal(e) for e in ESTADOS_ACTIVOS_INVENTARIO)
-# HAL-008 (Fase 6): las acciones de v_rendimiento_operadores también se
-# generan desde comun/ — mismo patrón que los estados.
-_ACCIONES_RENDIMIENTO_SQL = ",".join(_sql_literal(a) for a in ACCIONES_RENDIMIENTO)
+
+# DEC-065: views que el ETL creó en el pasado y ya no crea. Hay que
+# **dropearlas explícitamente**: `crear_views()` solo dropea lo que está a
+# punto de recrear, así que quitar una entrada del dict la dejaría viva en
+# `pedidos.db` para siempre, sin nadie que la mantenga.
+#
+# Por qué se retiró cada una está en DEC-065. En resumen: las dos de
+# pedidos hardcodeaban la lista de estados que `comun/` posee (discreparían
+# en silencio el día que cambie), `v_rendimiento_operadores` publicaba una
+# comparación entre personas que DEC-054 midió como inválida, y las dos de
+# variaciones eran vocabulario de exploración (30 filas entre ambas).
+#
+# Se puede vaciar esta tupla cuando no queden bases con esas views. No
+# corre riesgo de borrar de más: `DROP VIEW` no toca tablas.
+_VIEWS_RETIRADAS = (
+    "v_pedidos_activos",
+    "v_pedidos_cerrados",
+    "v_rendimiento_operadores",
+    "v_variaciones_timeline",
+    "v_variaciones_operaciones",
+)
 
 
 def _log_event(
@@ -151,7 +170,26 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
             "iva": "iva_num",
             "monto_diferencia": "monto_diferencia_num",
         },
+        # DEC-087: sin esto los montos de la tarjeta y de los comprobantes
+        # quedan como texto "COP X.XXX" y no se pueden sumar ni comparar —
+        # que es justamente lo que se necesita para falsar la hipótesis del
+        # comprobante compartido entre pedidos.
+        "pedidos": {
+            "pago_total": "pago_total_num",
+            "pago_pagado": "pago_pagado_num",
+            "pago_saldo": "pago_saldo_num",
+        },
+        "registros_pago": {
+            "monto_comprobante": "monto_comprobante_num",
+            "monto_pago": "monto_pago_num",
+        },
     }
+
+    # DEC-087: la paginación por keyset asumía un `id` surrogate, y `pedidos`
+    # usa `id_pedido` TEXT como clave primaria. Se declara por tabla en vez de
+    # hardcodearse: el default sigue siendo `id`, así que las cuatro tablas
+    # originales no cambian de comportamiento.
+    clave_por_tabla: dict[str, str] = {"pedidos": "id_pedido"}
 
     # E-8: validar que tablas y columnas fuente existen ANTES de tocar el
     # schema — un rename en el scraper debe fallar aquí con causa clara,
@@ -191,7 +229,12 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
         for col_src, col_num in columnas.items():
             # DEC-025: el guion solo significa cero en columnas concretas.
             guion_es_cero = col_src in COLUMNAS_GUION_ES_CERO
-            last_id = 0
+            clave = clave_por_tabla.get(tabla, "id")
+            # El centinela tiene que ser del mismo tipo que la clave: con
+            # `id_pedido` TEXT, un 0 entero compara mal en SQLite (los
+            # enteros ordenan ANTES que el texto, así que 0 funcionaría por
+            # accidente hoy y rompería el día que la clave sea numérica).
+            last_id: object = "" if clave != "id" else 0
             batch_count = 0
             total_escaneadas = 0
             total_convertidas = 0
@@ -203,10 +246,10 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
                 # escaneo — no hay nada que convertir; su magnitud se
                 # reporta con un COUNT al cierre de la columna.
                 async with db.execute(
-                    f"SELECT id, {col_src} FROM {tabla} "
-                    f"WHERE id > ? AND {col_num} IS NULL "
+                    f"SELECT {clave}, {col_src} FROM {tabla} "
+                    f"WHERE {clave} > ? AND {col_num} IS NULL "
                     f"AND {col_src} IS NOT NULL "
-                    f"ORDER BY id LIMIT 500",
+                    f"ORDER BY {clave} LIMIT 500",
                     (last_id,),
                 ) as cur:
                     rows = await cur.fetchall()
@@ -281,7 +324,7 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
                             )
                         continue
                     await db.execute(
-                        f"UPDATE {tabla} SET {col_num} = ? WHERE id = ?",
+                        f"UPDATE {tabla} SET {col_num} = ? WHERE {clave} = ?",
                         (valor_num, row_id),
                     )
                     total_convertidas += 1
@@ -384,10 +427,10 @@ async def crear_views(db: aiosqlite.Connection) -> None:
     DEC-019): con WAL, los lectores concurrentes ven el
     snapshot anterior hasta el COMMIT y nunca una view ausente.
 
-    VIEWs analíticas (8): v_pedidos_activos, v_pedidos_cerrados,
-    v_inventario_comprometido, v_diferencias_resumen,
-    v_rendimiento_operadores, v_variaciones_timeline,
-    v_variaciones_operaciones, v_descuentos_lineas.
+    VIEWs analíticas (3): v_inventario_comprometido,
+    v_diferencias_resumen, v_descuentos_lineas. Eran 8 hasta DEC-065;
+    las 5 retiradas se listan en `_VIEWS_RETIRADAS` y se dropean acá
+    mismo.
 
     VIEWs para el dashboard (4): v_lineas_pedido_num,
     v_estadisticas_monto_num, v_gestion_diferencias_num,
@@ -400,51 +443,6 @@ async def crear_views(db: aiosqlite.Connection) -> None:
     """
     views = {
         # AUD-M8: los literales de estados se generan desde comun/
-        "v_pedidos_activos": f"""
-            SELECT
-                p.id_pedido,
-                p.fecha,
-                p.vendedor,
-                p.forma_pago,
-                p.destinatario,
-                p.metodo_entrega,
-                p.hay_diferencia,
-                p.actualizado_en,
-                COUNT(s.id) AS total_subpedidos,
-                SUM(CASE WHEN LOWER(s.estado) NOT IN
-                    ({_CERRADOS_SQL})
-                    THEN 1 ELSE 0 END) AS subpedidos_abiertos
-            FROM pedidos p
-            -- DEC-021: INNER JOIN deliberado — un pedido sin subpedidos
-            -- (estado anómalo, ver etl_pedido_sin_subpedidos) no entra
-            -- a ninguna de las dos views de pedidos.
-            JOIN subpedidos s ON p.id_pedido = s.id_pedido
-            WHERE p.scraping_completo = 1
-            -- E-8/DEC-021: columnas desnudas en el SELECT con GROUP BY por
-            -- PK (p.id_pedido) — determinístico en SQLite por dependencia
-            -- funcional; SQL no portable a otros motores, aceptado.
-            GROUP BY p.id_pedido
-            HAVING subpedidos_abiertos > 0
-        """,
-        "v_pedidos_cerrados": f"""
-            SELECT
-                p.id_pedido,
-                p.fecha,
-                p.vendedor,
-                p.forma_pago,
-                p.hay_diferencia,
-                p.actualizado_en,
-                COUNT(s.id) AS total_subpedidos
-            FROM pedidos p
-            -- DEC-021: INNER JOIN deliberado (ver v_pedidos_activos)
-            JOIN subpedidos s ON p.id_pedido = s.id_pedido
-            WHERE p.scraping_completo = 1
-            -- E-8/DEC-021: GROUP BY por PK — ver v_pedidos_activos
-            GROUP BY p.id_pedido
-            HAVING SUM(CASE WHEN LOWER(s.estado) NOT IN
-                ({_CERRADOS_SQL})
-                THEN 1 ELSE 0 END) = 0
-        """,
         "v_inventario_comprometido": f"""
             SELECT
                 l.nombre_producto,
@@ -499,49 +497,6 @@ async def crear_views(db: aiosqlite.Connection) -> None:
             -- E-8/DEC-021: GROUP BY por PK; las columnas g.* son 1:1 por
             -- el UNIQUE de AUD-B9 (idx_gestion_dif_unico) — determinístico
             GROUP BY p.id_pedido
-        """,
-        "v_rendimiento_operadores": f"""
-            SELECT
-                o.usuario,
-                o.tipo_usuario,
-                o.accion,
-                COUNT(*) AS total_operaciones,
-                DATE(o.momento) AS fecha,
-                MIN(o.momento) AS primera_operacion,
-                MAX(o.momento) AS ultima_operacion
-            FROM registro_operaciones o
-            WHERE o.tipo_usuario = 'staff'
-            -- HAL-008 (Fase 6): acciones desde comun.ACCIONES_RENDIMIENTO
-            AND o.accion IN ({_ACCIONES_RENDIMIENTO_SQL})
-            GROUP BY o.usuario, o.accion, DATE(o.momento)
-            ORDER BY fecha DESC, o.usuario
-        """,
-        "v_variaciones_timeline": """
-            SELECT
-                titulo,
-                COUNT(*) AS total_ocurrencias,
-                COUNT(DISTINCT id_pedido) AS pedidos_afectados,
-                MIN(fecha_hora) AS primera_vez,
-                MAX(fecha_hora) AS ultima_vez
-            FROM timeline_pedido
-            WHERE titulo IS NOT NULL
-            AND titulo != ''
-            GROUP BY titulo
-            ORDER BY total_ocurrencias DESC
-        """,
-        "v_variaciones_operaciones": """
-            SELECT
-                accion,
-                tipo_usuario,
-                COUNT(*) AS total_ocurrencias,
-                COUNT(DISTINCT id_pedido) AS pedidos_afectados,
-                MIN(momento) AS primera_vez,
-                MAX(momento) AS ultima_vez
-            FROM registro_operaciones
-            WHERE accion IS NOT NULL
-            AND accion != ''
-            GROUP BY accion, tipo_usuario
-            ORDER BY total_ocurrencias DESC
         """,
         # DEC-024 (nota "monto del descuento"): la ranura monetaria de
         # lineas_pedido.descuento nunca contiene dinero — el descuento real
@@ -656,6 +611,11 @@ async def crear_views(db: aiosqlite.Connection) -> None:
     # anterior hasta el COMMIT.
     await db.execute("BEGIN IMMEDIATE")
     try:
+        # DEC-065: las retiradas se dropean dentro de la MISMA transacción
+        # que recrea el resto — si fuera aparte, un lector concurrente
+        # podría ver la base a medio migrar.
+        for nombre in _VIEWS_RETIRADAS:
+            await db.execute(f"DROP VIEW IF EXISTS {nombre}")
         for nombre, sql in views.items():
             await db.execute(f"DROP VIEW IF EXISTS {nombre}")
             await db.execute(f"CREATE VIEW {nombre} AS {sql}")
@@ -669,9 +629,13 @@ async def verificar_pedidos_sin_subpedidos(db: aiosqlite.Connection) -> int:
     """Check defensivo DEC-021: pedidos completos sin subpedidos.
 
     Un pedido con scraping_completo=1 sin filas en subpedidos es un
-    estado anómalo: las views de pedidos lo excluyen por diseño y sin
-    este check sería invisible. Emite etl_pedido_sin_subpedidos
+    estado anómalo que ninguna agregación por subpedido puede mostrar:
+    el INNER JOIN lo descarta. Emite etl_pedido_sin_subpedidos
     (WARNING) con conteo y muestra de IDs.
+
+    El check sobrevive a DEC-065 aunque las views de pedidos que lo
+    motivaron ya no existan: la anomalía sigue siendo real y sigue
+    siendo invisible desde cualquier consulta que una con subpedidos.
 
     Dos causas posibles, indistinguibles desde el ETL (ver DEC-021):
     el pedido está legítimamente vacío en el sistema origen ("Total 0
@@ -697,13 +661,53 @@ async def verificar_pedidos_sin_subpedidos(db: aiosqlite.Connection) -> int:
             level="WARNING",
             msg=(
                 f"{len(ids)} pedidos con scraping_completo=1 sin subpedidos — "
-                "invisibles en v_pedidos_activos/cerrados (DEC-021); "
+                "invisibles para cualquier agregación por subpedido (DEC-021); "
                 "verificar en el origen si están legítimamente vacíos"
             ),
             total=len(ids),
             muestra_ids=ids[:10],
         )
     return len(ids)
+
+
+async def actualizar_estadisticas(db: aiosqlite.Connection) -> None:
+    """Refresca las estadísticas del planificador de SQLite (DEC-068).
+
+    Sin `sqlite_stat1` el planificador no sabe que el filtro de fecha del
+    consolidado es selectivo —7 días de 210— y arranca escaneando la tabla
+    más grande: 864.073 líneas para devolver 34.000. Con estadísticas
+    reordena los joins solo.
+
+    Medido sobre copias limpias de la base real, tres corridas por
+    configuración: el consolidado pasa de **6,1 s a 1,9 s**. Agregar índices
+    encima aporta 0,1 s más y no paga su peso en cada INSERT del scraper,
+    así que **no se agregó ninguno** — mismo criterio que DEC-049.
+
+    Corre acá y no en el scraper porque el ETL es el último paso del ciclo:
+    cuando termina, los datos del scheduler ya están completos. Costo
+    medido: 2,1 s sobre un estacionario de 33 s.
+
+    Un fallo acá **no tumba el ETL**: las estadísticas son una optimización,
+    y quedarse con las de la corrida anterior solo cuesta velocidad.
+
+    Args:
+        db: Conexión abierta a pedidos.db.
+    """
+    try:
+        inicio = datetime.now(timezone.utc)
+        await db.execute("ANALYZE")
+        await db.commit()
+        ms = (datetime.now(timezone.utc) - inicio).total_seconds() * 1000
+        _log_event(
+            "etl_analyze_ok", msg=f"estadísticas actualizadas en {ms:.0f} ms", duracion_ms=ms
+        )
+    except Exception as exc:  # noqa: BLE001 — optimización, nunca crítica
+        _log_event(
+            "etl_analyze_fallido",
+            level="WARNING",
+            msg="no se pudieron actualizar las estadísticas; se sigue con las anteriores",
+            error=str(exc),
+        )
 
 
 async def main() -> int:
@@ -727,14 +731,8 @@ async def main() -> int:
             await normalizar_montos(db)
             await separar_concepto_tasa(db)
             await crear_views(db)
-            async with db.execute("SELECT COUNT(*) FROM v_rendimiento_operadores") as cur:
-                row = await cur.fetchone()
-            if row and row[0] == 0:
-                _log_event(
-                    "etl_view_vacia",
-                    level="WARNING",
-                    msg="v_rendimiento_operadores retorna 0 filas — verificar acciones hardcodeadas en WHERE",
-                )
+            # DEC-065: acá vivía un check de 0 filas sobre
+            # v_rendimiento_operadores. Se fue con la view.
 
             # AUD-M8 (auditoría 2026-07-01): check defensivo — un estado en
             # DB fuera de las listas del módulo común indica que el sistema
@@ -759,6 +757,8 @@ async def main() -> int:
             # DEC-021 (Fase 6): pedidos completos sin subpedidos — anómalos
             # e invisibles en las views de pedidos; hacerlos visibles.
             await verificar_pedidos_sin_subpedidos(db)
+
+            await actualizar_estadisticas(db)
         _log_event("etl_completado", db_path=db_path)
         return 0
     except Exception as exc:

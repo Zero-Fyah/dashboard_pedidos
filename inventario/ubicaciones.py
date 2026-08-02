@@ -26,7 +26,13 @@ import logging
 
 import pandas as pd
 
-from comun import familia_de
+from comun import (
+    SUFIJO_CLASE_HEREDADA,
+    VIGENCIA_ACTIVO,
+    VIGENCIA_DESCONTINUADO,
+    familia_de,
+)
+from inventario.normalizador import ADMIN_ACTIVO, ADMIN_DESCONTINUADO
 
 logger = logging.getLogger("inventario.ubicaciones")
 
@@ -51,7 +57,20 @@ ORDEN_CLASE = ("A", "B", "C", SIN_ROTACION)
 # que se hereda su clase y se marca el origen para no fingir precisión que
 # no hay. La causa de fondo es el código de barras no único por ID, que ya
 # está en Tareas como hallazgo (DEC-047).
-SUFIJO_HEREDADA = " (por referencia)"
+#
+# DEC-067: el sufijo se importa de `comun/`. El dashboard decide con él qué
+# entra a la cola de conteo, así que no puede vivir solo acá.
+SUFIJO_HEREDADA = SUFIJO_CLASE_HEREDADA
+
+# Orden físico de los racks en el plano de bodega (DEC-078). Los pares
+# consecutivos comparten pasillo: A|B, C|D, … O|P — verificado contra las
+# columnas de la hoja `Plano Layout`, donde cada `PASILLO` cae exactamente
+# entre el fin de un rack y el comienzo del siguiente.
+RACKS_EN_PLANO = "ABCDEFGHIJKLMNOP"
+
+# Un rack que el plano no dibuja (`PU`, o uno nuevo) va al final del
+# recorrido: mejor visible y último que fuera de orden o desaparecido.
+_PASILLO_DESCONOCIDO = 99
 
 _COLUMNAS = [
     "ubicacion",
@@ -62,6 +81,9 @@ _COLUMNAS = [
     "id_especificacion",
     "referencia",
     "familia",
+    # DEC-072: 1 si el ID está en el catálogo del admin. El alcance de
+    # trabajo son esos; el resto se ve pero no se cuenta.
+    "en_catalogo",
     "cantidad",
     "clase",
     "origen_clase",
@@ -71,6 +93,8 @@ _COLUMNAS = [
     "valor_linea",
     "dias_sin_salida",
     "prioridad",
+    # DEC-078: orden de visita física, derivado del plano.
+    "orden_recorrido",
 ]
 
 
@@ -140,6 +164,29 @@ def calcular_ubicaciones(
     lineas.loc[lineas["clase"] == SIN_ROTACION, "origen_clase"] = "Sin ventas"
     lineas = lineas.drop(columns="_clase_ref")
 
+    # ── ¿El catálogo del admin reconoce este ID? (DEC-072) ───────────
+    # El alcance de trabajo son los ID que publica `admin_inventario`. Lo
+    # que Bochica reporta bajo un ID que el catálogo no tiene existe
+    # físicamente y ocupa espacio, pero **no se puede contar**: nadie sabe
+    # qué producto es, ni qué clase tiene, ni cuánto vale.
+    #
+    # Se marca en vez de descartarse. Borrarlo dejaría 387 posiciones
+    # figurando vacías cuando están ocupadas, y el mapa de bodega mentiría
+    # sobre la utilización del espacio.
+    ids_catalogo = set(df_admin["id_especificacion"].astype(str))
+    lineas["en_catalogo"] = lineas["id_especificacion"].isin(ids_catalogo).astype(int)
+    fuera = lineas["en_catalogo"] == 0
+    if fuera.any():
+        logger.info(
+            "calcular_ubicaciones: %d de %d líneas con ID fuera del catálogo admin "
+            "(%d ID · %d posiciones · %.0f unidades) — quedan marcadas, no se descartan",
+            int(fuera.sum()),
+            len(lineas),
+            lineas.loc[fuera, "id_especificacion"].nunique(),
+            lineas.loc[fuera, "ubicacion"].nunique(),
+            float(lineas.loc[fuera, "cantidad"].sum()),
+        )
+
     # ── Valor de lo que hay en la posición ───────────────────────────
     precios = df_admin[["id_especificacion", "precio"]].copy()
     precios["id_especificacion"] = precios["id_especificacion"].astype(str)
@@ -206,6 +253,12 @@ def calcular_ubicaciones(
     ).reset_index(drop=True)
     lineas["prioridad"] = lineas.index + 1
 
+    # DEC-078: el par conceptual de `prioridad`. Una dice **qué** contar
+    # primero; la otra, **en qué orden caminar** lo que ya se eligió. No
+    # compiten: la hoja de conteo selecciona por prioridad y recorre por
+    # ruta.
+    lineas["orden_recorrido"] = _orden_recorrido(lineas)
+
     total = len(lineas)
     altura = lineas[lineas["tipo"] == TIPO_ALTURA]
     logger.info(
@@ -255,6 +308,113 @@ def resumen_cobertura(lineas: pd.DataFrame, layout: pd.DataFrame) -> pd.DataFram
             }
         )
     return pd.DataFrame(filas)
+
+
+def _orden_recorrido(lineas: pd.DataFrame) -> pd.Series:
+    """Orden de visita física, derivado de la geometría del plano (DEC-078).
+
+    La hoja `Plano Layout` muestra la bodega como es: **8 pasillos, cada uno
+    entre un par de racks consecutivos** —A|B, C|D, … O|P— con las posiciones
+    numeradas a lo largo del pasillo. Verificado contra las columnas del plano,
+    no supuesto por el nombre.
+
+    El orden que sale de acá es una **serpentina**: el pasillo impar se
+    recorre de la posición 1 hacia la 50 y el par de vuelta, porque quien
+    termina el pasillo 1 en la posición 50 entra al pasillo 2 por ese mismo
+    extremo. Recorrerlos todos en el mismo sentido obliga a volver caminando
+    en vacío la longitud del rack en cada cambio.
+
+    Dentro de una posición se cuentan las dos caras del pasillo (los dos
+    racks) y dentro de cada cara se sube por altura.
+
+    Un rack fuera de A-P —`PU`, o uno nuevo— va al final en vez de romper el
+    orden o desaparecer.
+
+    Returns:
+        Serie de enteros ordenables alineada al índice de `lineas`.
+    """
+    indice = {r: i for i, r in enumerate(RACKS_EN_PLANO)}
+    idx = lineas["rack"].astype(str).str.strip().str.upper().map(indice)
+
+    posicion = pd.to_numeric(lineas["posicion"], errors="coerce").fillna(0).astype(int)
+    altura = pd.to_numeric(lineas["nivel"], errors="coerce").fillna(0).astype(int)
+
+    pasillo = (idx // 2 + 1).fillna(_PASILLO_DESCONOCIDO)
+    # Cara del pasillo: 0 = rack izquierdo del par, 1 = derecho.
+    cara = (idx % 2).fillna(0)
+
+    # Serpentina: los pasillos pares se recorren al revés.
+    tope = int(posicion.max()) if len(posicion) else 0
+    posicion_ruta = posicion.where(pasillo % 2 == 1, tope - posicion)
+
+    orden = (
+        pasillo.astype(int) * 1_000_000
+        + posicion_ruta.astype(int) * 1_000
+        + cara.astype(int) * 100
+        + altura
+    )
+    return orden.astype(int)
+
+
+def sin_ubicacion_conocida(df_admin: pd.DataFrame, lineas: pd.DataFrame) -> pd.DataFrame:
+    """Producto que el admin dice que existe y que nadie puede ubicar (DEC-073).
+
+    El plan de conteo manda gente a posiciones **donde el sistema ya dice que
+    hay algo**, así que por construcción no puede descubrir lo que el sistema
+    no ve. Esto es la otra mitad: los ID cuyo catálogo declara inventario y
+    que no aparecen en **ninguna** posición de Bochica.
+
+    Medido: 288 ID con **151.345 unidades** que el admin da por existentes y
+    que el mapa de bodega no muestra en ningún lado. No es un error de datos
+    a corregir en pantalla — es producto que está físicamente en alguna parte
+    y hay que salir a buscarlo.
+
+    **Se incluyen los dos estados de `producto_activo`.** Que una referencia
+    esté descontinuada no la hace menos física: 102 de esos 288 ID lo están, y
+    son justamente los que nadie va a mirar si no aparecen en una lista.
+
+    Args:
+        df_admin: Catálogo del admin ya filtrado por alcance.
+        lineas: Resultado de `calcular_ubicaciones()`.
+
+    Returns:
+        Una fila por ID sin ubicación, ordenada por unidades declaradas.
+    """
+    columnas = ["id_especificacion", "referencia", "nombre_comercial", "vigencia", "inventario"]
+    if df_admin.empty:
+        return pd.DataFrame(columns=columnas)
+
+    cat = df_admin.copy()
+    cat["id_especificacion"] = cat["id_especificacion"].astype(str)
+    cat["inventario"] = pd.to_numeric(cat["inventario"], errors="coerce").fillna(0.0)
+    # Un ID puede venir en varias filas del catálogo; el inventario es el
+    # mismo dato repetido por almacén, así que se toma el máximo y no la suma.
+    cat = cat.groupby("id_especificacion", as_index=False).agg(
+        referencia=("referencia", "first"),
+        nombre_comercial=("nombre_comercial", "first"),
+        producto_activo=("producto_activo", "first"),
+        inventario=("inventario", "max"),
+    )
+
+    ubicados = set(lineas["id_especificacion"].astype(str)) if not lineas.empty else set()
+    fuera = cat[~cat["id_especificacion"].isin(ubicados) & (cat["inventario"] > 0)].copy()
+    if fuera.empty:
+        return pd.DataFrame(columns=columnas)
+
+    fuera["vigencia"] = fuera["producto_activo"].map(
+        {ADMIN_ACTIVO: VIGENCIA_ACTIVO, ADMIN_DESCONTINUADO: VIGENCIA_DESCONTINUADO}
+    )
+    fuera = fuera.sort_values("inventario", ascending=False)
+
+    logger.info(
+        "sin_ubicacion_conocida: %d ID con inventario declarado y ninguna posición "
+        "(%.0f unidades · %d vigentes · %d descontinuados)",
+        len(fuera),
+        float(fuera["inventario"].sum()),
+        int((fuera["vigencia"] == VIGENCIA_ACTIVO).sum()),
+        int((fuera["vigencia"] == VIGENCIA_DESCONTINUADO).sum()),
+    )
+    return fuera[columnas]
 
 
 def mapa_posiciones(

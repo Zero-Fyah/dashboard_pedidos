@@ -6,11 +6,14 @@ con `hoy` inyectado para que los días no dependan de cuándo corra el test.
 """
 
 import datetime as dt
+import logging
 import sqlite3
 
 import pandas as pd
 import pytest
 
+from comun import VIGENCIA_ACTIVO, VIGENCIA_DESCONTINUADO
+from inventario.normalizador import ADMIN_ACTIVO, ADMIN_DESCONTINUADO
 from inventario.salud import (
     COBERTURA_ALTA_D,
     ESTADO_ALTA,
@@ -41,9 +44,16 @@ def con():
     c.close()
 
 
-def _admin(filas):
-    """filas: (referencia, inventario, precio)."""
-    return pd.DataFrame(filas, columns=["referencia", "inventario", "precio"])
+def _admin(filas, producto_activo=ADMIN_ACTIVO):
+    """filas: (referencia, inventario, precio).
+
+    `producto_activo` se agrega con el valor "vigente" por defecto (DEC-065):
+    es una columna del contrato de `cargar_admin()` y sin ella la referencia
+    caería como descontinuada, sacándola del universo de salud.
+    """
+    df = pd.DataFrame(filas, columns=["referencia", "inventario", "precio"])
+    df["producto_activo"] = producto_activo
+    return df
 
 
 def _venta(con, ref, dias_atras, cantidad, estado="Completado", almacen="Bogotá"):
@@ -181,3 +191,98 @@ def test_referencia_del_catalogo_sin_ventas_igual_aparece(con):
 def test_familia_sale_de_la_referencia(con):
     df = calcular_salud(_admin([("PJ91", 10, 100)]), con, hoy=HOY).set_index("referencia")
     assert df.loc["PJ91", "familia"] == "PJ"
+
+
+# ─────────────────────────────────────────────
+# Vigencia del catálogo (DEC-065)
+# ─────────────────────────────────────────────
+
+
+def test_producto_marcado_activo_queda_vigente(con):
+    df = calcular_salud(_admin([("PA01", 10, 100)]), con, hoy=HOY).set_index("referencia")
+
+    assert df.loc["PA01", "vigencia"] == VIGENCIA_ACTIVO
+
+
+def test_producto_marcado_inactivo_queda_descontinuado(con):
+    """DEC-065: `No hay` es la marca de descontinuado del admin. Se estableció
+    midiendo su correlación con inventario y demanda, no por la etiqueta."""
+    admin = _admin([("PA01", 0, 100)], producto_activo=ADMIN_DESCONTINUADO)
+    df = calcular_salud(admin, con, hoy=HOY).set_index("referencia")
+
+    assert df.loc["PA01", "vigencia"] == VIGENCIA_DESCONTINUADO
+
+
+def test_el_descontinuado_no_se_borra_del_resultado(con):
+    """La separación es del consumidor, no de calcular_salud(): la página
+    muestra las vigentes y las otras aparte, pero el dato medido no se tira."""
+    admin = pd.concat(
+        [
+            _admin([("PA01", 10, 100)]),
+            _admin([("PB02", 0, 100)], producto_activo=ADMIN_DESCONTINUADO),
+        ]
+    )
+    df = calcular_salud(admin, con, hoy=HOY).set_index("referencia")
+
+    assert set(df.index) == {"PA01", "PB02"}
+    assert df.loc["PA01", "vigencia"] == VIGENCIA_ACTIVO
+    assert df.loc["PB02", "vigencia"] == VIGENCIA_DESCONTINUADO
+
+
+def test_una_especificacion_vigente_alcanza_para_la_referencia(con):
+    """Criterio conservador: basta una especificación activa para mantener la
+    referencia en el universo de salud, en vez de esconderla."""
+    admin = pd.concat(
+        [
+            _admin([("PA01", 5, 100)], producto_activo=ADMIN_DESCONTINUADO),
+            _admin([("PA01", 5, 100)]),
+        ]
+    )
+    df = calcular_salud(admin, con, hoy=HOY).set_index("referencia")
+
+    assert df.loc["PA01", "vigencia"] == VIGENCIA_ACTIVO
+
+
+def test_valor_desconocido_de_producto_activo_avisa(con, caplog):
+    """Un valor nuevo cae del lado descontinuado y sacaría referencias del
+    universo sin que nadie lo note: tiene que quedar en el log."""
+    admin = _admin([("PA01", 10, 100)], producto_activo="Quizás")
+
+    with caplog.at_level(logging.WARNING, logger="inventario.normalizador"):
+        df = calcular_salud(admin, con, hoy=HOY).set_index("referencia")
+
+    assert df.loc["PA01", "vigencia"] == VIGENCIA_DESCONTINUADO
+    assert "producto_activo" in caplog.text
+    assert "Quizás" in caplog.text
+
+
+# ─────────────────────────────────────────────
+# Umbral de cobertura alta (DEC-066)
+# ─────────────────────────────────────────────
+
+
+def test_el_umbral_alto_es_el_definido_por_negocio():
+    """DEC-066: 390 días = percentil 80 del catálogo vigente. No es un default
+    de implementación, es una definición del Arquitecto — si alguien lo cambia
+    sin pasar por decisions.md, este test lo frena."""
+    assert COBERTURA_ALTA_D == 390
+
+
+def test_cobertura_bajo_el_umbral_nuevo_sigue_normal(con):
+    """Con el umbral viejo de 90, una cobertura de 200 días caía en "alta".
+    Es exactamente el caso que hacía que el 57% del catálogo entrara ahí."""
+    _venta(con, "PA01", 10, 90)  # 1/día
+    df = calcular_salud(_admin([("PA01", 200, 1000)]), con, hoy=HOY).set_index("referencia")
+
+    assert df.loc["PA01", "dias_cobertura"] == pytest.approx(200)
+    assert df.loc["PA01", "estado"] == ESTADO_NORMAL
+
+
+def test_apenas_sobre_el_umbral_es_alta(con):
+    """La frontera se cruza en COBERTURA_ALTA_D, sin zona muerta entre bandas."""
+    _venta(con, "PA01", 10, 90)  # 1/día → cobertura = disponible
+    df = calcular_salud(_admin([("PA01", COBERTURA_ALTA_D + 1, 1000)]), con, hoy=HOY).set_index(
+        "referencia"
+    )
+
+    assert df.loc["PA01", "estado"] == ESTADO_ALTA

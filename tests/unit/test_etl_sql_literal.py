@@ -2,12 +2,17 @@
 
 Los literales SQL de estados se generan desde comun/; un estado con
 apóstrofe rompería el SQL de las views sin el escape estándar de SQLite.
+
+DEC-065 retiró las views que interpolaban `_CERRADOS_SQL` y
+`_ACCIONES_RENDIMIENTO_SQL`, así que ambas constantes se fueron con ellas.
+El único literal generado que queda es el de estados activos de inventario,
+que alimenta `v_inventario_comprometido` — y es el que se verifica acá.
 """
 
 import pytest
 
-from comun import ACCIONES_RENDIMIENTO
-from etl.etl_principal import _ACCIONES_RENDIMIENTO_SQL, _CERRADOS_SQL, _sql_literal
+from comun import ESTADOS_ACTIVOS_INVENTARIO
+from etl.etl_principal import _ACTIVOS_INVENTARIO_SQL, _sql_literal
 
 
 @pytest.mark.unit
@@ -22,28 +27,11 @@ def test_sql_literal_escapa_apostrofe():
 
 
 @pytest.mark.unit
-def test_cerrados_sql_identico_al_previo():
-    """El escape no altera el SQL generado con los estados actuales
-    (ninguno contiene apóstrofes): mismas views que antes de E-8."""
-    assert _CERRADOS_SQL == "'cancelado','comentado','completado'"
+def test_activos_inventario_sql_cubre_todos_los_estados():
+    """Un estado que no llegue al SQL saldría en silencio del universo de
+    v_inventario_comprometido, sin error visible."""
+    esperado = ",".join(_sql_literal(e) for e in ESTADOS_ACTIVOS_INVENTARIO)
 
-
-@pytest.mark.unit
-def test_acciones_rendimiento_exactamente_cuatro():
-    """HAL-008: las 4 acciones verificadas en DB real el 2026-07-17."""
-    assert ACCIONES_RENDIMIENTO == (
-        "Alistamiento sin diferencia",
-        "Alistamiento con faltantes",
-        "Inspección sin diferencia",
-        "Inspección con diferencia",
-    )
-
-
-@pytest.mark.unit
-def test_acciones_rendimiento_sql_identico_al_hardcodeado_previo():
-    """HAL-008 (Fase 6): el SQL generado desde comun/ es idéntico al
-    literal que estaba hardcodeado en v_rendimiento_operadores."""
-    assert _ACCIONES_RENDIMIENTO_SQL == (
-        "'Alistamiento sin diferencia','Alistamiento con faltantes',"
-        "'Inspección sin diferencia','Inspección con diferencia'"
-    )
+    assert _ACTIVOS_INVENTARIO_SQL == esperado
+    for estado in ESTADOS_ACTIVOS_INVENTARIO:
+        assert _sql_literal(estado) in _ACTIVOS_INVENTARIO_SQL

@@ -25,7 +25,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from comun import META_IRA_POR_CLASE
+from comun import META_IRA_POR_CLASE, VIGENCIA_ACTIVO
 from db import (
     get_alertas,
     get_inventario_corrida,
@@ -134,8 +134,13 @@ st.caption(
     "decidir sobre un número que nadie acordó."
 )
 
-quiebres = int((salud["estado"] == "Quiebre").sum()) if not salud.empty else 0
-riesgo = int((salud["estado"] == "Riesgo de quiebre").sum()) if not salud.empty else 0
+# DEC-067: sobre el catálogo vigente, igual que la página de Salud. Sin este
+# filtro el scorecard contaba 155 quiebres contra los 81 de la página de
+# detalle: 74 eran producto descontinuado, casi todo averías. Un quiebre de
+# stock de una avería no existe — nadie repone mercancía dañada.
+vigente = salud[salud["vigencia"] == VIGENCIA_ACTIVO] if not salud.empty else salud
+quiebres = int((vigente["estado"] == "Quiebre").sum()) if not vigente.empty else 0
+riesgo = int((vigente["estado"] == "Riesgo de quiebre").sum()) if not vigente.empty else 0
 sobrante_ref = int(_valor(corrida, "sobrante_referencias", 0) or 0)
 sobrante_uni = int(_valor(corrida, "sobrante_unidades", 0) or 0)
 

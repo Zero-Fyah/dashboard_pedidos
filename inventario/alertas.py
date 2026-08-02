@@ -25,6 +25,13 @@ import logging
 
 import pandas as pd
 
+from comun import (
+    ESTADO_CONTEO_CONFIRMADO,
+    ESTADO_CONTEO_PENDIENTE,
+    VIGENCIA_ACTIVO,
+    es_conteo_prioritario,
+)
+
 logger = logging.getLogger("inventario.alertas")
 
 CRITICA = "Crítica"
@@ -60,9 +67,26 @@ def _quiebres(salud: pd.DataFrame, abc: pd.DataFrame) -> list[dict]:
     Solo se alertan las de clase A y B: un quiebre en clase C con demanda
     marginal no compite por la atención de nadie, y meterlo acá diluiría
     los que sí importan.
+
+    **Solo catálogo vigente (DEC-067).** Un quiebre de producto descontinuado
+    no es un quiebre: nadie repone lo que ya no se vende. Sin este filtro, 2
+    de las 7 alertas críticas apuntaban a producto muerto (`PJ51`, `PJ32-27`).
+
+    El filtro es por la marca del admin, **no por el nombre**: las averías se
+    venden por Outlet y varias están vigentes. `PRA AVERIA` sigue alertando y
+    está bien — vendió 74 unidades en 90 días y quedó en cero.
+
+    Contraste deliberado con `_inmovilizado()`, que **sí** mira el
+    descontinuado: ahí la pregunta es de capital parado, y producto muerto con
+    stock es exactamente eso. La vigencia importa cuando la pregunta es de
+    abastecimiento, no cuando es de capital.
     """
     if salud.empty:
         return []
+    if "vigencia" in salud.columns:
+        salud = salud[salud["vigencia"] == VIGENCIA_ACTIVO]
+        if salud.empty:
+            return []
     clases = (
         abc[abc["nivel"] == "referencia"].set_index("clave")["abc"].to_dict()
         if not abc.empty
@@ -128,10 +152,21 @@ def _discrepancias(conteos: pd.DataFrame) -> list[dict]:
 
     Clase A es Crítica sin importar el monto: el plan de inventario exige
     doble verificación para **cualquier** ajuste de clase A.
+
+    **DEC-070: solo las que siguen abiertas.** Antes alertaba toda
+    discrepancia para siempre, incluidas las ya recontadas y las ya
+    ajustadas — una alerta que no se apaga cuando el problema se resuelve
+    enseña a ignorar el panel.
     """
     if conteos.empty:
         return []
     malas = conteos[conteos["exacta"] == 0]
+    if "estado_ciclo" in malas.columns:
+        malas = malas[
+            malas["estado_ciclo"].isin([ESTADO_CONTEO_PENDIENTE, ESTADO_CONTEO_CONFIRMADO])
+        ]
+    if malas.empty:
+        return []
     filas = []
     for r in malas.itertuples(index=False):
         clase = str(r.clase or "")[:1]
@@ -161,7 +196,11 @@ def _cobertura_de_conteo(ubicaciones: pd.DataFrame, conteos: pd.DataFrame) -> li
     if ubicaciones.empty:
         return []
     altura = ubicaciones[ubicaciones["tipo"] == "Altura"]
-    criticas = altura[altura["clase_posicion"].astype(str).str.startswith(("A", "B"))]
+    # DEC-067: el criterio vive en comun/ y se aplica sobre `clase_posicion`.
+    # Antes era un startswith local acá y un isin(["A","B"]) sobre otra columna
+    # en la cola de conteo — dos definiciones del mismo concepto, 1.817 contra
+    # 1.516 posiciones.
+    criticas = altura[altura["clase_posicion"].map(es_conteo_prioritario)]
     contadas = set(conteos["ubicacion"]) if not conteos.empty else set()
     pendientes = criticas[~criticas["ubicacion"].isin(contadas)]["ubicacion"].nunique()
     if not pendientes:

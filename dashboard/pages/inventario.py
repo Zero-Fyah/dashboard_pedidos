@@ -383,6 +383,10 @@ else:
         "paso_montacarga": "Paso de montacarga — el túnel transversal del rack, no es posición de almacenamiento",
         "estiba_nivel_superior": "Nivel superior de estiba completa — el stock debería estar todo en la altura 1",
         "posicion_no_habilitada": "Posición no habilitada — marcada NO en las tres alturas de picking",
+        "familia_fuera_de_rack": (
+            "Producto fuera de su rack — la familia no es la que la hoja "
+            "«Distribución» le asigna a ese rack (DEC-077)"
+        ),
     }
     a1, a2 = st.columns(2)
     a1.metric("Ubicaciones con stock inesperado", f"{anomalias['ubicacion'].nunique():,}")
@@ -487,8 +491,32 @@ else:
     )
 
 
-st.caption(
-    "Alcance: solo ubicaciones del layout de bodega. La mercancía recibida por peso "
-    "(buckets Q/R1/YU/Z, prefijos PU*, otras sedes) queda fuera del cruce por decisión "
-    "de negocio: se incorpora cuando el flujo de unidades esté controlado."
+# DEC-076: el alcance se cuantifica, no solo se nombra. Lo que queda afuera
+# es el 47% de las unidades de Bochica; decir "queda fuera" sin el número
+# deja pensar que es un residuo. Y las causas son tres, no una: atribuirlo
+# todo a "mercancía por peso" era falso para la zona de recibo.
+_fuera_u = float(corrida.get("fuera_layout_unidades") or 0)
+_fuera_l = int(corrida.get("fuera_layout_lineas") or 0)
+_dentro_u = sum(
+    float(corrida.get(k) or 0) for k in ("bochica_altura", "bochica_picking", "bochica_paso")
 )
+_pct = _fuera_u / (_fuera_u + _dentro_u) * 100 if (_fuera_u + _dentro_u) else 0
+
+if _fuera_u:
+    # El separador de miles se cambia sobre los números, no sobre la frase:
+    # un `.replace(",", ".")` al final se come también las comas de la prosa.
+    _l = f"{_fuera_l:,}".replace(",", ".")
+    _u = f"{_fuera_u:,.0f}".replace(",", ".")
+    st.caption(
+        f"**Alcance: solo ubicaciones del layout de bodega.** Quedan fuera "
+        f"**{_l} líneas con {_u} unidades** (el {_pct:.0f}% de lo que reporta "
+        "Bochica), por decisión de negocio. Son tres cosas distintas: mercancía "
+        "recibida **por peso** (racks virtuales Q/R1/YU/Z/O), la **zona de recibo** "
+        "PU_1_1 y **otras sedes** (PU\\*, Itagüí, Cúcuta). Se incorporan cuando el "
+        "flujo de unidades esté controlado (DEC-076)."
+    )
+else:
+    st.caption(
+        "Alcance: solo ubicaciones del layout de bodega. Lo que está fuera del "
+        "layout no se tiene en cuenta, por decisión de negocio (DEC-076)."
+    )

@@ -13,6 +13,7 @@ El layout de muestra reproduce en miniatura las tres formas reales:
 - rack B pos 25: Paso Montacarga (alturas 1-4)
 """
 
+import logging
 from pathlib import Path
 
 import pandas as pd
@@ -256,3 +257,121 @@ def test_el_layout_gana_sobre_la_lista_de_virtuales(layout):
     clasificado = clasificar_ubicaciones(_bochica(["Q_1_1"], [10]), ampliado)
 
     assert clasificado.iloc[0]["tipo"] == TIPO_ALTURA
+
+
+# ── DEC-074: notas al pie de la hoja ─────────────────────────────────────────
+
+
+def _layout_con_nota() -> pd.DataFrame:
+    """El layout real tal como quedó: filas de nota y en blanco al final.
+
+    Poner una nota abajo de una hoja de cálculo es lo más normal del mundo, y
+    hasta DEC-074 tumbaba la corrida entera.
+    """
+    base = _layout_raw()
+    vacia = dict.fromkeys(base.columns)
+    nota = dict.fromkeys(base.columns)
+    nota["CEDI"] = "Nota: PU_1_1 es una ubicación transitoria de recibo."
+    return pd.concat([base, pd.DataFrame([vacia, nota])], ignore_index=True)
+
+
+def test_una_nota_al_pie_no_tumba_la_carga(monkeypatch):
+    """Dos filas sin ubicación contaban como una ubicación duplicada y
+    `_validar_layout` levantaba ValueError: ni el inventario ni el ETL
+    llegaban a persistir nada."""
+    monkeypatch.setattr(
+        "inventario.layout.pd.read_excel", lambda _p, sheet_name=None: _layout_con_nota()
+    )
+    monkeypatch.setattr(Path, "exists", lambda _self: True)
+
+    df = cargar_layout(Path("irrelevante.xlsx"))
+
+    assert len(df) == len(_layout_raw())
+    assert df["ubicacion"].notna().all()
+    assert "nan" not in set(df["ubicacion"])
+
+
+def test_la_nota_queda_en_el_log(monkeypatch, caplog):
+    """Una nota puede traer información de negocio: descartarla en silencio
+    la perdería."""
+    monkeypatch.setattr(
+        "inventario.layout.pd.read_excel", lambda _p, sheet_name=None: _layout_con_nota()
+    )
+    monkeypatch.setattr(Path, "exists", lambda _self: True)
+
+    with caplog.at_level(logging.INFO, logger="inventario.layout"):
+        cargar_layout(Path("irrelevante.xlsx"))
+
+    assert "ubicación transitoria" in caplog.text
+
+
+def test_una_celda_vacia_no_vuelve_falsa_la_validacion_del_patron(monkeypatch, caplog):
+    """La fila en blanco hace que pandas lea `Posición`/`Altura` como float:
+    `astype(str)` daba "A_1.0_1.0" y el check reportaba el 100% de las
+    ubicaciones como mal formadas. Una alarma que suena para todo no
+    distingue nada."""
+    monkeypatch.setattr(
+        "inventario.layout.pd.read_excel", lambda _p, sheet_name=None: _layout_con_nota()
+    )
+    monkeypatch.setattr(Path, "exists", lambda _self: True)
+
+    with caplog.at_level(logging.WARNING, logger="inventario.layout"):
+        cargar_layout(Path("irrelevante.xlsx"))
+
+    assert "no siguen el patrón" not in caplog.text
+
+
+# ── DEC-075: Stage Recibo, conocido y fuera de alcance ───────────────────────
+
+
+def _layout_con_stage() -> pd.DataFrame:
+    """El layout tal como quedó tras el 2026-07-30: incluye `PU_1_1`."""
+    base = _layout_raw()
+    stage = _fila("PU", 1, 1, "Stage Recibo", "NO")
+    return pd.concat([base, pd.DataFrame([stage])], ignore_index=True)
+
+
+def _cargar_con(monkeypatch, df):
+    monkeypatch.setattr("inventario.layout.pd.read_excel", lambda _p, sheet_name=None: df)
+    monkeypatch.setattr(Path, "exists", lambda _self: True)
+    return cargar_layout(Path("irrelevante.xlsx"))
+
+
+def test_stage_recibo_no_entra_al_alcance_de_conteo(monkeypatch):
+    """DEC-075: decisión del Arquitecto. `PU_1_1` es zona transitoria de
+    recibo; `solo_layout()` la descarta como cualquier tipo fuera de
+    TIPOS_LAYOUT."""
+    df = _cargar_con(monkeypatch, _layout_con_stage())
+    clasificado = df.assign(cantidad=1).rename(columns={"ubicacion": "ubicacion"})
+
+    assert "Stage Recibo" not in set(solo_layout(clasificado)["tipo"])
+
+
+def test_stage_recibo_ya_no_alerta_como_tipo_desconocido(monkeypatch, caplog):
+    """El WARNING existe para avisar de un tipo NUEVO. Uno ya resuelto
+    saliendo en cada corrida solo enseña a ignorar el log."""
+    with caplog.at_level(logging.WARNING, logger="inventario.layout"):
+        _cargar_con(monkeypatch, _layout_con_stage())
+
+    assert "no reconocidos" not in caplog.text
+
+
+def test_el_descarte_de_stage_recibo_se_informa(monkeypatch, caplog):
+    """Fuera de alcance no es lo mismo que invisible: se baja a INFO, no
+    se calla."""
+    with caplog.at_level(logging.INFO, logger="inventario.layout"):
+        _cargar_con(monkeypatch, _layout_con_stage())
+
+    assert "fuera del alcance de conteo" in caplog.text
+
+
+def test_un_tipo_realmente_nuevo_sigue_alertando(monkeypatch, caplog):
+    """La red no se rompió: lo que no está decidido sigue avisando."""
+    df = pd.concat(
+        [_layout_raw(), pd.DataFrame([_fila("ZZ", 9, 9, "Cuarentena", "NO")])],
+        ignore_index=True,
+    )
+    with caplog.at_level(logging.WARNING, logger="inventario.layout"):
+        _cargar_con(monkeypatch, df)
+
+    assert "Cuarentena" in caplog.text

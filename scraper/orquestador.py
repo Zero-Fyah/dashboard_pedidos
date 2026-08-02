@@ -123,6 +123,107 @@ async def obtener_ids_activos(db_path: str) -> list[str]:
     return [r[0] for r in rows]
 
 
+# DEC-092: la tarjeta de entrega se da por NO LEÍDA solo si faltan sus tres
+# campos. Un solo campo vacío no alcanza, y las dos corridas del 2026-08-01 lo
+# demostraron probando los dos atajos:
+#
+# - Con `despachador` como testigo: 504 pedidos elegidos, 100% de éxito,
+#   **2 recuperados**. Ese campo está al 100% de marzo a junio pero cae al 44%
+#   en julio porque **el origen dejó de poblarlo** (lo había marcado el
+#   detector `cobertura_de_campos_cayendo`). Confunde "no se leyó la tarjeta"
+#   con "el origen ya no lo trae".
+# - Con `hora_entrega`: 12 elegidos, 100% de éxito, **0 recuperados**. Los 12
+#   tienen despachador y observaciones, o sea que la tarjeta SÍ se leyó y solo
+#   les falta la hora — 12 de ~17.800 en la ventana, 0,07%.
+#
+# Los tres vacíos a la vez es la única señal que no se confunde con un campo
+# que el origen dejó de traer ni con un vacío legítimo. Hoy devuelve 0 en
+# producción, y eso es correcto: no queda nada recuperable.
+_CAMPOS_ENTREGA = ("despachador", "hora_entrega", "obs_entrega")
+
+# Ventana de la pasada de mantenimiento, en días de antigüedad del pedido.
+# El borde inferior deja que la entrega ocurra y quede registrada; el superior
+# deja un mes de margen antes de que el origen esconda la tarjeta —medido en
+# ~6 meses y moviéndose un día por día (DEC-091)—.
+MANTENIMIENTO_DIAS_MIN = 25
+MANTENIMIENTO_DIAS_MAX = 150
+
+
+async def obtener_ids_para_recuperar(
+    db_path: str,
+    *,
+    dias_min: int = MANTENIMIENTO_DIAS_MIN,
+    dias_max: int = MANTENIMIENTO_DIAS_MAX,
+) -> list[str]:
+    """IDs de pedidos entregados a los que les falta la información de entrega.
+
+    Es el insumo de `--modo mantenimiento` (DEC-092). El origen deja de
+    renderizar esa tarjeta para pedidos viejos, así que existe una ventana
+    —desde que el pedido se entrega hasta que el origen lo esconde— y lo que
+    no se capture ahí **no se recupera nunca** (DEC-091: 3.517 pedidos ya
+    perdidos).
+
+    Cuatro condiciones, cada una descartando un falso positivo distinto:
+
+    1. **Entregado**: un pedido sin entregar tiene la tarjeta vacía con razón.
+    2. **Le faltan los tres campos de entrega**: es la única señal de que la
+       tarjeta no se leyó. Usar uno solo confunde eso con un campo que el
+       origen dejó de traer — se probó y se midió (ver el comentario de
+       `_CAMPOS_ENTREGA`).
+    3. **Cerrado**: los abiertos ya los cubre el carril de activos.
+    4. **Dentro de la ventana**: ni tan nuevo que no se haya entregado, ni tan
+       viejo que el origen ya lo haya escondido.
+
+    Args:
+        db_path: Ruta a la base de datos SQLite.
+        dias_min: Antigüedad mínima en días.
+        dias_max: Antigüedad máxima en días.
+
+    Returns:
+        Lista de id_pedido a re-extraer en modo completo.
+    """
+    _cerr_ph = ",".join("?" * len(ESTADOS_CERRADOS))
+    falta = " AND ".join(f"(p.{c} IS NULL OR TRIM(p.{c}) IN ('', '-'))" for c in _CAMPOS_ENTREGA)
+    async with aiosqlite.connect(db_path) as db:
+        rows = await (
+            await db.execute(
+                f"""
+                SELECT DISTINCT p.id_pedido
+                  FROM pedidos p
+                 WHERE p.fecha <= DATE('now', '-' || ? || ' days')
+                   AND p.fecha >= DATE('now', '-' || ? || ' days')
+                   AND ({falta})
+                   AND EXISTS (SELECT 1 FROM timeline_pedido t
+                                WHERE t.id_pedido = p.id_pedido
+                                  AND t.titulo = 'Recibido y recibido')
+                   AND NOT EXISTS (SELECT 1 FROM subpedidos s
+                                    WHERE s.id_pedido = p.id_pedido
+                                      AND LOWER(s.estado) NOT IN ({_cerr_ph}))
+              ORDER BY p.fecha
+            """,  # noqa: S608
+                (dias_min, dias_max, *tuple(ESTADOS_CERRADOS)),
+            )
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+async def marcar_para_recuperacion(db_path: str, ids: list[str]) -> None:
+    """Pone `scraping_completo = 0` para que determinar_modo() mande a completo.
+
+    Es el mismo mecanismo que usó el backfill de DEC-027; no se inventa una
+    vía nueva para forzar el modo.
+    """
+    if not ids:
+        return
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("PRAGMA foreign_keys = ON")
+        await db.executemany(
+            "UPDATE pedidos SET scraping_completo = 0 WHERE id_pedido = ?",
+            [(i,) for i in ids],
+        )
+        await db.commit()
+
+
 def calcular_desde_nuevos(
     ultima_ok: str | None,
     *,
@@ -321,6 +422,28 @@ async def main(args: argparse.Namespace) -> int:
                 ),
             )
 
+        elif args.modo == "mantenimiento":
+            # DEC-092: no recorre el listado. Los IDs salen de la base —los
+            # pedidos entregados a los que les falta la información de
+            # entrega— y se marcan para que determinar_modo() los mande a
+            # `completo`. Recuperar febrero a mano costó encolar 808 pedidos
+            # para arreglar 248; esto encola exactamente los que hacen falta.
+            ids_pendientes = await obtener_ids_para_recuperar(db_path)
+            await marcar_para_recuperacion(db_path, ids_pendientes)
+            carriles = None
+            # La pasada no escanea el listado del servidor, así que NO tiene
+            # nada que decir sobre la cobertura de pedidos nuevos: mover el
+            # watermark acá lo adelantaría sin haber mirado una sola página.
+            fecha_cobertura = None
+            log_event(
+                "mantenimiento_seleccionados",
+                msg=(
+                    f"Pedidos entregados sin información de entrega: "
+                    f"{len(ids_pendientes)} | ventana: "
+                    f"{MANTENIMIENTO_DIAS_MIN}-{MANTENIMIENTO_DIAS_MAX} días"
+                ),
+            )
+
         else:
             # Modo completo — recorre todas las páginas del rango dado
             ctx_0 = await browser.new_context(viewport=_VIEWPORTS[0], locale="es-CO")
@@ -363,11 +486,16 @@ async def main(args: argparse.Namespace) -> int:
             )
             # AUD-M4: el escaneo del servidor terminó OK aunque no haya
             # pendientes — la cobertura de pedidos nuevos avanza igual.
-            marca = await actualizar_watermark(db_path, fecha_cobertura)
-            log_event(
-                "watermark_actualizado",
-                msg=f"meta.ultima_corrida_ok = {marca} | cobertura del run: {fecha_cobertura}",
-            )
+            # DEC-092: salvo en mantenimiento, que no mira el listado y por
+            # lo tanto no tiene nada que decir sobre pedidos nuevos.
+            if fecha_cobertura is not None:
+                marca = await actualizar_watermark(db_path, fecha_cobertura)
+                log_event(
+                    "watermark_actualizado",
+                    msg=(
+                        f"meta.ultima_corrida_ok = {marca} | cobertura del run: {fecha_cobertura}"
+                    ),
+                )
             print("\n>>>RESUMEN<<<")
             print(json.dumps(resumen, indent=4, ensure_ascii=False))
             return 0  # AUD-B7: sin pendientes es un run OK
@@ -576,7 +704,10 @@ async def main(args: argparse.Namespace) -> int:
     # AUD-M4 (DEC-012): solo una corrida OK (tasa ≥ 95%, el mismo umbral del
     # exit code 0) avanza el watermark; un run fallido deja la marca atrás y
     # el hueco se re-escanea en la próxima corrida incremental.
-    if resumen["tasa_exito_pct"] >= 95.0:
+    # DEC-092: mantenimiento deja fecha_cobertura en None — no escaneó el
+    # listado, así que avanzar la marca haría creer al incremental que ya
+    # miró pedidos nuevos que nunca vio.
+    if resumen["tasa_exito_pct"] >= 95.0 and fecha_cobertura is not None:
         marca = await actualizar_watermark(db_path, fecha_cobertura)
         log_event(
             "watermark_actualizado",
@@ -651,8 +782,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--modo",
-        choices=["completo", "incremental"],
+        choices=["completo", "incremental", "mantenimiento"],
         default="completo",
-        help="completo: encola todos los IDs | incremental: omite scraping_completo=1",
+        help=(
+            "completo: encola todos los IDs | incremental: omite "
+            "scraping_completo=1 | mantenimiento: re-extrae los pedidos "
+            "entregados a los que les falta la información de entrega, antes "
+            "de que el origen deje de mostrarla (DEC-092)"
+        ),
     )
     return parser

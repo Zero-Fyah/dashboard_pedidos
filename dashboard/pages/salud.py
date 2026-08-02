@@ -21,7 +21,19 @@ import sqlite3
 import plotly.graph_objects as go
 import streamlit as st
 
-from db import get_inventario_corrida, get_inventario_salud
+from comun import (
+    COBERTURA_ALTA_D,
+    COBERTURA_RIESGO_D,
+    VIGENCIA_ACTIVO,
+    VIGENCIA_DESCONTINUADO,
+)
+from comun.reposicion import (
+    ESTADO_OK,
+    ESTADO_PEDIR_PRONTO,
+    ESTADO_PEDIR_YA,
+    calcular_reposicion,
+)
+from db import get_inventario_abc, get_inventario_corrida, get_inventario_salud
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
 
 st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_html=True)
@@ -30,6 +42,8 @@ st.title("🩺 Salud de inventario")
 try:
     df = get_inventario_salud()
     corrida = get_inventario_corrida()
+    # DEC-071: aporta la clase y el `cv` de la demanda para el punto de reorden.
+    abc = get_inventario_abc()
 except sqlite3.OperationalError as e:
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()
@@ -46,6 +60,20 @@ if corrida and corrida.get("datos_desactualizados"):
         f"⚠️ La fuente más antigua tiene {corrida['fuente_mas_vieja_h']:.1f} horas. "
         "Probablemente falló una descarga: las cifras de abajo pueden estar desfasadas."
     )
+
+# DEC-065: la salud se lee sobre el catálogo vigente. El descontinuado se
+# reporta aparte, al final: no es un problema de abastecimiento y mezclarlo
+# hacía que la categoría más grande de la página fuera 96% catálogo apagado.
+descontinuado = df[df["vigencia"] == VIGENCIA_DESCONTINUADO]
+df = df[df["vigencia"] == VIGENCIA_ACTIVO]
+
+if df.empty:
+    st.warning(
+        f"Las {len(descontinuado):,} referencias del alcance están marcadas como "
+        "descontinuadas en el sistema administrativo: no hay catálogo vigente que "
+        "evaluar. Revisar la columna «Producto activo o inactivo» en el origen."
+    )
+    st.stop()
 
 con_stock = df[df["disponible"] > 0]
 quiebre = df[df["estado"] == "Quiebre"]
@@ -64,7 +92,11 @@ k2.metric(
     f"{len(riesgo):,}",
     help="Menos de 15 días de cobertura al ritmo de venta de los últimos 90 días.",
 )
-k3.metric("Con stock", f"{len(con_stock):,}", help=f"De {len(df):,} referencias del catálogo.")
+k3.metric(
+    "Con stock",
+    f"{len(con_stock):,}",
+    help=f"De {len(df):,} referencias vigentes del catálogo.",
+)
 k4.metric(
     "Detenidas +180 días",
     f"{len(detenido):,}",
@@ -82,7 +114,7 @@ if len(quiebre):
 st.divider()
 
 # ── Composición ────────────────────────────────────────────────────────────────
-st.subheader("Cómo se reparte el catálogo")
+st.subheader("Cómo se reparte el catálogo vigente")
 
 orden = [
     "Quiebre",
@@ -100,7 +132,9 @@ with c1:
         st.markdown(f"**{conteo[estado]:,}** · {estado}")
     st.caption(
         "«Sin stock ni demanda» es catálogo por depurar, no un problema de "
-        "abastecimiento: son referencias en cero que además nadie pidió."
+        "abastecimiento: son referencias vigentes en cero que además nadie "
+        "pidió. El producto ya descontinuado no entra acá — va en el bloque "
+        "del final."
     )
 
 with c2:
@@ -252,9 +286,185 @@ else:
         mime="text/csv",
     )
 
+# Los umbrales se interpolan desde `comun/`, no se escriben en la prosa: un
+# número fijo acá quedaría contradiciendo la clasificación el día que cambie
+# (ya pasó en la página de Operación). La ventana de 90 días sí va literal —
+# está horneada en los nombres de columna (`demanda_90d`), no es un knob.
 st.caption(
     "La cobertura se calcula con la demanda de los últimos 90 días, excluyendo "
-    "subpedidos cancelados. Umbrales por defecto: riesgo bajo 15 días, cobertura "
-    "alta sobre 90. Alcance: catálogo sin arenas y almacén Bogotá, el mismo del "
-    "cruce de inventario."
+    f"subpedidos cancelados. Umbrales de inventario (DEC-066): riesgo bajo "
+    f"{COBERTURA_RIESGO_D} días, cobertura alta sobre {COBERTURA_ALTA_D}. "
+    "Alcance: catálogo sin arenas y almacén Bogotá, el mismo del cruce de "
+    "inventario. Solo referencias vigentes (DEC-065)."
 )
+
+# ── Reposición ─────────────────────────────────────────────────────────────────
+st.divider()
+st.subheader("Cuándo pedir y cuánto")
+
+st.markdown(
+    "Lo de arriba dice **qué falta**. Esto dice **cuándo pedir**, que es lo que "
+    "permite reponer antes del quiebre en vez de reaccionar después."
+)
+
+# El plazo de reposición NO está en los datos: no hay tabla de compras ni de
+# proveedores (C.1/C.2 del plan siguen bloqueados). Se pide explícito en vez
+# de esconder un default: un punto de reorden con un plazo inventado es peor
+# que no tenerlo, porque parece un dato.
+p1, p2 = st.columns(2)
+lead_time = p1.number_input(
+    "Plazo de reposición (días)",
+    min_value=1,
+    max_value=365,
+    value=60,
+    step=5,
+    help="Desde que se emite la orden hasta que la mercancía está disponible "
+    "en bodega. **No sale de los datos** — el sistema administrativo no expone "
+    "compras. Poné el plazo real de tu proveedor principal.",
+)
+objetivo = p2.number_input(
+    "Cobertura objetivo (días)",
+    min_value=0,
+    max_value=365,
+    value=30,
+    step=5,
+    help="Cuántos días de venta querés tener encima al recibir el pedido. "
+    "Define la cantidad sugerida, no el punto de reorden.",
+)
+
+repo = calcular_reposicion(
+    df, abc, lead_time_dias=int(lead_time), dias_cobertura_objetivo=int(objetivo)
+)
+
+if repo.empty:
+    st.info("No hay referencias vigentes con demanda en los últimos 90 días.")
+else:
+    ya = repo[repo["estado_reposicion"] == ESTADO_PEDIR_YA]
+    pronto = repo[repo["estado_reposicion"] == ESTADO_PEDIR_PRONTO]
+
+    r1, r2, r3 = st.columns(3)
+    r1.metric(
+        "Pedir ya",
+        f"{len(ya):,}",
+        help="Sin stock y con demanda: ya se está perdiendo venta.",
+    )
+    r2.metric(
+        "Bajo el punto de reorden",
+        f"{len(pronto):,}",
+        help="Todavía hay stock, pero no alcanza para cubrir el plazo de "
+        "reposición. Es la lista que evita el quiebre.",
+    )
+    r3.metric(
+        "Referencias con demanda",
+        f"{len(repo):,}",
+        help="Sobre las que tiene sentido calcular un punto de reorden.",
+    )
+
+    st.caption(
+        f"⚠️ **Todo este bloque depende del plazo de {int(lead_time)} días que "
+        "pusiste arriba.** Es el único número acá que no sale de los datos "
+        "medidos: la demanda diaria y la variabilidad (`cv`) salen del "
+        "histórico real. Cambiá el plazo y mirá cómo se mueve la lista."
+    )
+
+    urgentes = repo[repo["estado_reposicion"] != ESTADO_OK]
+    if len(urgentes):
+        st.dataframe(
+            urgentes[
+                [
+                    "referencia",
+                    "clase",
+                    "demanda_diaria",
+                    "disponible",
+                    "cobertura_dias",
+                    "punto_reorden",
+                    "stock_seguridad",
+                    "sugerido_pedir",
+                    "estado_reposicion",
+                ]
+            ],
+            hide_index=True,
+            height=380,
+            column_config={
+                "referencia": st.column_config.TextColumn("Referencia", width="small"),
+                "clase": st.column_config.TextColumn("Clase", width="small"),
+                "demanda_diaria": st.column_config.NumberColumn("Demanda/día", format="%.1f"),
+                "disponible": st.column_config.NumberColumn("Stock", format="%.0f"),
+                "cobertura_dias": st.column_config.NumberColumn("Días cobertura", format="%.0f"),
+                "punto_reorden": st.column_config.NumberColumn(
+                    "Punto de reorden",
+                    format="%.0f",
+                    help="Cuando el stock baja de acá, hay que emitir la orden.",
+                ),
+                "stock_seguridad": st.column_config.NumberColumn(
+                    "Stock seguridad",
+                    format="%.0f",
+                    help="Colchón por variabilidad de la demanda. Sale del `cv` "
+                    "que ya calcula la clasificación XYZ, no de un supuesto.",
+                ),
+                "sugerido_pedir": st.column_config.NumberColumn("Sugerido pedir", format="%.0f"),
+                "estado_reposicion": st.column_config.TextColumn("Estado", width="medium"),
+            },
+        )
+        st.download_button(
+            "⬇️ Descargar sugerencia de compra (CSV)",
+            urgentes.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"reposicion_lt{int(lead_time)}d.csv",
+            mime="text/csv",
+        )
+    else:
+        st.success("Ninguna referencia está por debajo de su punto de reorden.", icon="✅")
+
+    st.caption(
+        "**Lo que este cálculo no incluye, por falta de dato:** cantidad mínima "
+        "de pedido, múltiplos de empaque, restricciones de contenedor y costo "
+        "de ordenar. Sin eso la cantidad sugerida es un punto de partida para "
+        "negociar con el proveedor, no una orden de compra."
+    )
+
+
+# ── Catálogo descontinuado ─────────────────────────────────────────────────────
+if len(descontinuado):
+    st.divider()
+    st.subheader("Catálogo descontinuado")
+
+    con_fisico = descontinuado[descontinuado["disponible"] > 0]
+    st.markdown(
+        f"**{len(descontinuado):,} referencias** están marcadas como inactivas en el "
+        "sistema administrativo. No entran en los indicadores de arriba: no tener "
+        "stock de algo que ya no se vende no es un quiebre."
+    )
+    d1, d2 = st.columns(2)
+    d1.metric(
+        "Descontinuadas con stock",
+        f"{len(con_fisico):,}",
+        help="Producto que ya no se vende pero sigue ocupando inventario. "
+        "Son las accionables: liquidar, devolver o dar de baja.",
+    )
+    d2.metric(
+        "Unidades involucradas",
+        f"{con_fisico['disponible'].sum():,.0f}",
+        help="Según el inventario del sistema administrativo.",
+    )
+
+    if len(con_fisico):
+        st.dataframe(
+            con_fisico.sort_values("disponible", ascending=False)[
+                ["referencia", "familia", "disponible", "valor_venta", "ultima_salida"]
+            ],
+            hide_index=True,
+            column_config={
+                "referencia": st.column_config.TextColumn("Referencia", width="medium"),
+                "familia": st.column_config.TextColumn("Familia", width="small"),
+                "disponible": st.column_config.NumberColumn("Disponible", format="%.0f"),
+                "valor_venta": st.column_config.NumberColumn("Valor (precio venta)", format="%.0f"),
+                "ultima_salida": st.column_config.TextColumn("Última salida", width="small"),
+            },
+        )
+
+    st.caption(
+        "La vigencia viene de la columna «Producto activo o inactivo» del catálogo "
+        "del admin. Qué significa cada uno de sus dos valores se estableció "
+        "midiendo su correlación con inventario y demanda, no leyendo la etiqueta "
+        "— ver DEC-065."
+    )

@@ -6,6 +6,7 @@ import aiosqlite
 import pytest
 
 from etl.etl_principal import (
+    _VIEWS_RETIRADAS,
     crear_views,
     normalizar_montos,
     separar_concepto_tasa,
@@ -16,6 +17,12 @@ from etl.etl_principal import (
 def _eventos_etl(caplog):
     """Parsea los registros JSONL del logger 'etl' capturados por caplog."""
     return [json.loads(r.getMessage()) for r in caplog.records if r.name == "etl"]
+
+
+# View sobre la que se prueba la atomicidad de DEC-019: tiene que ser una
+# que exista y se recree, no una de `_VIEWS_RETIRADAS` (esas se dropean
+# primero y no existen, así que la sonda pasaría sin probar nada).
+_SONDA = "v_inventario_comprometido"
 
 
 @pytest.mark.integration
@@ -99,14 +106,9 @@ async def test_views_creadas(db_path):
         views = {r[0] for r in await cursor.fetchall()}
 
     views_esperadas = {
-        # 8 VIEWs analíticas
-        "v_pedidos_activos",
-        "v_pedidos_cerrados",
+        # 3 VIEWs analíticas (eran 8 hasta DEC-065)
         "v_inventario_comprometido",
         "v_diferencias_resumen",
-        "v_rendimiento_operadores",
-        "v_variaciones_timeline",
-        "v_variaciones_operaciones",
         "v_descuentos_lineas",
         # 4 VIEWs para el dashboard (montos _num con nombres limpios)
         "v_lineas_pedido_num",
@@ -118,10 +120,37 @@ async def test_views_creadas(db_path):
 
 
 @pytest.mark.integration
-async def test_views_son_idempotentes(db_path):
-    """Ejecutar crear_views dos veces produce exactamente 12 VIEWs.
+async def test_views_retiradas_se_dropean(db_path):
+    """DEC-065: quitar una entrada del dict no basta — `crear_views()` solo
+    dropea lo que está a punto de recrear, así que una view retirada
+    seguiría viva en las bases existentes si nadie la dropea explícitamente.
 
-    12 = 8 analíticas + 4 del dashboard.
+    Se simula una base legada creando las 5 a mano antes de correr el ETL.
+    """
+    async with aiosqlite.connect(db_path) as db:
+        for nombre in _VIEWS_RETIRADAS:
+            await db.execute(f"CREATE VIEW {nombre} AS SELECT 1 AS x")
+        await db.commit()
+
+        cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='view'")
+        antes = {r[0] for r in await cursor.fetchall()}
+        assert set(_VIEWS_RETIRADAS) <= antes, "el fixture no simuló la base legada"
+
+        await normalizar_montos(db)
+        await crear_views(db)
+
+        cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='view'")
+        despues = {r[0] for r in await cursor.fetchall()}
+
+    sobrevivientes = set(_VIEWS_RETIRADAS) & despues
+    assert not sobrevivientes, f"views retiradas que quedaron vivas: {sobrevivientes}"
+
+
+@pytest.mark.integration
+async def test_views_son_idempotentes(db_path):
+    """Ejecutar crear_views dos veces produce exactamente 7 VIEWs.
+
+    7 = 3 analíticas + 4 del dashboard (eran 12 hasta DEC-065).
     """
     async with aiosqlite.connect(db_path) as db:
         await normalizar_montos(db)  # ← obligatorio primero
@@ -132,7 +161,7 @@ async def test_views_son_idempotentes(db_path):
                 await db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='view'")
             ).fetchone()
         )[0]
-    assert count == 12
+    assert count == 7
 
 
 # ── FIX C-4 (auditoría 2026-07-01) — COALESCE en cantidad_pendiente ────────────
@@ -198,9 +227,14 @@ async def test_inventario_pendiente_incluye_entregada_null(db_path):
 
 @pytest.mark.integration
 async def test_pedido_sin_subpedidos_invisible_pero_reportado(db_path, caplog):
-    """DEC-021: un pedido completo sin subpedidos no entra a ninguna view
-    de pedidos (INNER JOIN deliberado), y el check defensivo lo hace
-    visible con etl_pedido_sin_subpedidos (WARNING, total + muestra_ids).
+    """DEC-021: un pedido completo sin subpedidos es invisible para
+    cualquier agregación por subpedido (el INNER JOIN lo descarta), y el
+    check defensivo lo hace visible con etl_pedido_sin_subpedidos
+    (WARNING, total + muestra_ids).
+
+    DEC-065: la invisibilidad se comprueba contra el mismo INNER JOIN que
+    usaban v_pedidos_activos/cerrados, ya retiradas. Lo que el check
+    protege no cambió — el pedido sigue sin aparecer.
     """
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
@@ -216,17 +250,18 @@ async def test_pedido_sin_subpedidos_invisible_pero_reportado(db_path, caplog):
         await normalizar_montos(db)
         await crear_views(db)
 
-        async with db.execute("SELECT id_pedido FROM v_pedidos_activos") as cur:
-            activos = {r[0] for r in await cur.fetchall()}
-        async with db.execute("SELECT id_pedido FROM v_pedidos_cerrados") as cur:
-            cerrados = {r[0] for r in await cur.fetchall()}
+        async with db.execute(
+            "SELECT p.id_pedido FROM pedidos p "
+            "JOIN subpedidos s ON p.id_pedido = s.id_pedido "
+            "WHERE p.scraping_completo = 1 GROUP BY p.id_pedido"
+        ) as cur:
+            visibles = {r[0] for r in await cur.fetchall()}
 
         with caplog.at_level(logging.INFO, logger="etl"):
             n = await verificar_pedidos_sin_subpedidos(db)
 
-    assert "TEST-SIN-SUBS" not in activos
-    assert "TEST-SIN-SUBS" not in cerrados
-    assert "TEST-NORMAL" in activos  # el normal sí es visible
+    assert "TEST-SIN-SUBS" not in visibles
+    assert "TEST-NORMAL" in visibles  # el normal sí es visible
 
     assert n == 1
     evento = next(e for e in _eventos_etl(caplog) if e["event"] == "etl_pedido_sin_subpedidos")
@@ -404,16 +439,20 @@ async def test_normalizar_montos_columna_fuente_inexistente_propaga(tmp_path):
 async def test_lector_concurrente_no_ve_ventana_sin_views(db_path):
     """DEC-019 (E-2): la recreación de views es atómica para lectores.
 
-    Pausa crear_views justo después del primer DROP VIEW (hook sobre
-    db.execute — el instante exacto de la ventana de HAL-007) y consulta
-    la view dropeada desde una segunda conexión. Con la transacción
-    explícita, el lector ve el snapshot anterior de WAL y la view sigue
-    existiendo. Sin el fix, el DROP era autocommit y este test falla con
-    "no such view".
+    Pausa crear_views justo después del DROP de una view que **existe** y
+    va a recrearse (hook sobre db.execute — el instante exacto de la
+    ventana de HAL-007) y la consulta desde una segunda conexión. Con la
+    transacción explícita, el lector ve el snapshot anterior de WAL y la
+    view sigue existiendo. Sin el fix, el DROP era autocommit y este test
+    falla con "no such view".
+
+    DEC-065: el hook apunta a `_SONDA` y no "al primer DROP". Los DROP de
+    `_VIEWS_RETIRADAS` corren primero y sobre views que no existen, así
+    que pausar ahí haría pasar el test sin probar nada.
     """
     async with aiosqlite.connect(db_path) as db:
         await normalizar_montos(db)
-        await crear_views(db)  # estado inicial: las 12 views existen
+        await crear_views(db)  # estado inicial: las 7 views existen
 
     async with aiosqlite.connect(db_path) as db:
         await db.execute("PRAGMA busy_timeout=5000")
@@ -424,7 +463,7 @@ async def test_lector_concurrente_no_ve_ventana_sin_views(db_path):
         def execute_pausado(sql, *args, **kwargs):
             async def _run():
                 cursor = await orig_execute(sql, *args, **kwargs)
-                if sql.startswith("DROP VIEW") and not primer_drop_hecho.is_set():
+                if sql.startswith(f"DROP VIEW IF EXISTS {_SONDA}"):
                     primer_drop_hecho.set()
                     await sonda_terminada.wait()
                 return cursor
@@ -437,12 +476,11 @@ async def test_lector_concurrente_no_ve_ventana_sin_views(db_path):
             await asyncio.wait_for(primer_drop_hecho.wait(), timeout=10)
 
             # DROP ejecutado, transacción sin commit: el lector concurrente
-            # debe seguir viendo la view (v_pedidos_activos es la primera
-            # del dict de crear_views, es decir, la primera dropeada).
+            # debe seguir viendo la view.
             async with aiosqlite.connect(db_path) as lector:
                 await lector.execute("PRAGMA busy_timeout=5000")
                 row = await (
-                    await lector.execute("SELECT COUNT(*) FROM v_pedidos_activos")
+                    await lector.execute(f"SELECT COUNT(*) FROM {_SONDA}")  # noqa: S608
                 ).fetchone()
             assert row is not None
         finally:
@@ -450,13 +488,13 @@ async def test_lector_concurrente_no_ve_ventana_sin_views(db_path):
             await asyncio.wait_for(tarea, timeout=30)
             db.execute = orig_execute  # type: ignore[method-assign]
 
-        # Tras el COMMIT, las 12 views recreadas quedan visibles.
+        # Tras el COMMIT, las 7 views recreadas quedan visibles.
         count = (
             await (
                 await db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='view'")
             ).fetchone()
         )[0]
-    assert count == 12
+    assert count == 7
 
 
 # ── E-3 + E-4 / DEC-020 — métricas veraces y fin del retrabajo ─────────────────
@@ -691,3 +729,57 @@ async def test_separar_concepto_tasa_es_idempotente(db_path):
             )
         ).fetchone()
     assert row == ("IVA accesorios", 19.0)
+
+
+# -- DEC-087: clave de paginacion por tabla --------------------------------
+
+
+@pytest.mark.integration
+async def test_normaliza_una_tabla_con_clave_texto(db_path):
+    """`pedidos` usa `id_pedido` TEXT como PK, no el `id` surrogate que la
+    paginacion por keyset asumia. Con mas de 500 filas se ejercita el bucle
+    completo: si el keyset estuviera roto, la segunda pagina no avanzaria y
+    quedarian filas sin convertir (o el bucle no terminaria).
+    """
+    async with aiosqlite.connect(db_path) as db:
+        await db.executemany(
+            "INSERT INTO pedidos (id_pedido, fecha, pago_total, pago_pagado, pago_saldo) "
+            "VALUES (?,?,?,?,?)",
+            [(f"P{n:05d}", "2026-07-20", "COP 1.000", "COP 400", "COP 600") for n in range(1200)],
+        )
+        await db.commit()
+
+        await normalizar_montos(db)
+
+        async with db.execute(
+            "SELECT COUNT(*), SUM(pago_saldo_num) FROM pedidos WHERE pago_saldo_num IS NOT NULL"
+        ) as cur:
+            n, suma = await cur.fetchone()
+
+    assert n == 1200
+    assert suma == 1200 * 600
+
+
+@pytest.mark.integration
+async def test_las_tablas_con_id_surrogate_no_cambiaron(db_path):
+    """El default sigue siendo `id`: el cambio de DEC-087 no debe alterar el
+    comportamiento de las cuatro tablas originales."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("INSERT INTO pedidos (id_pedido, fecha) VALUES ('Q1','2026-07-20')")
+        await db.executemany(
+            "INSERT INTO registros_pago (id_pedido, secuencia, monto_comprobante, monto_pago) "
+            "VALUES (?,?,?,?)",
+            [("Q1", str(n), "COP 5.000", "COP 1.250") for n in range(600)],
+        )
+        await db.commit()
+
+        await normalizar_montos(db)
+
+        async with db.execute(
+            "SELECT COUNT(*), SUM(monto_pago_num) FROM registros_pago "
+            "WHERE monto_pago_num IS NOT NULL"
+        ) as cur:
+            n, suma = await cur.fetchone()
+
+    assert n == 600
+    assert suma == 600 * 1250

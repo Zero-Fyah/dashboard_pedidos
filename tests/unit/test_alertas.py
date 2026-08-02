@@ -3,6 +3,7 @@
 import pandas as pd
 import pytest
 
+from comun import VIGENCIA_ACTIVO, VIGENCIA_DESCONTINUADO
 from inventario.alertas import ALTA, CRITICA, MEDIA, generar_alertas
 
 
@@ -244,3 +245,43 @@ def test_las_claves_son_estables_entre_corridas(salud, abc):
 
     assert list(a["clave"]) == list(b["clave"])
     assert a["clave"].is_unique
+
+
+# ── DEC-067: vigencia y criterio único de clase ──────────────────────────────
+
+
+def _con_vigencia(salud, vigencias):
+    """Agrega la columna `vigencia` mapeando por referencia."""
+    df = salud.copy()
+    df["vigencia"] = df["referencia"].map(vigencias).fillna(VIGENCIA_ACTIVO)
+    return df
+
+
+def test_el_quiebre_de_producto_descontinuado_no_alerta(salud, abc):
+    """DEC-067: nadie repone lo que ya no se vende. Sin este filtro, 2 de las
+    7 alertas críticas apuntaban a producto muerto —una a `PRA AVERIA`."""
+    r = generar_alertas(
+        _con_vigencia(salud, {"PA01": VIGENCIA_DESCONTINUADO}), VACIO, VACIO, VACIO, abc
+    )
+    quiebres = set(r[r["tipo"] == "Quiebre de stock"]["entidad"])
+
+    assert "PA01" not in quiebres  # descontinuado, aunque sea clase A
+    assert "PB02" in quiebres  # vigente, sigue alertando
+
+
+def test_el_inmovilizado_si_mira_el_descontinuado(salud, abc):
+    """Contraste deliberado: producto muerto CON stock parado es exactamente
+    capital inmovilizado. La vigencia importa para abastecimiento, no para
+    capital — son las 81 referencias con 168.894 unidades de DEC-065."""
+    r = generar_alertas(
+        _con_vigencia(salud, {"PD04": VIGENCIA_DESCONTINUADO}), VACIO, VACIO, VACIO, abc
+    )
+
+    assert "PD04" in set(r[r["tipo"] == "Sin movimiento"]["entidad"])
+
+
+def test_sin_columna_vigencia_no_revienta(salud, abc):
+    """La corrida puede traer un frame anterior a DEC-065."""
+    r = generar_alertas(salud, VACIO, VACIO, VACIO, abc)
+
+    assert "PA01" in set(r["entidad"])

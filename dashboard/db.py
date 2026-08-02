@@ -11,12 +11,19 @@ import streamlit as st
 # `comun` cuando Streamlit ejecuta la app con dashboard/ como directorio
 # del script.
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from comun import ESTADOS_ACTIVOS_INVENTARIO, ESTADOS_CERRADOS
+from comun import (
+    ESTADOS_ACTIVOS_INVENTARIO,
+    ESTADOS_CERRADOS,
+    ESTADOS_DESPACHADOS,
+    VIGENCIA_ACTIVO,
+)
 
 DB_PATH = Path(__file__).parent.parent / "data" / "pedidos.db"
 # Lista de estados de cierre lista para interpolar en IN (...) / NOT IN (...).
 # sorted() para SQL determinístico (frozenset no garantiza orden).
 _cerr = ",".join(f"'{e}'" for e in sorted(ESTADOS_CERRADOS))
+# DEC-069: cerrados menos cancelado — un subpedido cancelado no salió corto.
+_despachados = ",".join(f"'{e}'" for e in sorted(ESTADOS_DESPACHADOS))
 
 # DEC-045: el subfiltro "previos a picking" replica la definición de
 # DEC-039 pregunta 5 (corregida por HAL-013), que son DOS condiciones:
@@ -248,12 +255,684 @@ def get_inventario_salud() -> pd.DataFrame:
 
     Lo calcula el scheduler porque agregar la demanda sobre 840.000 líneas
     cuesta ~10 s: acá la consulta es inmediata.
+
+    DEC-065: si falta `vigencia`, se asume todo vigente. La columna llega a
+    las bases existentes por la migración de `inventario.persistencia`, que
+    corre en la próxima corrida del scheduler; entre el deploy y esa corrida
+    la página tiene que abrir igual. El default es `Activo` —no NULL— para
+    que degrade al comportamiento previo a DEC-065 (catálogo completo) en
+    vez de mostrar una página vacía.
     """
     if not _objeto_existe("v_inventario_salud", "view"):
         return pd.DataFrame()
     con = _conn()
     try:
-        return pd.read_sql("SELECT * FROM v_inventario_salud", con)
+        df = pd.read_sql("SELECT * FROM v_inventario_salud", con)
+    finally:
+        con.close()
+    if "vigencia" not in df.columns:
+        df["vigencia"] = VIGENCIA_ACTIVO
+    else:
+        df["vigencia"] = df["vigencia"].fillna(VIGENCIA_ACTIVO)
+    return df
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_despacho_diario() -> pd.DataFrame:
+    """Cumplimiento de despacho por día — la mitad "in full" de E.1 (DEC-065).
+
+    La auditoría del 2026-07-29 dio E.1 por bloqueada "sin fecha
+    comprometida (OTIF)". Cierto para la mitad *on time*; falso para la
+    mitad *in full*, que solo necesita comparar lo pedido con lo
+    entregado — y eso ya está en `detalle_diferencias` desde siempre.
+
+    `hay_diferencia` es el marcador del pedido: el sistema origen factura
+    de menos cuando algo no se despachó completo. Medido sobre la base
+    real: 4.264 de 29.427 pedidos, todos en la misma dirección (nunca se
+    facturó de más).
+
+    Returns:
+        Una fila por fecha con pedidos, pedidos con faltante y el monto
+        que no se despachó. Vacío si el ETL todavía no creó la VIEW.
+    """
+    if not _objeto_existe("v_diferencias_resumen", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        # DEC-067: el monto entra por un LEFT JOIN contra una subconsulta ya
+        # agregada. La versión anterior usaba una subconsulta **correlacionada**
+        # —se ejecutaba una vez por cada fecha del GROUP BY— y tardaba 29,6 s
+        # para devolver 211 filas. Así son 0,4 s: 74× más rápido, resultado
+        # idéntico (verificado con DataFrame.equals, no a ojo).
+        return pd.read_sql(
+            """SELECT p.fecha,
+                      COUNT(*) AS pedidos,
+                      SUM(CASE WHEN p.hay_diferencia = 1 THEN 1 ELSE 0 END)
+                          AS pedidos_con_faltante,
+                      COALESCE(MAX(d.monto), 0) AS monto_no_despachado
+                 FROM pedidos p
+                 LEFT JOIN (
+                      SELECT fecha, SUM(monto_diferencia_num) AS monto
+                        FROM v_diferencias_resumen
+                    GROUP BY fecha
+                 ) d ON d.fecha = p.fecha
+                WHERE p.scraping_completo = 1
+                  AND p.fecha IS NOT NULL AND p.fecha != ''
+             GROUP BY p.fecha
+             ORDER BY p.fecha""",
+            con,
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_despacho_faltantes(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+    """Detalle línea a línea de lo que no se despachó (DEC-069).
+
+    **Sale de `lineas_pedido`, no de `detalle_diferencias`.** La versión de
+    DEC-065 usaba esta última, que no tiene `referencia` ni `codigo_barras`:
+    dejaba decir *cuánto* faltó pero no *qué SKU, de qué clase, desde qué
+    posición* — justo lo único que convierte el dato en una acción de bodega.
+    `lineas_pedido` los tiene en el 100% de las líneas con faltante (medido:
+    4.782 de 4.782) y da cifras equivalentes.
+
+    Se cuentan solo los subpedidos **despachados**: un cancelado no salió
+    corto, no salió. En un subpedido todavía abierto, `entregada < comprada`
+    es lo normal, no un faltante.
+
+    Se acota por rango en SQL, no en pandas: traer los 7 meses cuesta 2,0 s
+    contra 0,6 s del mes que la página muestra por defecto (DEC-069).
+
+    Args:
+        fecha_desde: Fecha inicial inclusive (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive (YYYY-MM-DD).
+
+    Returns:
+        Una fila por línea con faltante, con fecha, referencia y código de
+        barras para cruzar contra el catálogo, el ABC y las ubicaciones.
+        Vacío si el scraper todavía no creó las tablas.
+    """
+    if not _objeto_existe("lineas_pedido"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            f"""SELECT p.fecha,
+                       l.id_pedido,
+                       l.numero_subpedido,
+                       l.referencia,
+                       l.codigo_barras,
+                       l.nombre_producto,
+                       l.almacen,
+                       l.cantidad_comprada,
+                       COALESCE(l.cantidad_entregada, 0) AS cantidad_entregada,
+                       l.cantidad_comprada - COALESCE(l.cantidad_entregada, 0) AS faltante
+                  FROM lineas_pedido l
+                  JOIN subpedidos s ON s.id_pedido = l.id_pedido
+                                   AND s.numero_subpedido = l.numero_subpedido
+                  JOIN pedidos p    ON p.id_pedido = l.id_pedido
+                 WHERE LOWER(s.estado) IN ({_despachados})
+                   AND l.cantidad_entregada < l.cantidad_comprada
+                   AND p.fecha BETWEEN ? AND ?""",  # noqa: S608
+            con,
+            params=(fecha_desde, fecha_hasta),
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_despacho_lineas_diario(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+    """Fill rate por línea y por unidad, por fecha (DEC-069).
+
+    El indicador por pedido es el más exigente —una sola línea corta arruina
+    el pedido entero— y por eso da 85,5% mientras el de línea da 99,27%. Los
+    dos son correctos y estándar; publicar solo el primero hace ver un
+    problema sistémico donde hay uno concentrado.
+
+    Args:
+        fecha_desde: Fecha inicial inclusive (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive (YYYY-MM-DD).
+
+    Returns:
+        Una fila por fecha con líneas despachadas, líneas con faltante,
+        unidades pedidas y unidades faltantes. Vacío si el scraper todavía
+        no creó las tablas.
+    """
+    if not _objeto_existe("lineas_pedido"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            f"""SELECT p.fecha,
+                       COUNT(*) AS lineas,
+                       SUM(CASE WHEN l.cantidad_entregada < l.cantidad_comprada
+                                THEN 1 ELSE 0 END) AS lineas_con_faltante,
+                       SUM(l.cantidad_comprada) AS unidades_pedidas,
+                       SUM(l.cantidad_comprada - COALESCE(l.cantidad_entregada, 0))
+                           AS unidades_faltantes
+                  FROM lineas_pedido l
+                  JOIN subpedidos s ON s.id_pedido = l.id_pedido
+                                   AND s.numero_subpedido = l.numero_subpedido
+                  JOIN pedidos p    ON p.id_pedido = l.id_pedido
+                 WHERE LOWER(s.estado) IN ({_despachados})
+                   AND p.fecha BETWEEN ? AND ?
+              GROUP BY p.fecha
+              ORDER BY p.fecha""",  # noqa: S608
+            con,
+            params=(fecha_desde, fecha_hasta),
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_auditoria_pago(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+    """Ciclo comprobante → auditoría, por pedido (DEC-082).
+
+    Sale **de datos que ya estaban**: `registro_operaciones` registra
+    `Subir comprobante de pago` y `Auditoría de pago` con usuario y hora
+    desde el 2026-01-23. Nadie los había cruzado.
+
+    El `LEFT JOIN` es deliberado: un comprobante subido y **nunca auditado**
+    es el caso que más importa —es una cola de trabajo invisible— y un
+    `INNER JOIN` lo borraría justo a él.
+
+    Se toma el primer comprobante y la primera auditoría posterior: un
+    pedido puede tener varios comprobantes (el DOM muestra "1 envíos · 2
+    comprobantes") y lo que se mide es cuánto tardó en revisarse, no cuántas
+    veces se subió.
+
+    **Veredicto (DEC-083).** `registro_operaciones.referencia` trae `Aprobado`
+    o `Rechazado` en las filas de auditoría. Solo está poblada **desde el
+    2026-04-10**: antes de esa fecha `con_veredicto` vale 0 y la tasa de
+    rechazo no es medible. La página lo dice en vez de rellenar con ceros,
+    que darían un rechazo artificialmente bajo en el primer trimestre.
+
+    Las subidas se pre-agregan en una CTE **antes** de unirlas con las
+    auditorías. Sin eso, un pedido con 2 comprobantes y 2 auditorías produce
+    4 filas y los `SUM()` cuentan doble; el `MIN()` original era inmune al
+    problema, los contadores nuevos no lo son.
+
+    Args:
+        fecha_desde: Fecha inicial inclusive del pedido (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive.
+
+    Returns:
+        Una fila por pedido con comprobante: cuándo se subió, quién y cuándo
+        auditó, las horas entre ambos (NaN si sigue sin auditar) y el conteo
+        de auditorías, rechazos y aprobaciones.
+    """
+    if not _objeto_existe("registro_operaciones"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """WITH subidas AS (
+                   SELECT id_pedido,
+                          MIN(momento) AS subido_en,
+                          MIN(usuario) AS subido_por,
+                          COUNT(*)     AS comprobantes
+                     FROM registro_operaciones
+                    WHERE accion = 'Subir comprobante de pago'
+                 GROUP BY id_pedido
+               )
+               SELECT p.id_pedido,
+                      p.fecha,
+                      p.forma_pago,
+                      s.subido_en,
+                      s.subido_por,
+                      s.comprobantes,
+                      MIN(a.momento)  AS auditado_en,
+                      MIN(a.usuario)  AS auditado_por,
+                      COUNT(a.momento) AS auditorias,
+                      SUM(CASE WHEN a.referencia = 'Rechazado' THEN 1 ELSE 0 END)
+                          AS rechazos,
+                      SUM(CASE WHEN a.referencia = 'Aprobado'  THEN 1 ELSE 0 END)
+                          AS aprobaciones,
+                      SUM(CASE WHEN a.referencia IN ('Aprobado', 'Rechazado')
+                               THEN 1 ELSE 0 END) AS con_veredicto
+                 FROM subidas s
+                 JOIN pedidos p ON p.id_pedido = s.id_pedido
+                 LEFT JOIN registro_operaciones a
+                        ON a.id_pedido = s.id_pedido
+                       AND a.accion    = 'Auditoría de pago'
+                       AND a.momento  >= s.subido_en
+                WHERE p.fecha BETWEEN ? AND ?
+             GROUP BY p.id_pedido, p.fecha, p.forma_pago,
+                      s.subido_en, s.subido_por, s.comprobantes""",
+            con,
+            params=(fecha_desde, fecha_hasta),
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_motivos_cancelacion(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+    """Pedidos cancelados con su motivo escrito a mano (DEC-085).
+
+    No confundir con `get_cancelaciones()`, que es de DEC-063 y mira otra
+    cosa: los subpedidos **alistados** que después se cancelaron, desde el
+    ángulo del inventario. Esta mira el **porqué** de la cancelación, sobre
+    todos los pedidos y no solo los alistados.
+
+    El motivo vive en `registro_operaciones.referencia` de las filas de
+    `Cancelar pedido` y nunca se había leído. La clasificación no se hace
+    acá sino en `comun.motivos`, que es una función pura y testeable; esta
+    capa solo trae el texto crudo y el contexto del pedido.
+
+    **Un pedido puede tener varios eventos de cancelación** (5.784 eventos
+    sobre 4.947 pedidos). Se toma el primero: es el que explica por qué murió,
+    los siguientes son reintentos administrativos.
+
+    Args:
+        fecha_desde: Fecha inicial inclusive del pedido (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive.
+
+    Returns:
+        Una fila por pedido cancelado, con el motivo crudo, el valor del
+        pedido y los días que pasaron entre el pedido y su cancelación.
+    """
+    if not _objeto_existe("registro_operaciones"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """WITH primera AS (
+                   SELECT id_pedido, MIN(momento) AS momento
+                     FROM registro_operaciones
+                    WHERE accion = 'Cancelar pedido'
+                 GROUP BY id_pedido
+               )
+               SELECT p.id_pedido,
+                      p.fecha,
+                      p.forma_pago,
+                      p.nombre_empresa,
+                      r.momento                       AS cancelado_en,
+                      r.usuario                       AS cancelado_por,
+                      r.referencia                    AS motivo,
+                      JULIANDAY(r.momento) - JULIANDAY(p.fecha) AS dias,
+                      (SELECT MAX(em.monto_final_num)
+                         FROM estadisticas_monto em
+                        WHERE em.id_pedido = p.id_pedido
+                          AND em.concepto_base =
+                              'Total a pagar / Total final a pagar') AS valor
+                 FROM primera pr
+                 JOIN registro_operaciones r
+                       ON r.id_pedido = pr.id_pedido
+                      AND r.momento   = pr.momento
+                      AND r.accion    = 'Cancelar pedido'
+                 JOIN pedidos p ON p.id_pedido = pr.id_pedido
+                WHERE p.fecha BETWEEN ? AND ?""",
+            con,
+            params=(fecha_desde, fecha_hasta),
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_pedidos_impagos() -> pd.DataFrame:
+    """Pedidos vivos de pago inmediato con saldo pendiente (DEC-085).
+
+    Es la mitad accionable del análisis de cancelaciones. Medido: el 94% de
+    las cancelaciones por falta de pago ocurre entre el día 3 y el 7, con
+    mediana en 5 y sin variar mes a mes. Con esa regularidad, un pedido vivo,
+    impago y de 5 días **es predecible**, y la mercancía que retiene está por
+    liberarse.
+
+    Solo `Pago inmediato`: el crédito no debe nada hasta su vencimiento y
+    contra entrega se cobra fuera de este campo (el 8,4% de cobertura medido
+    en DEC-084 lo confirma). Meterlos daría una lista de falsos positivos.
+
+    **El saldo sale del origen cuando existe (DEC-089).** La tarjeta
+    «Operación de pago» trae `pago_saldo` calculado por el sistema; solo
+    existe desde el 2026-07-16, así que fuera de ese rango se cae a la
+    derivación `total − pagado`. Medido sobre los 833 pedidos vivos con
+    tarjeta: la derivación marca 230 impagos y el origen 224 — los 6 que
+    sobran son pedidos que el origen da por **`Pagado`**, y no hay ninguno
+    en la dirección contraria. La columna `fuente` dice cuál se usó, porque
+    una cifra derivada y una del origen no son la misma clase de dato.
+
+    Returns:
+        Una fila por pedido vivo impago, con antigüedad en días, la mercancía
+        comprometida (líneas, unidades, referencias) y el origen del saldo.
+    """
+    if not _num_cols_exist():
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """WITH montos AS (
+                   SELECT id_pedido,
+                          MAX(CASE WHEN concepto_base =
+                                'Total a pagar / Total final a pagar'
+                              THEN monto_final_num END) AS total,
+                          MAX(CASE WHEN concepto_base = 'Monto pagado'
+                              THEN monto_pagar_num  END) AS pagado
+                     FROM estadisticas_monto
+                 GROUP BY id_pedido
+               ),
+               vivos AS (
+                   SELECT id_pedido
+                     FROM subpedidos
+                 GROUP BY id_pedido
+                   HAVING SUM(CASE WHEN LOWER(estado) NOT IN
+                            ('completado', 'cancelado', 'comentado')
+                          THEN 1 ELSE 0 END) > 0
+               ),
+               base AS (
+                   SELECT p.id_pedido,
+                          p.fecha,
+                          p.nombre_empresa,
+                          p.nit,
+                          p.pago_estado,
+                          COALESCE(p.pago_total_num, m.total) AS total,
+                          COALESCE(p.pago_pagado_num, m.pagado) AS pagado,
+                          -- DEC-089: el saldo del origen manda; la
+                          -- derivación solo cubre lo anterior al 2026-07-16.
+                          COALESCE(p.pago_saldo_num,
+                                   m.total - COALESCE(m.pagado, 0)) AS saldo,
+                          CASE WHEN p.pago_saldo_num IS NOT NULL
+                               THEN 'origen' ELSE 'derivado' END AS fuente
+                     FROM pedidos p
+                     JOIN vivos  v ON v.id_pedido = p.id_pedido
+                     JOIN montos m ON m.id_pedido = p.id_pedido
+                    WHERE p.scraping_completo = 1
+                      AND p.forma_pago = 'Pago inmediato'
+                      AND COALESCE(p.pago_total_num, m.total) IS NOT NULL
+                      AND COALESCE(p.pago_saldo_num,
+                                   m.total - COALESCE(m.pagado, 0)) > 1
+               )
+               SELECT b.id_pedido,
+                      b.fecha,
+                      b.nombre_empresa,
+                      b.nit,
+                      b.pago_estado,
+                      b.fuente,
+                      b.total,
+                      b.pagado,
+                      b.saldo,
+                      COUNT(l.id)                          AS lineas,
+                      COALESCE(SUM(CAST(l.cantidad_comprada AS REAL)), 0)
+                                                           AS unidades,
+                      COUNT(DISTINCT l.referencia)         AS referencias,
+                      CAST(JULIANDAY('now', '-5 hours') - JULIANDAY(b.fecha)
+                           AS INTEGER)                     AS dias
+                 FROM base b
+                 LEFT JOIN lineas_pedido l ON l.id_pedido = b.id_pedido
+             GROUP BY b.id_pedido, b.fecha, b.nombre_empresa, b.nit,
+                      b.pago_estado, b.fuente, b.total, b.pagado, b.saldo""",
+            con,
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_estado_pago(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+    """Estado y saldo de pago **calculados por el origen** (DEC-089).
+
+    Sale de la tarjeta «Operación de pago», que el scraper captura desde
+    DEC-087. Es la respuesta del propio sistema a "cuánto falta cobrar", sin
+    derivación: sobre los mismos pedidos, el `Total` coincide al 100% con
+    `estadisticas_monto` pero el `Monto pagado` solo al 92,1%, y donde
+    difieren la tarjeta no produce **ningún** ratio pagado/total mayor a 2
+    contra los 4 —de hasta 39,8×— del campo viejo.
+
+    **No sirve para el saldo a favor:** `pago_saldo` nunca es negativo, mide
+    lo que falta por cobrar topado en cero. De los 172 pedidos con
+    `pagado > total`, los 172 tienen saldo 0. Esa pregunta la sigue
+    respondiendo `get_saldo_a_favor()` sobre `gestion_diferencias`.
+
+    **Cobertura:** solo pedidos desde el 2026-07-16; DEC-087 verificó que el
+    origen no renderiza la tarjeta para los anteriores (0 de 24 en una prueba
+    sobre enero). La página tiene que decir el rango, no dar a entender que
+    cubre todo.
+
+    Args:
+        fecha_desde: Fecha inicial inclusive del pedido (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive.
+
+    Returns:
+        Una fila por pedido con tarjeta, con estado, montos y el número de
+        comprobantes registrados.
+    """
+    if not _num_cols_exist():
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """SELECT p.id_pedido,
+                      p.fecha,
+                      p.forma_pago,
+                      p.nombre_empresa,
+                      p.pago_estado,
+                      p.pago_total_num  AS total,
+                      p.pago_pagado_num AS pagado,
+                      p.pago_saldo_num  AS saldo,
+                      p.pago_progreso,
+                      COALESCE(r.comprobantes, 0) AS comprobantes,
+                      COALESCE(r.rechazados, 0)   AS rechazados,
+                      COALESCE(r.sin_revisar, 0)  AS sin_revisar,
+                      r.metodos
+                 FROM pedidos p
+                 LEFT JOIN (
+                     SELECT id_pedido,
+                            COUNT(*) AS comprobantes,
+                            SUM(CASE WHEN estado_revision = 'Rechazado'
+                                     THEN 1 ELSE 0 END) AS rechazados,
+                            SUM(CASE WHEN COALESCE(estado_revision, '') = ''
+                                     THEN 1 ELSE 0 END) AS sin_revisar,
+                            GROUP_CONCAT(DISTINCT metodo_pago) AS metodos
+                       FROM registros_pago
+                   GROUP BY id_pedido
+                 ) r ON r.id_pedido = p.id_pedido
+                WHERE p.pago_estado IS NOT NULL
+                  AND p.pago_estado <> ''
+                  AND p.fecha BETWEEN ? AND ?""",
+            con,
+            params=(fecha_desde, fecha_hasta),
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_comprobantes(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+    """Comprobantes de pago, uno por fila (DEC-090).
+
+    **No es una conciliación bancaria** y conviene decirlo: hay una sola
+    cuenta receptora —los 2.117 comprobantes con cuenta van todos a la misma;
+    los otros 220 traen `-` porque son pagos en línea— y el pipeline no ve
+    ningún extracto contra el cual cruzar. Lo que entrega es **el lado del
+    libro**: qué dice el sistema que entró, cuándo, por qué canal y si alguien
+    lo verificó.
+
+    Lo accionable son los **544 sin revisar**: plata que el cliente dice haber
+    pagado y que nadie verificó. Es la misma cola que DEC-082 encontró
+    contando eventos, pero por comprobante y con su monto.
+
+    Args:
+        fecha_desde: Fecha inicial inclusive del pedido (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive.
+
+    Returns:
+        Una fila por comprobante, con canal, cuenta, montos, revisor y estado.
+    """
+    if not _objeto_existe("registros_pago"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """SELECT r.id_pedido,
+                      p.fecha,
+                      p.nombre_empresa,
+                      r.secuencia,
+                      r.metodo_pago,
+                      r.cuenta_receptora,
+                      r.monto_comprobante_num AS monto_comprobante,
+                      r.monto_pago_num        AS monto_pago,
+                      r.hora_pago,
+                      r.fecha_envio,
+                      CASE WHEN COALESCE(r.estado_revision, '') = ''
+                           THEN 'Sin revisar' ELSE r.estado_revision END AS estado,
+                      r.fecha_revision,
+                      -- El origen usa '-' como placeholder de "todavía nadie".
+                      CASE WHEN COALESCE(r.revisor, '-') = '-' THEN ''
+                           ELSE r.revisor END AS revisor,
+                      r.observaciones
+                 FROM registros_pago r
+                 JOIN pedidos p ON p.id_pedido = r.id_pedido
+                WHERE p.fecha BETWEEN ? AND ?""",
+            con,
+            params=(fecha_desde, fecha_hasta),
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_credito_abierto() -> pd.DataFrame:
+    """Crédito que el sistema sigue mostrando abierto, con su vencimiento (DEC-086).
+
+    **No usa `Monto pagado`.** Para crédito ese campo no discrimina: la
+    mediana de `pagado/facturado` es 0% tanto en los pedidos con crédito
+    abierto como en los ya saldados. La señal que sí funciona es el
+    comprobante — los `Completado` que conservan los campos de crédito tienen
+    comprobante subido el **100%** de las veces, contra el **5,2%** de los
+    `Entregado sin liquidar`.
+
+    Definición, tres señales independientes y ninguna monetaria:
+
+    1. el pedido conserva `vencimiento_credito` (el origen lo mantiene
+       mientras el crédito está vivo);
+    2. ningún subpedido está cancelado;
+    3. nunca se subió un comprobante de pago.
+
+    Es la lectura **conservadora**: sus 543 pedidos son un subconjunto
+    estricto de los 714 que daría filtrar por saldo.
+
+    **Ausencia de comprobante no es prueba de impago** — un cliente grande
+    puede pagar por transferencia sin que nadie cargue nada. Ningún cliente
+    está en 0%, pero los dos grandes retailers cargan a un cuarto de la tasa
+    de los medianos; la página lo advierte junto a la tabla.
+
+    Returns:
+        Una fila por pedido con crédito abierto, con los días de atraso
+        (negativos si todavía no vence) y el valor del pedido.
+    """
+    if not _num_cols_exist():
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """WITH pagados AS (
+                   SELECT DISTINCT id_pedido
+                     FROM registro_operaciones
+                    WHERE accion = 'Subir comprobante de pago'
+               ),
+               cancelados AS (
+                   SELECT DISTINCT id_pedido
+                     FROM subpedidos
+                    WHERE LOWER(estado) = 'cancelado'
+               )
+               SELECT p.id_pedido,
+                      p.fecha,
+                      p.nit,
+                      p.nombre_empresa,
+                      p.dias_credito,
+                      p.inicio_credito,
+                      p.vencimiento_credito,
+                      (SELECT MAX(em.monto_final_num)
+                         FROM estadisticas_monto em
+                        WHERE em.id_pedido = p.id_pedido
+                          AND em.concepto_base =
+                              'Total a pagar / Total final a pagar') AS valor,
+                      CAST(JULIANDAY('now', '-5 hours')
+                           - JULIANDAY(p.vencimiento_credito) AS INTEGER) AS atraso
+                 FROM pedidos p
+                WHERE p.forma_pago = 'Pago a crédito'
+                  AND p.scraping_completo = 1
+                  AND p.vencimiento_credito IS NOT NULL
+                  AND p.vencimiento_credito <> ''
+                  AND p.id_pedido NOT IN (SELECT id_pedido FROM pagados)
+                  AND p.id_pedido NOT IN (SELECT id_pedido FROM cancelados)""",
+            con,
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_saldo_a_favor(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+    """Saldo a favor del cliente, calculado por el origen (DEC-084).
+
+    Mecanismo: el cliente paga primero; si el pedido sale corto, el monto
+    facturado baja y la diferencia le queda **a favor**. `gestion_diferencias`
+    trae la reconciliación ya hecha por el sistema origen —no derivada acá— y
+    su identidad se cumple entera: `final = total − diferencia` en 4.401 de
+    4.401 filas.
+
+    **`anomalo` marca, no descarta.** 16 pedidos tienen `pagado > 2 × total`
+    —el mayor pagó 107 veces el pedido— y cargan el 79% del saldo bruto. Un
+    saldo a favor de 107 veces no existe: es un dato malo del origen. Se
+    devuelven marcados para que la página publique las dos cifras por
+    separado; promediarlos convertiría una cifra accionable en ruido.
+
+    Args:
+        fecha_desde: Fecha inicial inclusive del pedido (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive.
+
+    Returns:
+        Una fila por pedido con saldo distinto de cero, con el signo en
+        `saldo` (positivo = a favor del cliente) y la marca `anomalo`.
+    """
+    if not _objeto_existe("gestion_diferencias"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """SELECT g.id_pedido,
+                      p.fecha,
+                      p.nit,
+                      p.nombre_empresa,
+                      p.forma_pago,
+                      g.total_pagar_pedido_num AS total,
+                      g.monto_final_pagar_num  AS facturado,
+                      g.monto_pagado_num       AS pagado,
+                      g.monto_diferencia_num   AS faltante,
+                      g.monto_pagado_num - g.monto_final_pagar_num AS saldo,
+                      CASE WHEN g.total_pagar_pedido_num > 0
+                            AND g.monto_pagado_num > 2 * g.total_pagar_pedido_num
+                           THEN 1 ELSE 0 END AS anomalo
+                 FROM gestion_diferencias g
+                 JOIN pedidos p ON p.id_pedido = g.id_pedido
+                WHERE p.fecha BETWEEN ? AND ?
+                  AND g.monto_pagado_num  IS NOT NULL
+                  AND g.monto_final_pagar_num IS NOT NULL
+                  AND ABS(g.monto_pagado_num - g.monto_final_pagar_num) > 1""",
+            con,
+            params=(fecha_desde, fecha_hasta),
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_sin_ubicacion() -> pd.DataFrame:
+    """Producto que el admin declara y que no está en ninguna posición (DEC-073).
+
+    Es lo que el plan de conteo por construcción no puede descubrir: la cola
+    manda gente a posiciones donde el sistema **ya dice que hay algo**.
+    """
+    if not _objeto_existe("v_inventario_sin_ubicacion", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_inventario_sin_ubicacion ORDER BY inventario DESC", con)
     finally:
         con.close()
 

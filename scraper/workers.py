@@ -37,7 +37,9 @@ from scraper.extractores import (
     extraer_gestion_diferencias,
     extraer_info_entrega,
     extraer_info_general,
+    extraer_operacion_pago,
     extraer_registro_operaciones,
+    extraer_registros_pago,
     extraer_subpedidos,
     extraer_timeline,
     extraer_total_subpedidos,
@@ -226,6 +228,11 @@ async def procesar_pedido(
                 gestion_dif = await extraer_gestion_diferencias(page, id_pedido)
                 detalle_dif = await extraer_detalle_diferencias(page, id_pedido)
                 registro_ops = await extraer_registro_operaciones(page, id_pedido)
+                # DEC-087: secciones nuevas del origen (2026-07-16). Devuelven
+                # None/[] si no renderizan, que es lo esperado en un pedido
+                # anterior a esa fecha — la persistencia entonces no pisa nada.
+                operacion_pago = await extraer_operacion_pago(page, id_pedido)
+                registros_pago = await extraer_registros_pago(page, id_pedido)
                 resultado = {
                     "tipo": "completo",
                     "id_pedido": id_pedido,
@@ -240,6 +247,8 @@ async def procesar_pedido(
                     "gestion_dif": gestion_dif,
                     "detalle_dif": detalle_dif,
                     "registro_ops": registro_ops,
+                    "operacion_pago": operacion_pago,
+                    "registros_pago": registros_pago,
                 }
                 n_subs = len(subpedidos)
 

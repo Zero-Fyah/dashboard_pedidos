@@ -53,6 +53,11 @@ import pandas as pd
 from comun import (
     COLUMNAS_CONTEO_REQUERIDAS,
     COLUMNAS_HOJA_CONTEO,
+    ESTADO_CONTEO_COINCIDE,
+    ESTADO_CONTEO_CONFIRMADO,
+    ESTADO_CONTEO_DESCARTADO,
+    ESTADO_CONTEO_PENDIENTE,
+    ESTADOS_CICLO_CONTEO,
     TOLERANCIA_CONTEO_DEFECTO,
     TOLERANCIA_POR_CLASE,
 )
@@ -95,6 +100,11 @@ _COLUMNAS = [
     "actividad_origen",
     "observacion",
     "archivo",
+    # DEC-070: cierre del ciclo. `intento` numera los conteos de la misma
+    # línea por fecha; `estado_ciclo` dice en qué quedó la discrepancia.
+    "intento",
+    "estado_ciclo",
+    "dias_abierto",
 ]
 
 
@@ -193,17 +203,22 @@ def inventariar_archivos(crudo: pd.DataFrame, ruta: Path | None = None) -> pd.Da
     return pd.DataFrame(filas, columns=columnas)
 
 
-def evaluar_conteos(crudo: pd.DataFrame, ubicaciones: pd.DataFrame) -> pd.DataFrame:
+def evaluar_conteos(
+    crudo: pd.DataFrame, ubicaciones: pd.DataFrame, *, hoy: dt.date | None = None
+) -> pd.DataFrame:
     """Compara cada conteo contra el sistema y decide si está dentro de tolerancia.
 
     Args:
         crudo: Resultado de `cargar_conteos()`.
         ubicaciones: Resultado de `ubicaciones.calcular_ubicaciones()`, que
             aporta la cantidad del sistema y la clase de cada línea.
+        hoy: Fecha de referencia para la antigüedad del ciclo (DEC-070),
+            inyectable para tests.
 
     Returns:
         Un DataFrame por `(ubicacion, id_especificacion, fecha, contado_por)`
-        con la diferencia y el veredicto de exactitud.
+        con la diferencia, el veredicto de exactitud y el estado del ciclo
+        de cierre (DEC-070).
     """
     if crudo.empty:
         return pd.DataFrame(columns=_COLUMNAS)
@@ -273,6 +288,7 @@ def evaluar_conteos(crudo: pd.DataFrame, ubicaciones: pd.DataFrame) -> pd.DataFr
     resultado = df.drop_duplicates(
         subset=["ubicacion", "id_especificacion", "fecha", "contado_por"], keep="last"
     )
+    resultado = _cerrar_ciclo(resultado, ubicaciones, hoy=hoy)
     logger.info(
         "evaluar_conteos: %d conteos · %d exactos (%.1f%%) · %d posiciones · %d sin match en sistema",
         len(resultado),
@@ -282,6 +298,84 @@ def evaluar_conteos(crudo: pd.DataFrame, ubicaciones: pd.DataFrame) -> pd.DataFr
         int((resultado["cantidad_sistema"] == 0).sum()),
     )
     return resultado[_COLUMNAS]
+
+
+def _cerrar_ciclo(
+    conteos: pd.DataFrame, ubicaciones: pd.DataFrame, *, hoy: dt.date | None = None
+) -> pd.DataFrame:
+    """Clasifica en qué quedó cada discrepancia (DEC-070).
+
+    El ciclo de DEC-058/060 terminaba en la detección. Este paso agrega el
+    tramo que falta —recuento y ajuste— **sin pedirle a nadie que registre
+    nada nuevo**, derivándolo de lo que ya está:
+
+    - `intento`: el enésimo conteo de la misma línea, por fecha. El segundo
+      **es** el recuento; no hace falta que el contador lo marque, y así no
+      hay un campo más que se pueda llenar mal.
+    - `estado_ciclo`:
+
+      | Estado | Qué pasó |
+      |---|---|
+      | `Coincide` | El conteo dio dentro de tolerancia. Nada que cerrar. |
+      | `Recuento corrige` | Un conteo posterior coincidió con el sistema: el primero estaba mal. |
+      | `Recuento confirma` | Un conteo posterior repitió la diferencia: es real, falta ajustar. |
+      | `Pendiente de recuento` | Hay diferencia y nadie volvió a contar. |
+
+    **No hay estado "ajuste aplicado", y no es un olvido.** Se intentó
+    deducirlo comparando lo contado contra el sistema actual, y no puede
+    dispararse nunca: `cantidad_sistema` sale del mismo snapshot que "el
+    sistema hoy", porque ambas tablas se reescriben enteras en cada corrida.
+    Cuando una diferencia se ajusta, el conteo simplemente vuelve a evaluarse
+    como `Coincide`. Ver DEC-070 para qué haría falta para distinguirlo.
+
+    Args:
+        conteos: Conteos ya evaluados contra el sistema.
+        ubicaciones: Ubicaciones de la corrida actual.
+        hoy: Fecha de referencia, inyectable para tests.
+
+    Returns:
+        El mismo DataFrame con `intento`, `estado_ciclo` y `dias_abierto`.
+    """
+    df = conteos.copy()
+    if df.empty:
+        for c in ("intento", "estado_ciclo", "dias_abierto"):
+            df[c] = None
+        return df
+
+    referencia = hoy or dt.date.today()
+    linea = ["ubicacion", "id_especificacion"]
+
+    df = df.sort_values([*linea, "fecha"])
+    df["intento"] = df.groupby(linea).cumcount() + 1
+
+    # ¿Hubo un conteo posterior de la misma línea, y en qué quedó?
+    ultimo = df.groupby(linea).agg(
+        _ultimo_intento=("intento", "max"), _ultima_exacta=("exacta", "last")
+    )
+    df = df.merge(ultimo, on=linea, how="left")
+
+    hubo_recuento = df["_ultimo_intento"] > 1
+
+    df["estado_ciclo"] = ESTADO_CONTEO_PENDIENTE
+    df.loc[hubo_recuento & (df["_ultima_exacta"] == 1), "estado_ciclo"] = ESTADO_CONTEO_DESCARTADO
+    df.loc[hubo_recuento & (df["_ultima_exacta"] == 0), "estado_ciclo"] = ESTADO_CONTEO_CONFIRMADO
+    # Coincidir manda sobre todo: no hay nada que cerrar.
+    df.loc[df["exacta"] == 1, "estado_ciclo"] = ESTADO_CONTEO_COINCIDE
+
+    dias = (pd.Timestamp(referencia) - pd.to_datetime(df["fecha"], errors="coerce")).dt.days
+    abierto = df["estado_ciclo"].isin([ESTADO_CONTEO_PENDIENTE, ESTADO_CONTEO_CONFIRMADO])
+    df["dias_abierto"] = dias.where(abierto)
+
+    logger.info(
+        "cerrar_ciclo: %s",
+        " · ".join(
+            f"{e}: {int((df['estado_ciclo'] == e).sum())}"
+            for e in ESTADOS_CICLO_CONTEO
+            if (df["estado_ciclo"] == e).any()
+        )
+        or "sin conteos",
+    )
+    return df.drop(columns=["_ultimo_intento", "_ultima_exacta"])
 
 
 def calcular_ira(conteos: pd.DataFrame) -> pd.DataFrame:

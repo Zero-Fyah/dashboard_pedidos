@@ -19,11 +19,19 @@ import logging
 import re
 import sqlite3
 import unicodedata
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 
 import pandas as pd
 
-from comun import ESTADOS_CONOCIDOS
+from comun import (
+    ACCIONES_CONOCIDAS,
+    CONCEPTOS_MONTO_CONOCIDOS,
+    ESTADOS_CERRADOS,
+    ESTADOS_CONOCIDOS,
+    TIMELINE_CONOCIDO,
+    VEREDICTOS_AUDITORIA,
+)
 
 logger = logging.getLogger("inventario.hallazgos")
 
@@ -449,6 +457,13 @@ def productos_en_bodega_sin_precio(df_admin: pd.DataFrame, con: sqlite3.Connecti
     Solo cuenta lo que **está en una posición**: un ID sin precio y sin
     existencias es una ficha incompleta de algo que no está, y no compite
     por la atención de nadie.
+
+    Cuenta **productos**, no filas de catálogo (DEC-064): el admin trae una
+    fila por `(producto, almacén)` y son 12 almacenes, así que hay que
+    colapsar por ID antes de contar. Sin eso, un producto de presencia
+    nacional aportaba 12 al total y una sola alta movía la cifra en 12 —
+    así fue como el detector pasó de reportar 9 a 49 sin que la realidad
+    aumentara.
     """
     columnas = {
         "id_especificacion": "ID",
@@ -472,8 +487,18 @@ def productos_en_bodega_sin_precio(df_admin: pd.DataFrame, con: sqlite3.Connecti
 
     catalogo = df_admin[["id_especificacion", "referencia", "nombre_comercial", "precio"]].copy()
     catalogo["id_especificacion"] = catalogo["id_especificacion"].astype(str)
-    catalogo["precio"] = pd.to_numeric(catalogo["precio"], errors="coerce")
-    sin_precio = catalogo[catalogo["precio"].fillna(0) <= 0]
+    catalogo["precio"] = pd.to_numeric(catalogo["precio"], errors="coerce").fillna(0)
+
+    # Una fila por producto, con el precio máximo entre sus almacenes: un
+    # producto está sin precio solo si NINGUNA de sus filas tiene precio.
+    # Hoy no hay IDs contradictorios (medido: 0), así que el max no cambia
+    # ninguna clasificación — blinda el detector si mañana aparecen.
+    por_producto = catalogo.groupby("id_especificacion", as_index=False).agg(
+        referencia=("referencia", "first"),
+        nombre_comercial=("nombre_comercial", "first"),
+        precio=("precio", "max"),
+    )
+    sin_precio = por_producto[por_producto["precio"] <= 0]
 
     en_bodega = pd.read_sql(
         """SELECT id_especificacion,
@@ -507,6 +532,327 @@ def productos_en_bodega_sin_precio(df_admin: pd.DataFrame, con: sqlite3.Connecti
     )
 
 
+def sku_en_bodega_fuera_de_catalogo(df_admin: pd.DataFrame, con: sqlite3.Connection) -> Hallazgo:
+    """Producto en una posición cuyo ID el catálogo del admin no reconoce.
+
+    Es la contracara del alcance que fijó DEC-072: el trabajo se concentra en
+    los ID que publica `admin_inventario`, y lo que queda afuera **tiene que
+    quedar contado en algún lado** o la exclusión se vuelve invisible.
+
+    No se puede contar ni clasificar: sin ficha en el catálogo no hay
+    referencia, ni clase ABC, ni precio. Pero ocupa posiciones reales del
+    layout, así que tampoco es un error de datos que se pueda ignorar —
+    alguien tiene que decidir si es otra línea de negocio que comparte
+    bodega o producto que el admin dejó de reconocer.
+    """
+    columnas = {
+        "id_especificacion": "ID",
+        "referencia": "Referencia",
+        "posiciones": "Posiciones",
+        "unidades": "Unidades",
+    }
+    vacio = Hallazgo(
+        clave="sku_en_bodega_fuera_de_catalogo",
+        titulo="Producto en bodega con ID fuera del catálogo",
+        explicacion="",
+        categoria="Identidad del producto",
+        prioridad="Alta",
+        origen="DEC-072",
+        unidad="ID",
+        cantidad=0,
+        filas=pd.DataFrame(columns=list(columnas.values())),
+    )
+    if not _tabla_existe(con, "inventario_ubicaciones"):
+        return vacio
+
+    en_bodega = pd.read_sql(
+        """SELECT id_especificacion,
+                  MAX(referencia)            AS referencia,
+                  COUNT(DISTINCT ubicacion)  AS posiciones,
+                  SUM(cantidad)              AS unidades
+           FROM inventario_ubicaciones
+           GROUP BY id_especificacion""",
+        con,
+    )
+    if en_bodega.empty:
+        return vacio
+    en_bodega["id_especificacion"] = en_bodega["id_especificacion"].astype(str)
+    conocidos = set(df_admin["id_especificacion"].astype(str))
+    fuera = en_bodega[~en_bodega["id_especificacion"].isin(conocidos)]
+
+    filas = fuera[list(columnas)].rename(columns=columnas).sort_values("Unidades", ascending=False)
+    return Hallazgo(
+        clave="sku_en_bodega_fuera_de_catalogo",
+        titulo="Producto en bodega con ID fuera del catálogo",
+        explicacion=(
+            "Hay existencias en posiciones del layout bajo ID que el catálogo del "
+            "sistema administrativo no reconoce. No se pueden identificar, clasificar "
+            "ni valorar, así que quedan fuera del alcance de conteo (DEC-072) — pero "
+            "ocupan espacio real. Requiere decidir si son otra línea de negocio que "
+            "comparte bodega o producto que el admin dejó de publicar."
+        ),
+        categoria="Identidad del producto",
+        prioridad="Alta",
+        origen="DEC-072",
+        unidad="ID",
+        cantidad=len(filas),
+        filas=filas,
+    )
+
+
+def vocabulario_nuevo_en_origen(con: sqlite3.Connection) -> Hallazgo:
+    """Valores que la SPA empezó a emitir y el pipeline no conoce (DEC-081).
+
+    **La vista del pedido cambia sola.** Medido sobre los 7 meses de
+    histórico: entre enero y julio de 2026 aparecieron 18 valores nuevos en
+    cuatro vocabularios, y ninguno lo detectó el pipeline. Se encontraron de
+    casualidad, revisando el DOM a mano.
+
+    Un valor nuevo puede ser inofensivo —una etiqueta renombrada— o significar
+    que hay una sección nueva que nadie está extrayendo, que fue justo lo que
+    pasó con la tarjeta "Operación de pago". Este detector no distingue entre
+    las dos cosas: avisa, y alguien mira.
+
+    Cubre tres vocabularios; el cuarto —los estados de subpedido— ya tiene su
+    propio detector (`estados_sin_clasificar`), que además alimenta las listas
+    de `comun/`.
+
+    **Trae la fecha del primer avistamiento**, que es lo que convierte el
+    aviso en algo accionable: un valor que apareció ayer es un cambio
+    reciente; uno de hace cinco meses es una deuda que venía pasando
+    inadvertida.
+
+    Reconocer un valor es agregarlo a la lista de `comun/` — ahí el hallazgo
+    desaparece solo, misma mecánica que el resto (DEC-047).
+    """
+    columnas = {
+        "vocabulario": "Dónde",
+        "valor": "Valor nuevo",
+        "primera_vez": "Visto por primera vez",
+        "veces": "Veces",
+    }
+    fuentes = (
+        (
+            "Paso del timeline",
+            TIMELINE_CONOCIDO,
+            """SELECT titulo AS valor, COUNT(*) AS veces, MIN(fecha_hora) AS primera_vez
+               FROM timeline_pedido
+               WHERE titulo IS NOT NULL AND titulo != ''
+                 AND fecha_hora IS NOT NULL AND fecha_hora != ''
+               GROUP BY titulo""",
+        ),
+        (
+            "Acción del registro",
+            ACCIONES_CONOCIDAS,
+            """SELECT accion AS valor, COUNT(*) AS veces, MIN(momento) AS primera_vez
+               FROM registro_operaciones
+               WHERE accion IS NOT NULL AND accion != ''
+                 AND momento IS NOT NULL AND momento != ''
+               GROUP BY accion""",
+        ),
+        (
+            "Concepto de monto",
+            CONCEPTOS_MONTO_CONOCIDOS,
+            """SELECT em.concepto_base AS valor, COUNT(*) AS veces, MIN(p.fecha) AS primera_vez
+               FROM estadisticas_monto em
+               JOIN pedidos p ON p.id_pedido = em.id_pedido
+               WHERE em.concepto_base IS NOT NULL AND em.concepto_base != ''
+                 AND p.fecha IS NOT NULL AND p.fecha != ''
+               GROUP BY em.concepto_base""",
+        ),
+        # DEC-083: el veredicto de la auditoría vivía en `referencia` desde el
+        # 2026-04-10 y este detector no lo veía porque solo miraba `accion`.
+        # `CAST(... AS INTEGER) = 0` descarta los ID numéricos de comprobante,
+        # que comparten la columna con el veredicto.
+        (
+            "Veredicto de auditoría",
+            VEREDICTOS_AUDITORIA,
+            """SELECT referencia AS valor, COUNT(*) AS veces, MIN(momento) AS primera_vez
+               FROM registro_operaciones
+               WHERE accion = 'Auditoría de pago'
+                 AND referencia IS NOT NULL AND referencia != ''
+                 AND CAST(referencia AS INTEGER) = 0
+                 AND momento IS NOT NULL AND momento != ''
+               GROUP BY referencia""",
+        ),
+    )
+
+    filas: list[dict[str, object]] = []
+    for etiqueta, conocidos, sql in fuentes:
+        tabla = sql.split("FROM")[1].split()[0]
+        if not _tabla_existe(con, tabla):
+            continue
+        df = pd.read_sql(sql, con)
+        nuevos = df[~df["valor"].isin(conocidos)]
+        for r in nuevos.itertuples(index=False):
+            filas.append(
+                {
+                    "vocabulario": etiqueta,
+                    "valor": r.valor,
+                    "primera_vez": str(r.primera_vez)[:10],
+                    "veces": int(r.veces),
+                }
+            )
+
+    detalle = pd.DataFrame(filas, columns=list(columnas))
+    if not detalle.empty:
+        detalle = detalle.sort_values("primera_vez", ascending=False)
+    detalle = detalle.rename(columns=columnas)
+
+    return Hallazgo(
+        clave="vocabulario_nuevo_en_origen",
+        titulo="El sistema origen empezó a emitir valores desconocidos",
+        explicacion=(
+            "La vista del pedido en el sistema administrativo cambia con el tiempo: "
+            "solo entre enero y julio de 2026 aparecieron 18 valores nuevos sin que "
+            "nadie lo notara. Un valor desconocido puede ser una etiqueta renombrada "
+            "o la punta de una sección nueva que el scraper no está extrayendo — que "
+            "es lo que pasó con la tarjeta «Operación de pago». Revisar la vista en "
+            "el origen y, si el valor es esperado, declararlo en `comun/`."
+        ),
+        categoria="Cambios del sistema origen",
+        prioridad="Alta",
+        origen="DEC-081",
+        unidad="valores",
+        cantidad=len(detalle),
+        filas=detalle,
+    )
+
+
+# Campos que el origen debería seguir mostrando. La lista es explícita y no
+# derivada del schema: una columna nueva y todavía sin poblar daría un falso
+# positivo permanente, y una que legítimamente solo aplica a veces
+# —`conductor`, que solo viene con método 'Ruta'— se compara contra sí misma
+# mes a mes, no contra el 100%.
+_CAMPOS_VIGILADOS: tuple[tuple[str, str], ...] = (
+    ("pedidos", "despachador"),
+    ("pedidos", "hora_entrega"),
+    ("pedidos", "obs_entrega"),
+    ("pedidos", "conductor"),
+    ("pedidos", "vehiculo_entrega"),
+    ("pedidos", "alistador_pedido"),
+    ("pedidos", "inspector_pedido"),
+    ("pedidos", "nombre_empresa"),
+    ("pedidos", "nit"),
+    ("pedidos", "metodo_entrega"),
+    ("pedidos", "forma_pago"),
+    ("subpedidos", "estado"),
+    ("subpedidos", "alistador"),
+    ("subpedidos", "inspector"),
+    ("lineas_pedido", "referencia"),
+    ("lineas_pedido", "nombre_producto"),
+    ("lineas_pedido", "precio_unitario"),
+    ("estadisticas_monto", "concepto"),
+    ("registro_operaciones", "accion"),
+    ("registro_operaciones", "usuario"),
+)
+
+# Puntos porcentuales de caída que disparan el aviso. Por debajo de esto el
+# ruido normal del mix de pedidos (más `Ruta` un mes que otro) produciría
+# alertas constantes, que es la patología que DEC-070 y DEC-075 ya costaron.
+_CAIDA_MINIMA_PP = 20.0
+
+# DEC-065 dejó escrito lo que pasa al hardcodear estados que `comun/` posee:
+# dos VIEWs discreparon del dashboard en silencio. Se deriva de la constante.
+_CERRADOS_SQL = "(" + ", ".join(f"'{e}'" for e in sorted(ESTADOS_CERRADOS)) + ")"
+
+
+def cobertura_de_campos_cayendo(con: sqlite3.Connection) -> Hallazgo:
+    """Campos que el origen **dejó** de mostrar (DEC-091).
+
+    `vocabulario_nuevo_en_origen` (DEC-081) vigila lo que aparece. Este vigila
+    lo contrario, y hacía falta: la SPA dejó de renderizar la tarjeta de
+    información de entrega para pedidos viejos y **nadie se enteró durante
+    meses**, porque ninguna alerta miraba si una cifra bajaba.
+
+    Peor: el `UPDATE` de persistencia escribía el vacío resultante encima del
+    dato bueno, así que cada re-scrape destruía historia irrecuperable
+    —`hora_entrega` de `Ruta` cayó de 10.924/10.924 a 8.306/11.750—. Eso ya
+    está corregido; este detector cubre el caso que la corrección vuelve
+    invisible.
+
+    **Solo mira pedidos cerrados.** Uno abierto todavía se está llenando: un
+    pedido de ayer sin `hora_entrega` es normal, no una pérdida, y compararlo
+    daría un aviso todos los días.
+
+    Returns:
+        Un hallazgo con una fila por campo cuya cobertura cayó más de 20
+        puntos porcentuales respecto del mes anterior.
+    """
+    columnas = {
+        "campo": "Campo",
+        "mes_anterior": "Mes anterior",
+        "mes_actual": "Mes actual",
+        "caida_pp": "Caída (pp)",
+    }
+    filas: list[dict[str, object]] = []
+
+    for tabla, columna in _CAMPOS_VIGILADOS:
+        join = "" if tabla == "pedidos" else "JOIN pedidos p ON p.id_pedido = t.id_pedido"
+        fecha = "t.fecha" if tabla == "pedidos" else "p.fecha"
+        sql = f"""
+            SELECT STRFTIME('%Y-%m', {fecha}) AS mes,
+                   COUNT(*) AS n,
+                   SUM(CASE WHEN t.{columna} IS NOT NULL
+                             AND TRIM(t.{columna}) NOT IN ('', '-', '--')
+                            THEN 1 ELSE 0 END) AS con
+              FROM {tabla} t {join}
+             WHERE {fecha} >= DATE('now', '-4 months')
+               AND NOT EXISTS (
+                     SELECT 1 FROM subpedidos s
+                      WHERE s.id_pedido = t.id_pedido
+                        AND LOWER(s.estado) NOT IN {_CERRADOS_SQL}
+                   )
+          GROUP BY 1 ORDER BY 1
+        """  # noqa: S608
+        try:
+            datos = pd.read_sql(sql, con)
+        except Exception:  # noqa: BLE001
+            continue
+        # El mes EN CURSO se excluye por nombre, no por posición: todavía se
+        # está poblando y compararlo daría una caída falsa cada primero de
+        # mes. Se comparan los dos últimos meses completos.
+        mes_actual = datetime.now(timezone.utc).strftime("%Y-%m")
+        datos = datos[(datos["mes"] != mes_actual) & (datos["n"] >= 50)]
+        if len(datos) < 2:
+            continue
+        prev, act = datos.iloc[-2], datos.iloc[-1]
+        pct_prev = prev["con"] / prev["n"] * 100
+        pct_act = act["con"] / act["n"] * 100
+        caida = pct_prev - pct_act
+        if caida >= _CAIDA_MINIMA_PP:
+            filas.append(
+                {
+                    "campo": f"{tabla}.{columna}",
+                    "mes_anterior": f"{prev['mes']}: {pct_prev:.0f}%",
+                    "mes_actual": f"{act['mes']}: {pct_act:.0f}%",
+                    "caida_pp": round(caida),
+                }
+            )
+
+    df = pd.DataFrame(filas, columns=list(columnas)).rename(columns=columnas)
+    if len(df):
+        df = df.sort_values("Caída (pp)", ascending=False)
+
+    return Hallazgo(
+        clave="cobertura_de_campos_cayendo",
+        titulo="El origen dejó de mostrar un campo",
+        explicacion=(
+            "Un campo que el sistema origen venía poblando dejó de venir. No es "
+            "un error del scraper: la SPA deja de renderizar secciones enteras "
+            "para pedidos viejos, y lo que no se capture antes de que eso pase "
+            "**no se puede recuperar**. Revisar si hay que adelantar la captura "
+            "de ese periodo antes de que la ventana se cierre del todo."
+        ),
+        categoria="Cambios del sistema origen",
+        prioridad="Alta",
+        origen="pedidos.db",
+        unidad="campos",
+        cantidad=len(df),
+        filas=df,
+    )
+
+
 def detectar_todos(df_admin: pd.DataFrame, con: sqlite3.Connection) -> list[Hallazgo]:
     """Corre todos los detectores y devuelve solo los que encontraron algo.
 
@@ -533,6 +879,9 @@ def detectar_todos(df_admin: pd.DataFrame, con: sqlite3.Connection) -> list[Hall
         lambda: lineas_sin_id_producto(con),
         lambda: personal_duplicado(con),
         lambda: productos_en_bodega_sin_precio(df_admin, con),
+        lambda: sku_en_bodega_fuera_de_catalogo(df_admin, con),
+        lambda: vocabulario_nuevo_en_origen(con),
+        lambda: cobertura_de_campos_cayendo(con),
     ]
 
     encontrados: list[Hallazgo] = []

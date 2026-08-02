@@ -15,6 +15,27 @@ import aiosqlite
 from comun import ESTADOS_CERRADOS
 from scraper.config import log_event
 
+# DEC-087: `executemany` con parámetros nombrados revienta si a una fila le
+# falta una clave, y al extractor le faltan las columnas que el origen no
+# haya renderizado en esa fila. Este default se mezcla debajo de cada
+# registro para que una columna ausente entre como cadena vacía en vez de
+# tumbar la persistencia del pedido entero — que es exactamente lo que hizo
+# DEC-074 con una nota al pie del layout.
+_REGISTRO_PAGO_VACIO = {
+    "secuencia": "",
+    "metodo_pago": "",
+    "cuenta_receptora": "",
+    "monto_comprobante": "",
+    "monto_pago": "",
+    "hora_pago": "",
+    "comprobante": "",
+    "fecha_envio": "",
+    "estado_revision": "",
+    "fecha_revision": "",
+    "revisor": "",
+    "observaciones": "",
+}
+
 # ─────────────────────────────────────────────
 # PERSISTENCIA
 # ─────────────────────────────────────────────
@@ -193,6 +214,28 @@ async def _persistir_secciones_satelite(
             level="WARNING",
             msg="registro_operaciones retornó vacío — datos existentes preservados",
             id_pedido=id_pedido,
+        )
+
+    # DEC-087: los comprobantes de pago. Mismo DELETE condicional que el
+    # resto (HAL-004), pero SIN el WARNING de sección vacía ni siquiera en
+    # modo completo: la tabla solo existe si el pedido tuvo comprobantes, y
+    # además la sección es nueva —la SPA la agregó el 2026-07-16— así que en
+    # pedidos viejos su ausencia es lo esperado. Un WARNING que suena para el
+    # caso normal enseña a ignorar el log (la patología de DEC-070/075).
+    if resultado.get("registros_pago"):
+        await db.execute("DELETE FROM registros_pago WHERE id_pedido = ?", (id_pedido,))
+        await db.executemany(
+            """INSERT INTO registros_pago
+               (id_pedido, secuencia, metodo_pago, cuenta_receptora,
+                monto_comprobante, monto_pago, hora_pago, comprobante,
+                fecha_envio, estado_revision, fecha_revision, revisor,
+                observaciones)
+               VALUES
+               (:id_pedido, :secuencia, :metodo_pago, :cuenta_receptora,
+                :monto_comprobante, :monto_pago, :hora_pago, :comprobante,
+                :fecha_envio, :estado_revision, :fecha_revision, :revisor,
+                :observaciones)""",
+            [{**_REGISTRO_PAGO_VACIO, **r} for r in resultado["registros_pago"]],
         )
 
 
@@ -484,24 +527,42 @@ async def persistencia_worker(
                         )
 
                     info_e = resultado.get("info_entrega") or {}
+                    # DEC-091: un valor vacío NO pisa uno bueno.
+                    #
+                    # La SPA deja de renderizar la tarjeta de entrega para
+                    # pedidos viejos —medido: 0-2% de cobertura antes del
+                    # 2026-02-03 contra 76-84% después, y re-extraer 24
+                    # pedidos de enero con el código de hoy no recupera nada—
+                    # pero esos pedidos SÍ se entregaron (3.333 con paso
+                    # «Recibido y recibido» y 3.425 con evento «Entrega»).
+                    #
+                    # Con el UPDATE incondicional anterior, cada re-scrape de
+                    # un pedido cuya tarjeta ya no renderiza escribía cadena
+                    # vacía encima del dato bueno. **Preservar es la elección
+                    # deliberada**: el costo es quedarse con un valor viejo si
+                    # el origen realmente lo borra; el beneficio es no perder
+                    # lo único que tenemos de un periodo que ya no se puede
+                    # volver a leer. El detector de cobertura (DEC-091) avisa
+                    # si un campo empieza a caerse, que es el caso que esta
+                    # protección vuelve invisible.
                     await db.execute(
                         """
                         UPDATE pedidos SET
-                            alistador_pedido      = :ap,
-                            inspector_pedido      = :ip,
-                            movil_cliente         = :mc,
-                            despachador           = :desp,
-                            conductor             = :cond,
-                            hora_entrega          = :he,
-                            vehiculo_entrega      = :veh,
-                            obs_entrega           = :oe,
-                            entrega_ruta_tag      = :ert,
-                            entrega_descuento_tag = :edt,
-                            persona_recogida      = :pr,
-                            movil_recogida        = :mr,
-                            dias_credito          = :dc,
-                            inicio_credito        = :ic,
-                            vencimiento_credito   = :vc
+                            alistador_pedido      = CASE WHEN TRIM(:ap) <> '' THEN :ap ELSE alistador_pedido END,
+                            inspector_pedido      = CASE WHEN TRIM(:ip) <> '' THEN :ip ELSE inspector_pedido END,
+                            movil_cliente         = CASE WHEN TRIM(:mc) <> '' THEN :mc ELSE movil_cliente END,
+                            despachador           = CASE WHEN TRIM(:desp) <> '' THEN :desp ELSE despachador END,
+                            conductor             = CASE WHEN TRIM(:cond) <> '' THEN :cond ELSE conductor END,
+                            hora_entrega          = CASE WHEN TRIM(:he) <> '' THEN :he ELSE hora_entrega END,
+                            vehiculo_entrega      = CASE WHEN TRIM(:veh) <> '' THEN :veh ELSE vehiculo_entrega END,
+                            obs_entrega           = CASE WHEN TRIM(:oe) <> '' THEN :oe ELSE obs_entrega END,
+                            entrega_ruta_tag      = CASE WHEN TRIM(:ert) <> '' THEN :ert ELSE entrega_ruta_tag END,
+                            entrega_descuento_tag = CASE WHEN TRIM(:edt) <> '' THEN :edt ELSE entrega_descuento_tag END,
+                            persona_recogida      = CASE WHEN TRIM(:pr) <> '' THEN :pr ELSE persona_recogida END,
+                            movil_recogida        = CASE WHEN TRIM(:mr) <> '' THEN :mr ELSE movil_recogida END,
+                            dias_credito          = CASE WHEN TRIM(:dc) <> '' THEN :dc ELSE dias_credito END,
+                            inicio_credito        = CASE WHEN TRIM(:ic) <> '' THEN :ic ELSE inicio_credito END,
+                            vencimiento_credito   = CASE WHEN TRIM(:vc) <> '' THEN :vc ELSE vencimiento_credito END
                         WHERE id_pedido = :pid
                         """,
                         {
@@ -535,6 +596,34 @@ async def persistencia_worker(
                         await db.execute(
                             "UPDATE pedidos SET hay_diferencia = ? WHERE id_pedido = ?",
                             (_hd, id_pedido),
+                        )
+
+                    # DEC-087: la tarjeta «Operación de pago» se actualiza
+                    # SOLO si se leyó. Mismo criterio que FIX C-3 y por un
+                    # motivo concreto: la sección es del 2026-07-16, no
+                    # renderiza en pedidos viejos, y el UPDATE de arriba
+                    # —que pisa con cadena vacía lo que no viene— borraría
+                    # datos buenos en cada re-scrape de un pedido anterior.
+                    _op = resultado.get("operacion_pago")
+                    if _op:
+                        await db.execute(
+                            """
+                            UPDATE pedidos SET
+                                pago_estado   = :estado,
+                                pago_total    = :total,
+                                pago_pagado   = :pagado,
+                                pago_saldo    = :saldo,
+                                pago_progreso = :progreso
+                            WHERE id_pedido = :pid
+                            """,
+                            {
+                                "estado": _op.get("pago_estado", ""),
+                                "total": _op.get("pago_total", ""),
+                                "pagado": _op.get("pago_pagado", ""),
+                                "saldo": _op.get("pago_saldo", ""),
+                                "progreso": _op.get("pago_progreso", ""),
+                                "pid": id_pedido,
+                            },
                         )
 
                     # HAL-004: DELETE dentro de if (sección con datos) para no

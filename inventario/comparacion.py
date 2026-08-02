@@ -29,8 +29,8 @@ import sqlite3
 import pandas as pd
 
 from comun import ESTADOS_ACTIVOS_INVENTARIO, familia_de, get_db_path
-from inventario.layout import TIPO_ALTURA, TIPO_PASO, TIPO_PICKING
-from inventario.normalizador import ALMACEN_BODEGA, marcar_averias
+from inventario.layout import FAMILIA_AVERIAS, TIPO_ALTURA, TIPO_PASO, TIPO_PICKING
+from inventario.normalizador import _PATRON_AVERIA, ALMACEN_BODEGA, marcar_averias
 
 logger = logging.getLogger("inventario.comparacion")
 
@@ -217,23 +217,83 @@ def comparar(
     return comparado[columnas].sort_values("referencia").reset_index(drop=True)
 
 
-def anomalias_layout(df_bochica_layout: pd.DataFrame) -> pd.DataFrame:
+def _familia_fuera_de_rack(
+    df: pd.DataFrame, politica: dict[str, frozenset[str]] | None
+) -> pd.Series:
+    """Marca las líneas de picking cuya familia no corresponde al rack (DEC-077).
+
+    Conforme si la familia está entre las asignadas al rack, o si es una
+    avería y el rack acepta averías. Las averías se detectan por el patrón de
+    la referencia, no por familia: `familia_de()` las clasifica con el
+    prefijo de su producto de origen, así que una `PJ91 AVERIA` da familia
+    `PJ` y sin este caso especial saldría mal ubicada en el rack de averías.
+
+    Returns:
+        Serie booleana alineada al índice de `df`.
+    """
+    vacio = pd.Series(False, index=df.index)
+    if not politica or "rack" not in df.columns or "referencia" not in df.columns:
+        return vacio
+
+    rack = df["rack"].astype(str).str.strip().str.upper()
+    esperadas = rack.map(politica)
+    # Un rack sin política declarada no se evalúa: no hay contra qué comparar.
+    evaluables = (df["tipo"] == TIPO_PICKING) & esperadas.notna()
+    if not evaluables.any():
+        return vacio
+
+    referencia = df["referencia"].astype(str)
+    familia = referencia.map(familia_de)
+    es_averia = referencia.str.contains(_PATRON_AVERIA, regex=True, na=False)
+
+    # `fillna(frozenset())` no sirve: pandas trata el conjunto como iterable
+    # y revienta. El `or frozenset()` cubre el rack sin política, que igual
+    # queda fuera por `evaluables`.
+    conforme = pd.Series(
+        [
+            (f in (e or frozenset())) or (a and FAMILIA_AVERIAS in (e or frozenset()))
+            for f, a, e in zip(familia, es_averia, esperadas, strict=True)
+        ],
+        index=df.index,
+    )
+    # Sin familia reconocida no se opina: es el problema de los ID fuera de
+    # catálogo, no uno de ubicación.
+    return evaluables & familia.notna() & ~conforme
+
+
+def anomalias_layout(
+    df_bochica_layout: pd.DataFrame,
+    politica: dict[str, frozenset[str]] | None = None,
+) -> pd.DataFrame:
     """Lista el stock que está donde no debería estar, según el layout (DEC-041).
 
-    Tres situaciones, todas derivadas de la semántica de
-    `Activa Para Almacenar` confirmada por el Arquitecto. Ninguna cambia
-    el cálculo — se reportan para que la operación las corrija:
+    Cuatro situaciones. Ninguna cambia el cálculo — se reportan para que la
+    operación las corrija:
 
     - `paso_montacarga`: stock en el túnel transversal del rack.
     - `estiba_nivel_superior`: stock en alturas 2-3 de una posición donde
       el bulto ocupa los 3 niveles y todo debe registrarse en la altura 1.
     - `posicion_no_habilitada`: stock en posiciones marcadas `NO` en las
       tres alturas de picking.
+    - `familia_fuera_de_rack` (DEC-077): producto de una familia que no es
+      la que la política de slotting asigna a ese rack.
+
+    **El cuarto motivo solo evalúa picking**, porque la política es de
+    picking: la altura es almacenamiento masivo y no se asigna por familia.
+
+    Y **solo marca lo que se puede identificar**. Una referencia cuya familia
+    no se reconoce no es un producto mal ubicado: es un producto que nadie
+    sabe qué es, y confundirlos inflaría el hallazgo con un problema
+    distinto —el de los ID fuera de catálogo (DEC-072)— que ya tiene su
+    propio detector.
 
     Args:
         df_bochica_layout: Resultado de `clasificar_ubicaciones()` +
-            `solo_layout()` — necesita `tipo`, `activa`, `altura` y
-            `estiba_completa`.
+            `solo_layout()` — necesita `tipo`, `activa`, `altura`,
+            `estiba_completa`, `rack` y `referencia`.
+        politica: Resultado de `layout.cargar_distribucion()`. Si es None o
+            vacío, el motivo de familia no se evalúa y los otros tres siguen
+            funcionando igual.
 
     Returns:
         DataFrame con `motivo`, `ubicacion`, `id_especificacion` y
@@ -253,6 +313,7 @@ def anomalias_layout(df_bochica_layout: pd.DataFrame) -> pd.DataFrame:
     es_estiba = df["estiba_completa"].fillna(False).astype(bool)
 
     motivo = pd.Series("", index=df.index, dtype="object")
+    motivo[_familia_fuera_de_rack(df, politica)] = "familia_fuera_de_rack"
     motivo[es_picking_inactivo] = "posicion_no_habilitada"
     motivo[es_picking_inactivo & es_estiba & (df["altura"] > 1)] = "estiba_nivel_superior"
     motivo[es_paso] = "paso_montacarga"
