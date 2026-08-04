@@ -85,6 +85,23 @@ paginas: dict[str, list[st.Page]] = {
             title="Consolidado",
             icon=":material/local_shipping:",
         ),
+        st.Page(
+            "pages/ciclo.py",
+            title="Ciclo de vida",
+            icon=":material/timeline:",
+        ),
+    ],
+    "Comercial": [
+        st.Page(
+            "pages/ventas.py",
+            title="Ventas y descuentos",
+            icon=":material/payments:",
+        ),
+        st.Page(
+            "pages/cobranza.py",
+            title="Cobranza y cartera",
+            icon=":material/account_balance:",
+        ),
     ],
     "Inventario": [
         st.Page(
@@ -118,6 +135,16 @@ paginas: dict[str, list[st.Page]] = {
             "pages/operacion.py",
             title="Tiempos y productividad",
             icon=":material/schedule:",
+        ),
+        st.Page(
+            "pages/entregas.py",
+            title="Cumplimiento de entrega",
+            icon=":material/local_shipping:",
+        ),
+        st.Page(
+            "pages/excepciones.py",
+            title="Excepciones del proceso",
+            icon=":material/report_problem:",
         ),
     ],
     # A medida que el proyecto evolucione, se agregan aquí nuevas

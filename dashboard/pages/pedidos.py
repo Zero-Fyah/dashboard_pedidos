@@ -11,11 +11,15 @@ producto.
 """
 
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import datetime
 
+import pandas as pd
 import streamlit as st
+from filtros import aviso_alcance, barra_lateral, recortar
 
 from db import (
+    get_comprometido,
+    get_opciones_comerciales,
     get_opciones_filtro,
     get_pedidos_consolidado,
     get_rango_fechas,
@@ -27,9 +31,10 @@ from db import (
 # nadie lee 840.000 filas — se exploran filtrando. El total real siempre
 # se informa, así que el recorte nunca es silencioso.
 LIMITE_FILAS = 50_000
-# 7 días ≈ 34.000 líneas: entra cómodo bajo el tope, así la primera carga
-# no arranca ya recortada. 30 días serían ~148.000.
-DIAS_POR_DEFECTO = 7
+# Tope de días que esta página consulta, por encima del filtro global (DEC-101).
+# Medido: 7 días = 4,4 s · histórico completo = 42,7 s sobre 875.059 líneas.
+# 31 días es el punto donde sigue siendo usable sin volverse un exportador lento.
+DIAS_MAXIMOS = 31
 
 st.markdown('<p class="dp-breadcrumb">Dashboard / Pedidos</p>', unsafe_allow_html=True)
 st.title("📦 Consolidado de pedidos")
@@ -61,24 +66,27 @@ if _ultima:
         _ultima_fmt = _ultima
     st.caption(f"📅 Datos al: {_ultima_fmt}")
 
-_min_d = date.fromisoformat(_min_fecha)
-_max_d = date.fromisoformat(_max_fecha)
-# Default acotado a los últimos 30 días: abrir con el histórico completo
-# haría que la primera carga trajera cientos de miles de filas.
-_ini_d = max(_min_d, _max_d - timedelta(days=DIAS_POR_DEFECTO))
-
 # ── Filtros ────────────────────────────────────────────────────────────────────
-col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+# DEC-101: el rango sale del filtro global; los controles propios de esta página
+# son los que ninguna otra usa (almacén y el subfiltro de picking).
+_f = barra_lateral(_min_fecha, _max_fecha, get_opciones_comerciales())
+# Esta es la única página que consulta a nivel de línea sobre las 875.059 de
+# `lineas_pedido`: medido, 7 días cuestan 4,4 s y el histórico completo 42,7 s.
+# El recorte es local — el filtro global del sidebar queda intacto para el resto.
+_f_local, _recortado = recortar(_f, DIAS_MAXIMOS)
+aviso_alcance(_f_local, aplica_dimensiones=False)
+fecha_desde, fecha_hasta = _f_local.desde, _f_local.hasta
 
-with col1:
-    rango = st.date_input(
-        "Rango de fechas",
-        value=(_ini_d, _max_d),
-        min_value=_min_d,
-        max_value=_max_d,
-        format="YYYY-MM-DD",
-        help="Filtra por la fecha del pedido padre.",
+if _recortado:
+    st.warning(
+        f"El filtro global cubre **{_f.desde} → {_f.hasta}**, pero esta página consulta "
+        f"línea por línea sobre 875.000 registros y se acota a los últimos "
+        f"**{DIAS_MAXIMOS} días** ({fecha_desde} → {fecha_hasta}). El histórico completo "
+        "tarda 42 s contra 4 s de una semana. **El resto de las páginas sigue usando el "
+        "rango que elegiste** — el recorte es solo acá."
     )
+
+col2, col3, col4 = st.columns(3)
 with col2:
     estado_pedido_sel = st.selectbox(
         "Estado del pedido",
@@ -104,13 +112,14 @@ with col4:
         ),
     )
 
-# st.date_input devuelve una tupla incompleta mientras el usuario está
-# eligiendo el segundo extremo del rango.
-if not isinstance(rango, (tuple, list)) or len(rango) != 2:
-    st.info("Elegí la fecha final del rango para ver los resultados.")
-    st.stop()
+st.info(
+    "El consolidado agrega en SQL sobre el conjunto completo, así que **los filtros "
+    "de vendedor, cliente y canal no lo alcanzan**: aplicarlos en pandas dejaría los "
+    "totales de arriba hablando de un universo y la tabla de otro. Para cortar por "
+    "esas dimensiones están las páginas de Ventas, Ciclo de vida y Entregas.",
+    icon="ℹ️",
+)
 
-fecha_desde, fecha_hasta = (d.isoformat() for d in rango)
 almacenes_key = tuple(sorted(almacenes_sel))
 
 # ── Datos ──────────────────────────────────────────────────────────────────────
@@ -173,3 +182,105 @@ st.dataframe(
         "ID del producto": st.column_config.TextColumn(width="medium"),
     },
 )
+
+# ── Inventario comprometido ────────────────────────────────────────────────────
+# DEC-098: la "Vista de inventario comprometido" que `integral.md` pide desde el
+# primer día. No depende del rango de fechas de arriba: es el estado vivo de hoy,
+# igual que los impagos de DEC-085.
+st.divider()
+st.subheader("Mercancía comprometida en pedidos abiertos")
+
+try:
+    comp = get_comprometido()
+except sqlite3.OperationalError as e:
+    st.error(f"La base está ocupada momentáneamente ({e}).")
+    comp = pd.DataFrame()
+
+if comp.empty:
+    st.info("Sin pedidos abiertos con mercancía comprometida.")
+else:
+    con_stock = comp[comp["disponible"].notna()]
+    sin_cubrir = con_stock[con_stock["faltante"] > 0]
+    cubierto = con_stock["comprometido"].sum() - con_stock["faltante"].sum()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(
+        "Unidades comprometidas",
+        f"{comp['comprometido'].sum():,.0f}".replace(",", "."),
+        help="Cantidad comprada en subpedidos que siguen abiertos.",
+    )
+    c2.metric("Referencias", f"{len(comp):,}".replace(",", "."))
+    c3.metric(
+        "Valor comprometido",
+        f"${comp['valor'].sum() / 1e6:,.0f} M".replace(",", "."),
+    )
+    c4.metric(
+        "Cobertura con stock",
+        f"{100 * cubierto / con_stock['comprometido'].sum():.1f}%"
+        if con_stock["comprometido"].sum()
+        else "—",
+        delta=f"{len(sin_cubrir)} refs sin cubrir" if len(sin_cubrir) else "Todo cubierto",
+        delta_color="inverse" if len(sin_cubrir) else "normal",
+    )
+
+    st.warning(
+        "**Esta cifra no sale de `v_inventario_comprometido`, y es a propósito.** Esa "
+        "VIEW resta `cantidad_entregada` a `cantidad_comprada`, pero el origen puebla "
+        "las dos iguales mientras el subpedido está abierto —99,3% de las líneas, con "
+        "`cantidades_definitivas = 0` en 2.081 de 2.085 subpedidos activos—. La resta da "
+        "**251 unidades** cuando lo realmente comprometido son **497.929**. Acá se usa "
+        "`cantidad_comprada`, que es lo que la bodega tiene reservado."
+    )
+
+    if not sin_cubrir.empty:
+        st.markdown(
+            f"**{len(sin_cubrir)} referencias no alcanzan a cubrir lo comprometido**: "
+            f"faltan {sin_cubrir['faltante'].sum():,.0f} unidades y hay "
+            f"${sin_cubrir['valor'].sum() / 1e6:,.0f} M en pedidos que dependen de ellas. "
+            "Es la lista de reposición con urgencia real: no es demanda proyectada, es "
+            "mercancía ya vendida.".replace(",", ".")
+        )
+        vista = sin_cubrir.sort_values("faltante", ascending=False)
+        st.dataframe(
+            vista[
+                [
+                    "referencia",
+                    "producto",
+                    "pedidos",
+                    "comprometido",
+                    "disponible",
+                    "faltante",
+                    "estado_salud",
+                    "valor",
+                ]
+            ],
+            hide_index=True,
+            width="stretch",
+            height=340,
+            column_config={
+                "referencia": st.column_config.TextColumn("Referencia"),
+                "producto": st.column_config.TextColumn("Producto", width="medium"),
+                "pedidos": st.column_config.NumberColumn("Pedidos", format="%d"),
+                "comprometido": st.column_config.NumberColumn("Comprometido", format="%.0f"),
+                "disponible": st.column_config.NumberColumn("Disponible", format="%.0f"),
+                "faltante": st.column_config.NumberColumn("Faltante", format="%.0f"),
+                "estado_salud": st.column_config.TextColumn("Salud"),
+                "valor": st.column_config.NumberColumn("Valor en juego", format="$%.0f"),
+            },
+        )
+        st.download_button(
+            "⬇️ Descargar referencias sin cubrir (CSV)",
+            vista.to_csv(index=False).encode("utf-8-sig"),
+            file_name="comprometido_sin_cubrir.csv",
+            mime="text/csv",
+        )
+    else:
+        st.success("Todas las referencias comprometidas tienen stock suficiente.")
+
+    _sin_dato = int(comp["disponible"].isna().sum())
+    if _sin_dato:
+        st.caption(
+            f"{_sin_dato} de {len(comp)} referencias comprometidas no tienen dato de stock "
+            "en el cruce de inventario, así que no entran en la cobertura. No es lo mismo "
+            "que tener cero: es no saber."
+        )

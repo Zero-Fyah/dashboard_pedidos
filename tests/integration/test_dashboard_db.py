@@ -68,14 +68,18 @@ def test_num_cols_exist_pasa_timeout_5(monkeypatch, tmp_path):
 
 
 @pytest.mark.integration
-def test_view_consolidado_exists_pasa_timeout_5(monkeypatch, tmp_path):
+def test_objeto_existe_pasa_timeout_5(monkeypatch, tmp_path):
+    """DEC-103: la sonda era `_view_consolidado_exists`, que se fue con el
+    código muerto. La preocupación de AUD-M6 sobrevive en `_objeto_existe`,
+    que es hoy el guard que usan todas las consultas antes de tocar una VIEW.
+    """
     ddb.st.cache_data.clear()
     db_file = tmp_path / "view.db"
     monkeypatch.setattr(ddb, "DB_PATH", db_file)
     db_file.touch()
     llamadas = _espiar_connect(monkeypatch)
 
-    assert ddb._view_consolidado_exists() is False
+    assert ddb._objeto_existe("v_no_existe", "view") is False
     assert llamadas.get("timeout") == 5
     ddb.st.cache_data.clear()
 

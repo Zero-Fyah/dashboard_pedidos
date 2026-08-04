@@ -33,6 +33,7 @@ from db import (
     get_inventario_salud,
     get_inventario_ubicaciones,
     get_ira,
+    get_scorecard,
 )
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
 
@@ -46,6 +47,9 @@ try:
     ubicaciones = get_inventario_ubicaciones()
     corrida = get_inventario_corrida()
     corridas = get_inventario_corridas()
+    # DEC-102: las cifras de pedidos, servicio y caja. Consulta propia por
+    # rendimiento; su consistencia con las páginas de detalle está testeada.
+    tarjeta = get_scorecard()
 except sqlite3.OperationalError as e:
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()
@@ -170,6 +174,57 @@ d4.metric(
     f"{ab_pendientes:,}".replace(",", "."),
     help=f"De {posiciones:,} posiciones de altura ocupadas.".replace(",", "."),
 )
+
+
+# ─────────────────────────────────────────────
+# Pedidos y servicio (DEC-102)
+# ─────────────────────────────────────────────
+# El scorecard tenía siete métricas y las siete eran de inventario, ignorando
+# 29.931 pedidos, $84.088 M facturados y 227.666 eventos operacionales. Para el
+# Comité —que también decide sobre servicio y caja— eso es media foto.
+st.divider()
+st.subheader("Pedidos y servicio")
+st.caption(
+    "Sale de una consulta propia por rendimiento: reusar las de las páginas de "
+    "detalle costaba 6,6 s en la portada. Cada cifra usa **el mismo predicado** que "
+    "su página, y hay tests que comparan las dos vías — es la lección de DEC-067, "
+    "donde dos definiciones del mismo indicador divergieron en silencio."
+)
+
+if tarjeta is None:
+    st.info("No se pudieron leer las cifras de pedidos.")
+else:
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric(
+        "Pedidos abiertos",
+        f"{int(tarjeta['pedidos_abiertos']):,}".replace(",", "."),
+        help="Con al menos un subpedido sin cerrar. Detalle en Pedidos → Ciclo de vida.",
+    )
+    p2.metric(
+        "Valor retenido",
+        f"${tarjeta['valor_retenido'] / 1e6:,.0f} M".replace(",", "."),
+        help="Total a pagar de los pedidos que siguen abiertos.",
+    )
+    p3.metric(
+        "Fill rate por pedido",
+        f"{tarjeta['fill_rate']:.1f}%" if tarjeta["fill_rate"] is not None else "—",
+        help="Pedidos que salieron completos. La escala más exigente de DEC-069: "
+        "una sola línea corta arruina el pedido entero.",
+    )
+    _ot = tarjeta["on_time"]
+    p4.metric(
+        "Entregas a tiempo",
+        f"{_ot:.1f}%" if _ot is not None else "—",
+        help=f"Sobre {int(tarjeta['entregas_medibles']):,} pedidos con compromiso fechado "
+        "y entrega registrada. Escala por día.".replace(",", "."),
+    )
+    st.caption(
+        "⚠️ **Las entregas a tiempo dependen de una definición que el negocio no cerró.** "
+        "Si «Hora de entrega» es un compromiso con el cliente, esta cifra es el indicador "
+        "de servicio del área; si es una franja de programación interna, mide otra cosa "
+        "(DEC-094). El detalle y la advertencia completa están en **Operación → "
+        "Cumplimiento de entrega**."
+    )
 
 
 # ─────────────────────────────────────────────

@@ -23,7 +23,6 @@ import aiosqlite
 # carga el scraper (ni Playwright, ni sus efectos secundarios de import).
 from comun import (
     COLUMNAS_GUION_ES_CERO,
-    ESTADOS_ACTIVOS_INVENTARIO,
     ESTADOS_CONOCIDOS,
     es_placeholder,
     get_db_path,
@@ -39,21 +38,6 @@ _MAX_DETALLE_FALLIDAS = 10
 _MAX_MUESTRA_FALLIDAS = 10
 
 
-def _sql_literal(texto: str) -> str:
-    """Escapa un texto como literal SQL entre comillas simples.
-
-    E-8: un estado con apóstrofe rompería el SQL generado de las views;
-    la duplicación de comillas ('') es el escape estándar de SQLite.
-
-    Args:
-        texto: Valor a convertir en literal SQL.
-
-    Returns:
-        El literal entre comillas simples con apóstrofes escapados.
-    """
-    return "'" + texto.replace("'", "''") + "'"
-
-
 # AUD-M8 (auditoría 2026-07-01): literales SQL generados desde las
 # constantes del módulo común — único origen de verdad para
 # "cerrado"/"activo" en las VIEWs.
@@ -61,7 +45,6 @@ def _sql_literal(texto: str) -> str:
 # DEC-065: quedó uno solo. `_CERRADOS_SQL` y `_ACCIONES_RENDIMIENTO_SQL`
 # existían para interpolarse en las views retiradas (ver `_VIEWS_RETIRADAS`)
 # y se fueron con ellas.
-_ACTIVOS_INVENTARIO_SQL = ",".join(_sql_literal(e) for e in ESTADOS_ACTIVOS_INVENTARIO)
 
 # DEC-065: views que el ETL creó en el pasado y ya no crea. Hay que
 # **dropearlas explícitamente**: `crear_views()` solo dropea lo que está a
@@ -77,6 +60,14 @@ _ACTIVOS_INVENTARIO_SQL = ",".join(_sql_literal(e) for e in ESTADOS_ACTIVOS_INVE
 # Se puede vaciar esta tupla cuando no queden bases con esas views. No
 # corre riesgo de borrar de más: `DROP VIEW` no toca tablas.
 _VIEWS_RETIRADAS = (
+    # DEC-103: `v_inventario_comprometido` no era código muerto sino una VIEW
+    # que **no puede dar bien lo que promete**. Calcula
+    # `cantidad_comprada − cantidad_entregada` sobre subpedidos **activos**, y
+    # el origen puebla las dos iguales mientras el subpedido está abierto: 99,3%
+    # de las líneas, con `cantidades_definitivas = 0` en 2.081 de 2.085. Reporta
+    # **251 unidades** cuando lo comprometido son **497.929** (DEC-098).
+    # `dashboard.db.get_comprometido()` la reemplaza usando `cantidad_comprada`.
+    "v_inventario_comprometido",
     "v_pedidos_activos",
     "v_pedidos_cerrados",
     "v_rendimiento_operadores",
@@ -427,10 +418,11 @@ async def crear_views(db: aiosqlite.Connection) -> None:
     DEC-019): con WAL, los lectores concurrentes ven el
     snapshot anterior hasta el COMMIT y nunca una view ausente.
 
-    VIEWs analíticas (3): v_inventario_comprometido,
-    v_diferencias_resumen, v_descuentos_lineas. Eran 8 hasta DEC-065;
-    las 5 retiradas se listan en `_VIEWS_RETIRADAS` y se dropean acá
-    mismo.
+    VIEWs analíticas (2): v_diferencias_resumen y v_descuentos_lineas.
+    Eran 8 hasta DEC-065 y 3 hasta DEC-103, que retiró
+    `v_inventario_comprometido` por semántica inválida (medido: reportaba
+    251 unidades cuando lo comprometido eran 497.929). Las 6 retiradas se
+    listan en `_VIEWS_RETIRADAS` y se dropean acá mismo.
 
     VIEWs para el dashboard (4): v_lineas_pedido_num,
     v_estadisticas_monto_num, v_gestion_diferencias_num,
@@ -442,39 +434,6 @@ async def crear_views(db: aiosqlite.Connection) -> None:
         db: Conexión abierta a pedidos.db.
     """
     views = {
-        # AUD-M8: los literales de estados se generan desde comun/
-        "v_inventario_comprometido": f"""
-            SELECT
-                l.nombre_producto,
-                l.referencia,
-                l.codigo_barras,
-                l.presentacion,
-                l.almacen,
-                s.estado,
-                SUM(l.cantidad_comprada)
-                    AS cantidad_comprometida_total,
-                SUM(l.cantidad_entregada)
-                    AS cantidad_entregada_total,
-                -- FIX C-4 (auditoría 2026-07-01): COALESCE evita que
-                -- cantidad_entregada NULL anule la fila entera en el SUM
-                -- (x - NULL = NULL y SUM ignora NULLs → subcuenta Pendiente)
-                SUM(l.cantidad_comprada - COALESCE(l.cantidad_entregada, 0))
-                    AS cantidad_pendiente,
-                COUNT(DISTINCT l.id_pedido) AS pedidos_activos
-            FROM lineas_pedido l
-            JOIN subpedidos s
-                ON l.id_pedido = s.id_pedido
-                AND l.numero_subpedido = s.numero_subpedido
-            WHERE LOWER(s.estado) IN ({_ACTIVOS_INVENTARIO_SQL})
-            AND l.nombre_producto IS NOT NULL
-            AND l.nombre_producto != ''
-            GROUP BY
-                l.nombre_producto,
-                l.referencia,
-                l.codigo_barras,
-                l.almacen,
-                s.estado
-        """,
         "v_diferencias_resumen": """
             SELECT
                 p.id_pedido,

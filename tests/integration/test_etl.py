@@ -22,7 +22,7 @@ def _eventos_etl(caplog):
 # View sobre la que se prueba la atomicidad de DEC-019: tiene que ser una
 # que exista y se recree, no una de `_VIEWS_RETIRADAS` (esas se dropean
 # primero y no existen, así que la sonda pasaría sin probar nada).
-_SONDA = "v_inventario_comprometido"
+_SONDA = "v_diferencias_resumen"
 
 
 @pytest.mark.integration
@@ -106,8 +106,8 @@ async def test_views_creadas(db_path):
         views = {r[0] for r in await cursor.fetchall()}
 
     views_esperadas = {
-        # 3 VIEWs analíticas (eran 8 hasta DEC-065)
-        "v_inventario_comprometido",
+        # 2 VIEWs analíticas (eran 8 hasta DEC-065 y 3 hasta DEC-103, que
+        # retiró `v_inventario_comprometido` por semántica inválida)
         "v_diferencias_resumen",
         "v_descuentos_lineas",
         # 4 VIEWs para el dashboard (montos _num con nombres limpios)
@@ -148,9 +148,10 @@ async def test_views_retiradas_se_dropean(db_path):
 
 @pytest.mark.integration
 async def test_views_son_idempotentes(db_path):
-    """Ejecutar crear_views dos veces produce exactamente 7 VIEWs.
+    """Ejecutar crear_views dos veces produce exactamente 6 VIEWs.
 
-    7 = 3 analíticas + 4 del dashboard (eran 12 hasta DEC-065).
+    6 = 2 analíticas + 4 del dashboard. Eran 12 hasta DEC-065 y 7 hasta
+    DEC-103, que retiró `v_inventario_comprometido`.
     """
     async with aiosqlite.connect(db_path) as db:
         await normalizar_montos(db)  # ← obligatorio primero
@@ -161,68 +162,7 @@ async def test_views_son_idempotentes(db_path):
                 await db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='view'")
             ).fetchone()
         )[0]
-    assert count == 7
-
-
-# ── FIX C-4 (auditoría 2026-07-01) — COALESCE en cantidad_pendiente ────────────
-
-
-@pytest.mark.integration
-async def test_inventario_pendiente_incluye_entregada_null(db_path):
-    """FIX C-4: una línea con cantidad_entregada NULL (aún sin entrega
-    registrada) aporta su cantidad_comprada completa a cantidad_pendiente.
-
-    Antes del fix, x - NULL = NULL y SUM ignoraba la fila entera:
-    el KPI "Pendiente" subcontaba exactamente las líneas pendientes.
-    """
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute(
-            "INSERT INTO pedidos (id_pedido, fecha, scraping_completo) "
-            "VALUES ('TEST-C4', '2026-06-01', 1)"
-        )
-        await db.execute(
-            "INSERT INTO subpedidos "
-            "(id_pedido, numero_subpedido, tipo_subpedido, estado) "
-            "VALUES ('TEST-C4', 'SUB-C4', 'Normal', 'Pendiente de entrega')"
-        )
-        # Línea 1: sin entrega registrada (NULL) — debe aportar 10 pendientes
-        await db.execute(
-            "INSERT INTO lineas_pedido "
-            "(id_pedido, numero_subpedido, nombre_producto, referencia, "
-            "codigo_barras, presentacion, almacen, "
-            "cantidad_comprada, cantidad_entregada) "
-            "VALUES ('TEST-C4', 'SUB-C4', 'Producto C4', 'REF-C4', "
-            "'7700000000C4', 'Unidad', 'Almacén Test', 10.0, NULL)"
-        )
-        # Línea 2: entrega parcial — debe aportar 6 pendientes
-        await db.execute(
-            "INSERT INTO lineas_pedido "
-            "(id_pedido, numero_subpedido, nombre_producto, referencia, "
-            "codigo_barras, presentacion, almacen, "
-            "cantidad_comprada, cantidad_entregada) "
-            "VALUES ('TEST-C4', 'SUB-C4', 'Producto C4', 'REF-C4', "
-            "'7700000000C4', 'Unidad', 'Almacén Test', 10.0, 4.0)"
-        )
-        await db.commit()
-
-        await normalizar_montos(db)  # ← obligatorio primero
-        await crear_views(db)
-
-        row = await (
-            await db.execute(
-                "SELECT cantidad_comprometida_total, cantidad_entregada_total, "
-                "cantidad_pendiente "
-                "FROM v_inventario_comprometido WHERE referencia = 'REF-C4'"
-            )
-        ).fetchone()
-
-    assert row is not None, "la línea no entró a v_inventario_comprometido"
-    assert row[0] == 20.0  # 10 + 10 compradas
-    assert row[1] == 4.0  # solo la entrega registrada
-    assert row[2] == 16.0  # 10 (NULL→0) + 6 — antes del fix daba 6
-
-
-# ── DEC-021 Fase 6 — pedidos sin subpedidos: invisibles pero reportados ────────
+    assert count == 6
 
 
 @pytest.mark.integration
@@ -488,13 +428,13 @@ async def test_lector_concurrente_no_ve_ventana_sin_views(db_path):
             await asyncio.wait_for(tarea, timeout=30)
             db.execute = orig_execute  # type: ignore[method-assign]
 
-        # Tras el COMMIT, las 7 views recreadas quedan visibles.
+        # Tras el COMMIT, las 6 views recreadas quedan visibles.
         count = (
             await (
                 await db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='view'")
             ).fetchone()
         )[0]
-    assert count == 7
+    assert count == 6
 
 
 # ── E-3 + E-4 / DEC-020 — métricas veraces y fin del retrabajo ─────────────────

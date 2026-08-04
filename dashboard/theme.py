@@ -90,7 +90,7 @@ def inject_global_css() -> None:
     """
     Inyecta el CSS que aplica la identidad visual a toda la app: fondo con
     degradado navy, sidebar en navy profundo, tipografía en blanco/opacidades
-    y una clase `.dp-card` reutilizable para las futuras tarjetas de KPIs
+    y los estilos base de tipografía y superficies
     y gráficos.
 
     Llamar una sola vez, en `app.py`, inmediatamente después de
@@ -145,26 +145,7 @@ def inject_global_css() -> None:
         }}
 
         /* Tarjeta base reutilizable para KPIs y gráficos */
-        .dp-card {{
-            background-color: {BG_DEEP};
-            border: 1px solid {BORDER_SUBTLE};
-            border-radius: {CARD_RADIUS};
-            padding: {CARD_PADDING};
-            height: 100%;
-        }}
-        .dp-card-label {{
-            color: {TEXT_SECONDARY};
-            font-size: 0.8rem;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            margin-bottom: 0.4rem;
-        }}
-        .dp-card-value {{
-            color: {TEXT_PRIMARY};
-            font-size: 2rem;
-            font-weight: 700;
-            line-height: 1.2;
-        }}
+
         </style>
         """,
         unsafe_allow_html=True,

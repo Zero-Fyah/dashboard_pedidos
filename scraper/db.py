@@ -285,6 +285,15 @@ async def init_db(db_path: str) -> None:
             "CREATE INDEX IF NOT EXISTS idx_detalle_dif_pedido  ON detalle_diferencias(id_pedido)",
             "CREATE INDEX IF NOT EXISTS idx_registro_ops_pedido ON registro_operaciones(id_pedido)",
             "CREATE INDEX IF NOT EXISTS idx_pedidos_scraping    ON pedidos(scraping_completo)",
+            # DEC-096: `timeline_pedido` era la única tabla grande sin ningún
+            # índice, y la causa era circular — nadie la consultaba, así que
+            # nadie lo necesitó (la auditoría de DEC-094 la encontró con 0
+            # consumidores). Al conectarla al dashboard, la consulta de ciclo
+            # de vida tardaba 10,4 s. Con estos dos + el reescrito a GROUP BY
+            # baja a 2,0 s. El compuesto sirve para "último paso del pedido";
+            # el de título, para filtrar por estado (`Recibido y recibido`).
+            "CREATE INDEX IF NOT EXISTS idx_timeline_pedido_paso ON timeline_pedido(id_pedido, paso)",
+            "CREATE INDEX IF NOT EXISTS idx_timeline_titulo      ON timeline_pedido(titulo)",
         ):
             await db.execute(ddl_idx)
         await db.commit()

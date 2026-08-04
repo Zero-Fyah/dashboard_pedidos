@@ -68,38 +68,6 @@ def _num_cols_exist() -> bool:
         return False
 
 
-@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def _view_consolidado_exists() -> bool:
-    if not DB_PATH.exists():
-        return False
-    try:
-        con = sqlite3.connect(DB_PATH, timeout=5)
-        exists = (
-            con.execute(
-                "SELECT COUNT(*) FROM sqlite_master "
-                "WHERE type='view' AND name='v_inventario_comprometido'"
-            ).fetchone()[0]
-            > 0
-        )
-        con.close()
-        return exists
-    except Exception:
-        return False
-
-
-COLS_CONSOLIDADO = [
-    "Producto",
-    "Referencia",
-    "Presentación",
-    "Almacén",
-    "Estado subpedido",
-    "Comprometido",
-    "Entregado",
-    "Pendiente",
-    "Pedidos con stock",
-]
-
-
 def _check_db() -> None:
     if not DB_PATH.exists():
         raise FileNotFoundError(
@@ -160,6 +128,41 @@ def get_opciones_filtro() -> tuple[list[str], list[str], list[str], list[str]]:
     finally:
         con.close()
     return ["Todos", "Abiertos", "Cerrados"], estados, almacenes, tipos
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_opciones_comerciales() -> dict[str, list[str]]:
+    """Valores disponibles para los filtros globales (DEC-101).
+
+    Se excluyen los placeholders del origen (`-`, vacío) porque ofrecerlos como
+    opción de filtro no sirve para nada: nadie quiere ver "los pedidos cuyo
+    vendedor es un guion".
+
+    Returns:
+        Un dict listo para `filtros.barra_lateral()`, con las cuatro
+        dimensiones ordenadas alfabéticamente.
+    """
+    con = _conn()
+    try:
+        columnas = {
+            "vendedores": "vendedor",
+            "clientes": "nombre_empresa",
+            "canales": "metodo_entrega",
+            "formas_pago": "forma_pago",
+        }
+        salida: dict[str, list[str]] = {}
+        for clave, col in columnas.items():
+            salida[clave] = [
+                r[0]
+                for r in con.execute(
+                    f"SELECT DISTINCT {col} FROM pedidos "  # noqa: S608
+                    f"WHERE {col} IS NOT NULL AND TRIM({col}) NOT IN ('', '-') "
+                    f"ORDER BY {col}"
+                )
+            ]
+    finally:
+        con.close()
+    return salida
 
 
 def _objeto_existe(nombre: str, tipo: str = "table") -> bool:
@@ -373,7 +376,13 @@ def get_despacho_faltantes(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
                                    AND s.numero_subpedido = l.numero_subpedido
                   JOIN pedidos p    ON p.id_pedido = l.id_pedido
                  WHERE LOWER(s.estado) IN ({_despachados})
-                   AND l.cantidad_entregada < l.cantidad_comprada
+                   -- DEC-103: COALESCE obligatorio. `NULL < 10` no es true, así
+                   -- que una línea de la que no se entregó **nada** quedaría
+                   -- fuera del listado de faltantes — el peor lugar donde
+                   -- perderla. Es el mismo FIX C-4 de 2026-07-01, que vivía en
+                   -- `v_inventario_comprometido` y se destapó acá al migrar su
+                   -- test en vez de borrarlo con la VIEW.
+                   AND COALESCE(l.cantidad_entregada, 0) < l.cantidad_comprada
                    AND p.fecha BETWEEN ? AND ?""",  # noqa: S608
             con,
             params=(fecha_desde, fecha_hasta),
@@ -407,7 +416,10 @@ def get_despacho_lineas_diario(fecha_desde: str, fecha_hasta: str) -> pd.DataFra
         return pd.read_sql(
             f"""SELECT p.fecha,
                        COUNT(*) AS lineas,
-                       SUM(CASE WHEN l.cantidad_entregada < l.cantidad_comprada
+                       -- DEC-103: sin COALESCE, una línea con entregada NULL
+                       -- cae al ELSE y no se cuenta como faltante.
+                       SUM(CASE WHEN COALESCE(l.cantidad_entregada, 0)
+                                     < l.cantidad_comprada
                                 THEN 1 ELSE 0 END) AS lineas_con_faltante,
                        SUM(l.cantidad_comprada) AS unidades_pedidas,
                        SUM(l.cantidad_comprada - COALESCE(l.cantidad_entregada, 0))
@@ -420,6 +432,648 @@ def get_despacho_lineas_diario(fecha_desde: str, fecha_hasta: str) -> pd.DataFra
                    AND p.fecha BETWEEN ? AND ?
               GROUP BY p.fecha
               ORDER BY p.fecha""",  # noqa: S608
+            con,
+            params=(fecha_desde, fecha_hasta),
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_entregas(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+    """Compromiso de entrega contra entrega real — la mitad *on time* (DEC-095).
+
+    `CLAUDE.md` daba esta mitad de E.1 por imposible "sin fecha comprometida en
+    el origen". El compromiso está en `pedidos.hora_entrega` desde siempre
+    (DEC-093) y la entrega real en el evento `Entrega` de
+    `registro_operaciones`; nadie los había cruzado.
+
+    **El evento de entrega está validado contra el origen** (DEC-094): coincide
+    al segundo en 3 de 3 pedidos sondeados, no se marca en lote —se distribuye
+    como jornada real, 1 evento en domingo sobre 25.495— y su tiempo
+    envío→entrega se separa por canal como manda la física (Ruta 2,0 d,
+    Transportadora 5,0 d). No es un sello administrativo.
+
+    Se toma `MIN(momento)`: 1.685 pedidos tienen más de un evento `Entrega`
+    —reintentos tras una entrega fallida— y lo que se mide es cuándo llegó, no
+    cuántas veces se intentó.
+
+    El `LEFT JOIN` contra la entrega es deliberado: un pedido **prometido y no
+    entregado** es el caso accionable de hoy, y un `INNER JOIN` lo borraría.
+
+    La clasificación no se hace acá sino en `comun.entregas`, que es puro y
+    testeable; esta capa solo trae el texto crudo del compromiso y el contexto.
+
+    Args:
+        fecha_desde: Fecha inicial inclusive del pedido (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive.
+
+    Returns:
+        Una fila por pedido con el compromiso sin parsear, el momento de
+        entrega (NaN si no hay), las reprogramaciones y el valor del pedido.
+    """
+    if not _objeto_existe("registro_operaciones"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """SELECT p.id_pedido,
+                      p.fecha,
+                      p.metodo_entrega,
+                      p.forma_pago,
+                      p.nombre_empresa,
+                      p.vendedor,
+                      p.hora_entrega,
+                      p.despachador,
+                      e.entregado_en,
+                      COALESCE(u.reprogramaciones, 0) AS reprogramaciones,
+                      COALESCE(v.valor, 0)            AS valor
+                 FROM pedidos p
+                 LEFT JOIN (
+                     SELECT id_pedido, MIN(momento) AS entregado_en
+                       FROM registro_operaciones
+                      WHERE accion = 'Entrega'
+                   GROUP BY id_pedido
+                 ) e ON e.id_pedido = p.id_pedido
+                 LEFT JOIN (
+                     SELECT id_pedido, COUNT(*) AS reprogramaciones
+                       FROM registro_operaciones
+                      WHERE accion = 'Actualizar hora de entrega'
+                   GROUP BY id_pedido
+                 ) u ON u.id_pedido = p.id_pedido
+                 LEFT JOIN (
+                     SELECT id_pedido, MAX(monto_final_num) AS valor
+                       FROM estadisticas_monto
+                      WHERE concepto_base = 'Total a pagar / Total final a pagar'
+                   GROUP BY id_pedido
+                 ) v ON v.id_pedido = p.id_pedido
+                WHERE p.scraping_completo = 1
+                  AND p.fecha BETWEEN ? AND ?""",
+            con,
+            params=(fecha_desde, fecha_hasta),
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_scorecard() -> dict[str, float | None]:
+    """Cifras de pedidos, servicio y caja para la portada (DEC-102).
+
+    El scorecard tenía **siete métricas y las siete eran de inventario**,
+    ignorando 29.931 pedidos, $84.088 M y 227.666 eventos operacionales.
+
+    **Por qué una consulta propia y no reusar las de las páginas de detalle.**
+    Reusarlas costaba 6,6 s en frío —`get_entregas` 3,1 s, `get_ciclo_pedidos`
+    2,4 s— y la portada es lo primero que se abre, sin caché caliente. Esta
+    consulta agrega en SQL y tarda una fracción.
+
+    **El riesgo de esa decisión es el que DEC-067 documentó**: dos definiciones
+    del mismo indicador que divergen en silencio (155 contra 81 quiebres, 1.817
+    contra 1.516 posiciones). Por eso cada cifra usa **exactamente el mismo
+    predicado** que su página de detalle, y `test_scorecard_coincide_con_detalle`
+    lo verifica contra las funciones reales. Si alguien cambia una definición y
+    no la otra, la suite cae.
+
+    El *on time* se calcula como `DATE(entrega) <= SUBSTR(hora_entrega, 1, 10)`,
+    que es la traducción literal de `comun.entregas.clasificar_por_dia()` y
+    funciona con los dos formatos fechados porque ambos empiezan por
+    `YYYY-MM-DD`. Verificado: **1.809 de 20.069 por las dos vías**.
+
+    Returns:
+        Dict con las cifras. Un valor `None` significa "no medible", nunca cero.
+    """
+    con = _conn()
+    try:
+        fila = con.execute(
+            f"""SELECT
+                  (SELECT COUNT(*) FROM (
+                      SELECT id_pedido FROM subpedidos GROUP BY id_pedido
+                       HAVING SUM(CASE WHEN LOWER(estado) NOT IN ({_cerr})
+                                  THEN 1 ELSE 0 END) > 0
+                  ))                                                AS abiertos,
+                  (SELECT COALESCE(SUM(v.valor), 0) FROM (
+                      SELECT id_pedido FROM subpedidos GROUP BY id_pedido
+                       HAVING SUM(CASE WHEN LOWER(estado) NOT IN ({_cerr})
+                                  THEN 1 ELSE 0 END) > 0
+                   ) a
+                   JOIN (SELECT id_pedido, MAX(monto_final_num) AS valor
+                           FROM estadisticas_monto
+                          WHERE concepto_base = 'Total a pagar / Total final a pagar'
+                       GROUP BY id_pedido) v ON v.id_pedido = a.id_pedido)
+                                                                    AS valor_retenido,
+                  (SELECT COUNT(*) FROM pedidos
+                    WHERE scraping_completo = 1)                    AS pedidos_total,
+                  (SELECT SUM(CASE WHEN hay_diferencia = 1 THEN 1 ELSE 0 END)
+                     FROM pedidos WHERE scraping_completo = 1)      AS pedidos_con_faltante,
+                  (SELECT COUNT(*) FROM pedidos p
+                     JOIN (SELECT id_pedido, MIN(momento) AS m FROM registro_operaciones
+                            WHERE accion = 'Entrega' GROUP BY id_pedido) e
+                       ON e.id_pedido = p.id_pedido
+                    WHERE p.hora_entrega LIKE '____-__-__%')        AS entregas_medibles,
+                  (SELECT SUM(CASE WHEN DATE(e.m) <= SUBSTR(p.hora_entrega, 1, 10)
+                                   THEN 1 ELSE 0 END)
+                     FROM pedidos p
+                     JOIN (SELECT id_pedido, MIN(momento) AS m FROM registro_operaciones
+                            WHERE accion = 'Entrega' GROUP BY id_pedido) e
+                       ON e.id_pedido = p.id_pedido
+                    WHERE p.hora_entrega LIKE '____-__-__%')        AS entregas_a_tiempo
+            """  # noqa: S608
+        ).fetchone()
+    finally:
+        con.close()
+
+    abiertos, valor, total, con_falt, medibles, a_tiempo = fila
+    return {
+        "pedidos_abiertos": abiertos or 0,
+        "valor_retenido": valor or 0.0,
+        "fill_rate": (100.0 * (total - (con_falt or 0)) / total) if total else None,
+        "on_time": (100.0 * (a_tiempo or 0) / medibles) if medibles else None,
+        "entregas_medibles": medibles or 0,
+    }
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_riesgo_por_referencia() -> pd.DataFrame:
+    """Venta diaria en riesgo por referencia, para valorizar las alertas (DEC-102).
+
+    **El precio no puede salir de `inventario_salud`.** Ahí `valor_venta` es el
+    valor del stock, y una referencia en quiebre tiene stock cero: las 15 alertas
+    de quiebre traen `valor_venta = 0` y `disponible = 0`, así que dividir una
+    por otra da `NULL`. El precio real sale de `lineas_pedido` — lo que la
+    empresa efectivamente cobra por esa referencia.
+
+    `demanda_diaria × precio_medio` es lo que cuesta **cada día** de quiebre.
+    Reordena las alertas por completo: por unidades la primera es `PS03-85G`
+    (3.104), por plata es `PS13-60U` con **$1,57 M/día**, y `PP129` —0,3
+    unidades diarias a $374 mil— entra al top 3 siendo invisible en el ranking
+    por volumen.
+
+    Returns:
+        Una fila por referencia con demanda diaria, precio medio y riesgo diario.
+    """
+    if not _objeto_existe("inventario_salud"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """SELECT s.referencia,
+                      s.demanda_diaria,
+                      AVG(l.precio_unitario_num)                    AS precio_medio,
+                      s.demanda_diaria * AVG(l.precio_unitario_num) AS riesgo_diario
+                 FROM inventario_salud s
+                 JOIN lineas_pedido l ON l.referencia = s.referencia
+                                     AND l.precio_unitario_num > 0
+             GROUP BY s.referencia, s.demanda_diaria""",
+            con,
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_excepciones(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+    """Excepciones del proceso: faltantes, entregas fallidas y ajustes (DEC-099).
+
+    `registro_operaciones` emite 19 acciones distintas y el dashboard leía
+    cuatro. Las que faltaban describen **lo que sale mal**, que es justo lo que
+    un área de operaciones necesita ver:
+
+    | Acción | Pedidos | Qué es |
+    |---|---|---|
+    | `Alistamiento con faltantes` | 3.605 | la bodega no pudo completar |
+    | `Faltantes aprobados` | 3.606 | alguien aceptó despachar corto |
+    | `Faltantes no aprobados` | 404 | alguien lo rechazó |
+    | `Cancelar entrega` | 316 | la entrega falló |
+    | `Modificar cantidad de entrega manualmente` | 24 | ajuste fuera de proceso |
+
+    El monto sale de `v_gestion_diferencias_num` y el desglose por línea de
+    `v_detalle_diferencias_num` — las dos VIEWs que DEC-065 dio por conectadas
+    sin estarlo (DEC-094, Corrección 2).
+
+    **`Usuario realizó pedido` con `tipo_usuario = 'member'`** marca los pedidos
+    que hizo el cliente y no un vendedor: son **26.892 de 29.931 (89,8%)**, con
+    4.354 usuarios distintos. Es un hecho estructural del canal que no estaba en
+    ninguna pantalla.
+
+    Args:
+        fecha_desde: Fecha inicial inclusive del pedido (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive.
+
+    Returns:
+        Una fila por pedido con las marcas de tiempo de cada excepción, el monto
+        de la diferencia y si lo hizo el cliente.
+    """
+    if not _objeto_existe("v_gestion_diferencias_num", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """WITH ev AS (
+                   SELECT id_pedido,
+                          MIN(CASE WHEN accion = 'Alistamiento con faltantes'
+                              THEN momento END) AS faltante_en,
+                          MIN(CASE WHEN accion = 'Faltantes aprobados'
+                              THEN momento END) AS aprobado_en,
+                          MIN(CASE WHEN accion = 'Faltantes no aprobados'
+                              THEN momento END) AS rechazado_en,
+                          MIN(CASE WHEN accion = 'Cancelar entrega'
+                              THEN momento END) AS entrega_cancelada_en,
+                          MIN(CASE WHEN accion = 'Entrega' THEN momento END) AS entregado_en,
+                          MAX(CASE WHEN accion = 'Entrega' THEN momento END)
+                              AS ultima_entrega_en,
+                          SUM(CASE WHEN accion = 'Modificar cantidad de entrega manualmente'
+                              THEN 1 ELSE 0 END) AS ajustes_manuales,
+                          MAX(CASE WHEN accion = 'Modificar cantidad de entrega manualmente'
+                              THEN usuario END) AS ajustado_por,
+                          MAX(CASE WHEN accion = 'Usuario realizó pedido'
+                                    AND tipo_usuario = 'member'
+                              THEN 1 ELSE 0 END) AS autogestion
+                     FROM registro_operaciones
+                 GROUP BY id_pedido
+               ),
+               lineas_dif AS (
+                   SELECT id_pedido,
+                          COUNT(*)                    AS productos_con_faltante,
+                          GROUP_CONCAT(DISTINCT tipo) AS lineas_afectadas
+                     FROM v_detalle_diferencias_num
+                 GROUP BY id_pedido
+               )
+               SELECT p.id_pedido, p.fecha, p.nombre_empresa, p.metodo_entrega,
+                      p.vendedor, p.forma_pago,
+                      e.faltante_en, e.aprobado_en, e.rechazado_en,
+                      e.entrega_cancelada_en, e.entregado_en, e.ultima_entrega_en,
+                      COALESCE(e.ajustes_manuales, 0) AS ajustes_manuales,
+                      e.ajustado_por,
+                      COALESCE(e.autogestion, 0)      AS autogestion,
+                      g.monto_diferencia,
+                      COALESCE(d.productos_con_faltante, 0) AS productos_con_faltante,
+                      d.lineas_afectadas
+                 FROM pedidos p
+                 -- LEFT y no INNER: 412 pedidos no tienen ninguna fila en
+                 -- `registro_operaciones`, y excluirlos inflaría el porcentaje
+                 -- de autogestión de 89,8% a 91,1% sin que nada lo delate.
+                 LEFT JOIN ev e       ON e.id_pedido = p.id_pedido
+                 LEFT JOIN v_gestion_diferencias_num g ON g.id_pedido = p.id_pedido
+                 LEFT JOIN lineas_dif d                ON d.id_pedido = p.id_pedido
+                WHERE p.fecha BETWEEN ? AND ?""",
+            con,
+            params=(fecha_desde, fecha_hasta),
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_comprometido() -> pd.DataFrame:
+    """Mercancía comprometida en pedidos abiertos, contra el stock (DEC-098).
+
+    Es la "Vista de inventario comprometido" que `integral.md` pide desde el
+    primer día — el puente entre pedidos e inventario.
+
+    **No usa `v_inventario_comprometido`, y la razón es un defecto medido.** Esa
+    VIEW calcula `cantidad_comprada − cantidad_entregada` sobre subpedidos
+    **activos**, siguiendo la definición literal de `integral.md`. El problema es
+    que el origen puebla `cantidad_entregada = cantidad_comprada` desde el
+    momento en que se crea la línea: en subpedidos abiertos **el 99,3% de las
+    líneas tiene las dos cantidades iguales**, y `cantidades_definitivas` vale 0
+    en 2.081 de 2.085 subpedidos activos —el propio scraper sabe que esas
+    cantidades no son finales—.
+
+    Consecuencia medida: la VIEW reporta **251 unidades pendientes** cuando el
+    comprometido real de los 1.812 pedidos abiertos es de **497.929**. La resta
+    solo tiene sentido en subpedidos ya despachados, que es donde sí la usa el
+    fill rate (DEC-069); sobre los abiertos da casi cero siempre.
+
+    Acá se toma `cantidad_comprada` de los subpedidos abiertos, que es lo que la
+    bodega tiene efectivamente reservado.
+
+    Returns:
+        Una fila por referencia con lo comprometido, el stock disponible, el
+        faltante para cubrirlo y su estado de salud. Vacío si falta el ETL.
+    """
+    if not _objeto_existe("v_lineas_pedido_num", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            f"""WITH comprometido AS (
+                    SELECT l.referencia,
+                           MIN(l.nombre_producto)      AS producto,
+                           COUNT(*)                    AS lineas,
+                           COUNT(DISTINCT l.id_pedido) AS pedidos,
+                           SUM(l.cantidad_comprada)    AS comprometido,
+                           SUM(l.monto_final)          AS valor
+                      FROM v_lineas_pedido_num l
+                      JOIN subpedidos s ON s.id_pedido        = l.id_pedido
+                                       AND s.numero_subpedido = l.numero_subpedido
+                     WHERE LOWER(s.estado) NOT IN ({_cerr})
+                       AND l.nombre_producto IS NOT NULL
+                       AND l.nombre_producto <> ''
+                  GROUP BY l.referencia
+                )
+                SELECT c.referencia,
+                       c.producto,
+                       c.lineas,
+                       c.pedidos,
+                       c.comprometido,
+                       c.valor,
+                       sa.disponible,
+                       sa.estado    AS estado_salud,
+                       sa.familia,
+                       MAX(c.comprometido - COALESCE(sa.disponible, 0), 0) AS faltante
+                  FROM comprometido c
+                  LEFT JOIN inventario_salud sa ON sa.referencia = c.referencia""",  # noqa: S608
+            con,
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_ventas(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+    """Facturación por pedido, con su descomposición monetaria (DEC-097).
+
+    Sale de `v_estadisticas_monto_num`, una de las dos VIEWs que DEC-065 dejó
+    **reservadas con decisión escrita** y que el ETL venía reconstruyendo cada
+    hora sin ningún consumidor. Los 15 conceptos tienen cobertura del 100% de
+    los pedidos.
+
+    **`cancelado` no es opcional.** De los $84.093 M facturados, **$11,9 mil
+    millones (14,1%) son pedidos cuyos subpedidos están todos cancelados**.
+    Publicar el bruto como "ventas" sobreestimaría la facturación en un 14%, así
+    que la columna viaja con los datos y la página parte las dos cifras. Se
+    marca cancelado solo cuando **todos** los subpedidos lo están: hay 131
+    pedidos parcialmente cancelados que no son ni una cosa ni la otra.
+
+    Se usa `monto_final` y no `monto_pagar`: el primero es lo que quedó después
+    de los faltantes de despacho, o sea lo realmente facturado.
+
+    Args:
+        fecha_desde: Fecha inicial inclusive del pedido (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive.
+
+    Returns:
+        Una fila por pedido con vendedor, cliente, canal y los cinco montos que
+        componen la factura.
+    """
+    if not _objeto_existe("v_estadisticas_monto_num", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """WITH cancelado AS (
+                   SELECT id_pedido
+                     FROM subpedidos
+                 GROUP BY id_pedido
+                   HAVING SUM(CASE WHEN LOWER(estado) = 'cancelado' THEN 1 ELSE 0 END)
+                          = COUNT(*)
+               ),
+               montos AS (
+                   SELECT id_pedido,
+                          MAX(CASE WHEN concepto_base =
+                                'Total a pagar / Total final a pagar'
+                              THEN monto_final END) AS total,
+                          MAX(CASE WHEN concepto_base = 'Total antes de IVA'
+                              THEN monto_final END) AS antes_iva,
+                          MAX(CASE WHEN concepto_base = 'Total precio original'
+                              THEN monto_final END) AS precio_lista,
+                          MAX(CASE WHEN concepto_base = 'Total descuento'
+                              THEN monto_final END) AS descuento,
+                          MAX(CASE WHEN concepto_base = 'Total IVA'
+                              THEN monto_final END) AS iva
+                     FROM v_estadisticas_monto_num
+                 GROUP BY id_pedido
+               )
+               SELECT p.id_pedido, p.fecha, p.vendedor, p.nombre_empresa, p.nit,
+                      p.metodo_entrega, p.forma_pago,
+                      CASE WHEN x.id_pedido IS NOT NULL THEN 1 ELSE 0 END AS cancelado,
+                      m.total, m.antes_iva, m.precio_lista, m.descuento, m.iva
+                 FROM pedidos p
+                 JOIN montos m     ON m.id_pedido = p.id_pedido
+                 LEFT JOIN cancelado x ON x.id_pedido = p.id_pedido
+                WHERE p.fecha BETWEEN ? AND ?""",
+            con,
+            params=(fecha_desde, fecha_hasta),
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_ventas_por_linea(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+    """Mix por línea de producto, desde `lineas_pedido.tipo` (DEC-097).
+
+    **No se deriva del IVA.** Esa vía parecía natural —el origen publica `IVA
+    arena para gatos`, `IVA accesorios` e `IVA alimentos`— pero solo cubre el
+    **75,4%** de la base antes de IVA: el 24,6% restante es producto sin IVA que
+    no queda atribuido a ninguna línea. `lineas_pedido.tipo` trae las mismas
+    tres categorías **al 100% y a nivel de línea**, sin dividir por una tasa.
+
+    Tampoco se usa `familia`: es un código de bodega (PS, PA, PB…), no una
+    categoría comercial, y cubre apenas el 28% del valor.
+
+    Los pedidos totalmente cancelados quedan fuera, igual que en `get_ventas()`.
+
+    Args:
+        fecha_desde: Fecha inicial inclusive del pedido (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive.
+
+    Returns:
+        Una fila por fecha y línea, con líneas, unidades y valor.
+    """
+    if not _num_cols_exist():
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """WITH cancelado AS (
+                   SELECT id_pedido
+                     FROM subpedidos
+                 GROUP BY id_pedido
+                   HAVING SUM(CASE WHEN LOWER(estado) = 'cancelado' THEN 1 ELSE 0 END)
+                          = COUNT(*)
+               )
+               SELECT p.fecha,
+                      l.tipo                    AS linea,
+                      COUNT(*)                  AS lineas,
+                      SUM(l.cantidad_comprada)  AS unidades,
+                      SUM(l.monto_final_num)    AS valor
+                 FROM lineas_pedido l
+                 JOIN pedidos p        ON p.id_pedido = l.id_pedido
+                 LEFT JOIN cancelado x ON x.id_pedido = l.id_pedido
+                WHERE p.fecha BETWEEN ? AND ?
+                  AND x.id_pedido IS NULL
+             GROUP BY p.fecha, l.tipo""",
+            con,
+            params=(fecha_desde, fecha_hasta),
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_descuentos_por_tipo(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+    """Descuento concedido por tipo, a nivel de línea (DEC-097).
+
+    Sale de `v_descuentos_lineas` (DEC-035), la otra VIEW que el ETL
+    reconstruía cada hora sin consumidor. El `descuento_tipo` es texto compuesto
+    del origen: una línea puede acumular varios (`Almacen9% | Tipo de cambio3%`),
+    y se respeta la combinación tal como viene en vez de partirla — separarla
+    repartiría el monto entre categorías con un criterio inventado.
+
+    Args:
+        fecha_desde: Fecha inicial inclusive del pedido (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive.
+
+    Returns:
+        Una fila por tipo de descuento, con líneas afectadas y monto concedido.
+    """
+    if not _objeto_existe("v_descuentos_lineas", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """SELECT descuento_tipo,
+                      COUNT(*)                      AS lineas,
+                      SUM(monto_descuento_total)    AS monto,
+                      COUNT(DISTINCT id_pedido)     AS pedidos
+                 FROM v_descuentos_lineas
+                WHERE fecha BETWEEN ? AND ?
+             GROUP BY descuento_tipo
+             ORDER BY monto DESC""",
+            con,
+            params=(fecha_desde, fecha_hasta),
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_ciclo_pedidos(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+    """Ciclo de vida de cada pedido, leído del timeline (DEC-096).
+
+    `timeline_pedido` tenía **172.954 filas y cero consumidores** hasta la
+    auditoría de DEC-094. Es la sección 1 de las ocho que captura el scraper y
+    la fuente de la "Vista de ciclos operacionales" que `integral.md` pide desde
+    el principio.
+
+    **El timeline solo registra pasos completados** (`completado = 1` en el
+    100% de las filas) y está en orden cronológico perfecto —cero violaciones
+    sobre 172.954—. De ahí sale la propiedad que hace útil esta consulta: el
+    último paso de un pedido abierto **es su estado actual**, y la antigüedad de
+    ese paso es cuánto lleva ahí parado.
+
+    **Reescrita a `GROUP BY` a propósito.** La versión con
+    `ROW_NUMBER() OVER (PARTITION BY ...)` tardaba 10,4 s: las funciones de
+    ventana no aprovechan el índice. Con el agregado más el
+    `idx_timeline_pedido_paso` que DEC-096 agregó baja a **2,0 s**, con
+    resultado idéntico —verificado con `DataFrame.equals`, no a ojo, igual que
+    en DEC-067—.
+
+    Args:
+        fecha_desde: Fecha inicial inclusive del pedido (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive.
+
+    Returns:
+        Una fila por pedido con su estado actual, cuándo entró en él, cuántos
+        pasos lleva, si sigue abierto y cuándo se entregó (NaN si no).
+    """
+    if not _objeto_existe("timeline_pedido"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            f"""WITH resumen AS (
+                    SELECT id_pedido,
+                           MIN(fecha_hora) AS inicio,
+                           COUNT(*)        AS pasos,
+                           MAX(paso)       AS ultimo_paso
+                      FROM timeline_pedido
+                  GROUP BY id_pedido
+                ),
+                abiertos AS (
+                    SELECT id_pedido
+                      FROM subpedidos
+                  GROUP BY id_pedido
+                    HAVING SUM(CASE WHEN LOWER(estado) NOT IN ({_cerr})
+                                    THEN 1 ELSE 0 END) > 0
+                ),
+                entrega AS (
+                    SELECT id_pedido, MIN(fecha_hora) AS entregado_en
+                      FROM timeline_pedido
+                     WHERE titulo = 'Recibido y recibido'
+                  GROUP BY id_pedido
+                )
+                SELECT r.id_pedido,
+                       pe.fecha,
+                       pe.metodo_entrega,
+                       pe.nombre_empresa,
+                       pe.vendedor,
+                       pe.forma_pago,
+                       t.titulo         AS estado_actual,
+                       r.inicio,
+                       t.fecha_hora     AS ultimo_evento,
+                       r.pasos,
+                       e.entregado_en,
+                       CASE WHEN a.id_pedido IS NOT NULL THEN 1 ELSE 0 END AS abierto,
+                       COALESCE(v.valor, 0) AS valor
+                  FROM resumen r
+                  JOIN timeline_pedido t ON t.id_pedido = r.id_pedido
+                                        AND t.paso      = r.ultimo_paso
+                  JOIN pedidos pe        ON pe.id_pedido = r.id_pedido
+                  LEFT JOIN abiertos a   ON a.id_pedido  = r.id_pedido
+                  LEFT JOIN entrega  e   ON e.id_pedido  = r.id_pedido
+                  LEFT JOIN (
+                      SELECT id_pedido, MAX(monto_final_num) AS valor
+                        FROM estadisticas_monto
+                       WHERE concepto_base = 'Total a pagar / Total final a pagar'
+                    GROUP BY id_pedido
+                  ) v ON v.id_pedido = r.id_pedido
+                 WHERE pe.fecha BETWEEN ? AND ?""",  # noqa: S608
+            con,
+            params=(fecha_desde, fecha_hasta),
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_ciclo_transiciones(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+    """Cuánto tarda cada salto entre dos estados consecutivos (DEC-096).
+
+    Responde "dónde se va el tiempo", que es distinto de "cuánto tarda el
+    pedido": un ciclo de 9 días puede ser diez etapas de un día o una de siete.
+
+    Se devuelven las duraciones crudas y la mediana se calcula en pandas —
+    SQLite no tiene percentiles y la media miente con colas largas como estas
+    (hay transiciones de meses).
+
+    **Un mismo par origen→destino puede repetirse dentro de un pedido**: los de
+    varios subpedidos recorren el timeline más de una vez (hay 3.455 saltos
+    `confirmando → confirmando`). Cada repetición cuenta como una observación,
+    que es lo correcto para medir duración de etapa.
+
+    Args:
+        fecha_desde: Fecha inicial inclusive del pedido (YYYY-MM-DD).
+        fecha_hasta: Fecha final inclusive.
+
+    Returns:
+        Una fila por salto entre pasos consecutivos, con origen, destino y horas.
+    """
+    if not _objeto_existe("timeline_pedido"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            """SELECT a.titulo AS origen,
+                      b.titulo AS destino,
+                      (JULIANDAY(b.fecha_hora) - JULIANDAY(a.fecha_hora)) * 24.0 AS horas
+                 FROM timeline_pedido a
+                 JOIN timeline_pedido b ON b.id_pedido = a.id_pedido
+                                       AND b.paso      = a.paso + 1
+                 JOIN pedidos p         ON p.id_pedido  = a.id_pedido
+                WHERE p.fecha BETWEEN ? AND ?""",
             con,
             params=(fecha_desde, fecha_hasta),
         )
@@ -1317,397 +1971,3 @@ def get_pedidos_consolidado(
     finally:
         con.close()
     return df, agregados
-
-
-@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_consolidado(
-    estados_sub: tuple[str, ...],
-    almacenes: tuple[str, ...],
-) -> pd.DataFrame:
-    con = _conn()
-    try:
-        view_exists = (
-            con.execute(
-                "SELECT COUNT(*) FROM sqlite_master "
-                "WHERE type='view' AND name='v_inventario_comprometido'"
-            ).fetchone()[0]
-            > 0
-        )
-        if not view_exists:
-            return pd.DataFrame(columns=COLS_CONSOLIDADO)
-
-        conditions = ["nombre_producto IS NOT NULL", "nombre_producto != ''"]
-        params: list = []
-
-        if estados_sub:
-            placeholders = ",".join("?" * len(estados_sub))
-            conditions.append(f"estado IN ({placeholders})")
-            params.extend(estados_sub)
-
-        if almacenes:
-            placeholders = ",".join("?" * len(almacenes))
-            conditions.append(f"almacen IN ({placeholders})")
-            params.extend(almacenes)
-
-        where_clause = " AND ".join(conditions)
-
-        sql = f"""
-            SELECT
-                nombre_producto                  AS "Producto",
-                referencia                       AS "Referencia",
-                presentacion                     AS "Presentación",
-                almacen                          AS "Almacén",
-                estado                           AS "Estado subpedido",
-                SUM(cantidad_comprometida_total) AS "Comprometido",
-                SUM(cantidad_entregada_total)    AS "Entregado",
-                SUM(cantidad_pendiente)          AS "Pendiente",
-                SUM(pedidos_activos)             AS "Pedidos con stock"
-            FROM v_inventario_comprometido
-            WHERE {where_clause}
-            GROUP BY nombre_producto, referencia, presentacion, almacen, estado
-            ORDER BY SUM(cantidad_pendiente) DESC
-        """
-
-        df = pd.read_sql_query(sql, con, params=params)
-        return df
-    finally:
-        con.close()
-
-
-@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_pedidos(
-    estado_pedido: str,
-    estados_sub: tuple[str, ...],
-    almacenes: tuple[str, ...],
-) -> pd.DataFrame:
-    filtro_estado_sub_en_join = ""
-    params_join_sub: list = []
-    if estados_sub:
-        placeholders = ",".join("?" * len(estados_sub))
-        filtro_estado_sub_en_join = f"AND s.estado IN ({placeholders})"
-        params_join_sub = list(estados_sub)
-
-    filtro_almacen_en_join = ""
-    params_join_alm: list = []
-    if almacenes:
-        placeholders = ",".join("?" * len(almacenes))
-        filtro_almacen_en_join = f"AND l.almacen IN ({placeholders})"
-        params_join_alm = list(almacenes)
-
-    if estado_pedido == "Abiertos":
-        filtro_estado_pedido = f"""AND EXISTS (
-            SELECT 1 FROM subpedidos s2
-            WHERE s2.id_pedido = p.id_pedido
-              AND LOWER(s2.estado) NOT IN ({_cerr})
-        )"""
-    elif estado_pedido == "Cerrados":
-        filtro_estado_pedido = f"""AND NOT EXISTS (
-            SELECT 1 FROM subpedidos s2
-            WHERE s2.id_pedido = p.id_pedido
-              AND LOWER(s2.estado) NOT IN ({_cerr})
-        )"""
-    else:
-        filtro_estado_pedido = ""
-
-    sql = f"""
-        SELECT
-            p.id_pedido                         AS "ID Pedido",
-            p.fecha                             AS Fecha,
-            p.servicio_cliente                  AS Cliente,
-            p.vendedor                          AS Vendedor,
-            p.forma_pago                        AS "Forma de pago",
-            p.metodo_entrega                    AS "Método entrega",
-            p.destinatario                      AS Destinatario,
-            p.hay_diferencia                    AS _hay_diferencia,
-            COUNT(DISTINCT s.numero_subpedido)  AS Subpedidos,
-            GROUP_CONCAT(DISTINCT s.estado)     AS "Estados subpedidos"
-        FROM pedidos p
-        JOIN subpedidos s ON p.id_pedido = s.id_pedido
-                         {filtro_estado_sub_en_join}
-        JOIN lineas_pedido l ON l.id_pedido = s.id_pedido
-                            AND l.numero_subpedido = s.numero_subpedido
-                            {filtro_almacen_en_join}
-        WHERE p.scraping_completo = 1
-          {filtro_estado_pedido}
-        GROUP BY p.id_pedido
-        ORDER BY p.fecha DESC, p.id_pedido DESC
-    """
-
-    params = params_join_sub + params_join_alm
-    con = _conn()
-    try:
-        df = pd.read_sql_query(sql, con, params=params)
-    finally:
-        con.close()
-    df["⚠ Diferencia"] = df.pop("_hay_diferencia").map({1: "Sí", 0: ""})
-    return df
-
-
-@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_pedidos_activos(
-    estados_sub: tuple[str, ...],
-    almacenes: tuple[str, ...],
-    tipos_sub: tuple[str, ...],
-) -> pd.DataFrame:
-    """Retorna pedidos con al menos un subpedido abierto, con métricas de tiempo.
-
-    Incluye días desde creación (antigüedad) y días desde última actualización
-    (detección de pedidos estancados). Aplica filtros de estado de subpedido,
-    almacén y tipo de subpedido.
-
-    Los filtros determinan qué pedidos aparecen, pero los conteos de subpedidos
-    reflejan siempre el total real del pedido (no solo los subpedidos filtrados).
-
-    Args:
-        estados_sub: Tupla de estados de subpedido a incluir. Vacío = todos.
-        almacenes: Tupla de almacenes a incluir. Vacío = todos.
-        tipos_sub: Tupla de tipos de subpedido a incluir. Vacío = todos.
-
-    Returns:
-        DataFrame con una fila por pedido activo, ordenado por días_abierto DESC.
-    """
-    # Todos los filtros van como EXISTS en WHERE para no distorsionar
-    # los agregados COUNT/SUM que deben reflejar el pedido completo.
-    params: list = []
-
-    filtro_tipo = ""
-    if tipos_sub:
-        placeholders = ",".join("?" * len(tipos_sub))
-        filtro_tipo = f"""AND EXISTS (
-            SELECT 1 FROM subpedidos st
-            WHERE st.id_pedido = p.id_pedido
-              AND st.tipo_subpedido IN ({placeholders})
-        )"""
-        params.extend(tipos_sub)
-
-    filtro_estado = ""
-    if estados_sub:
-        placeholders = ",".join("?" * len(estados_sub))
-        filtro_estado = f"""AND EXISTS (
-            SELECT 1 FROM subpedidos se
-            WHERE se.id_pedido = p.id_pedido
-              AND se.estado IN ({placeholders})
-        )"""
-        params.extend(estados_sub)
-
-    filtro_almacen = ""
-    if almacenes:
-        placeholders = ",".join("?" * len(almacenes))
-        filtro_almacen = f"""AND EXISTS (
-            SELECT 1 FROM lineas_pedido l
-            WHERE l.id_pedido = p.id_pedido
-              AND l.almacen IN ({placeholders})
-        )"""
-        params.extend(almacenes)
-
-    sql = f"""
-        SELECT
-            p.id_pedido                                         AS "ID Pedido",
-            p.fecha                                             AS "Fecha creación",
-            p.servicio_cliente                                  AS "Cliente",
-            p.vendedor                                          AS "Vendedor",
-            p.forma_pago                                        AS "Forma de pago",
-            p.metodo_entrega                                    AS "Método entrega",
-            p.destinatario                                      AS "Destinatario",
-            p.hay_diferencia                                    AS _hay_diferencia,
-            CAST(
-                JULIANDAY({_HOY_CO}) - JULIANDAY(p.fecha)
-                AS INTEGER
-            )                                                   AS "Días abierto",
-            CAST(
-                JULIANDAY({_HOY_CO})
-                - JULIANDAY(DATE(
-                    MIN(CASE
-                        WHEN LOWER(s.estado) NOT IN ({_cerr})
-                        THEN s.estado_cambiado_en
-                        ELSE NULL
-                    END),
-                    '-5 hours'
-                ))
-                AS INTEGER
-            )                                                   AS "Días sin mov.",
-            (
-                SELECT sub2.estado
-                FROM subpedidos sub2
-                WHERE sub2.id_pedido = p.id_pedido
-                  AND LOWER(sub2.estado) NOT IN ({_cerr})
-                ORDER BY sub2.estado_cambiado_en ASC NULLS LAST,
-                         sub2.numero_subpedido   ASC
-                LIMIT 1
-            )                                                   AS "Estado estancado",
-            COUNT(DISTINCT s.numero_subpedido)                  AS "Subpedidos",
-            SUM(CASE WHEN LOWER(s.estado) NOT IN
-                ({_cerr})
-                THEN 1 ELSE 0 END)                              AS "Sub. abiertos",
-            GROUP_CONCAT(DISTINCT s.estado)                     AS "Estados"
-        FROM pedidos p
-        JOIN subpedidos s ON s.id_pedido = p.id_pedido
-        WHERE p.scraping_completo = 1
-          AND EXISTS (
-              SELECT 1 FROM subpedidos s2
-              WHERE s2.id_pedido = p.id_pedido
-                AND LOWER(s2.estado) NOT IN ({_cerr})
-          )
-          {filtro_tipo}
-          {filtro_estado}
-          {filtro_almacen}
-        GROUP BY p.id_pedido
-        ORDER BY CAST(
-            JULIANDAY({_HOY_CO}) - JULIANDAY(p.fecha) AS INTEGER
-        ) DESC, p.id_pedido DESC
-    """
-
-    con = _conn()
-    try:
-        df = pd.read_sql_query(sql, con, params=params)
-    finally:
-        con.close()
-    df["⚠ Dif."] = df.pop("_hay_diferencia").map({1: "Sí", 0: ""})
-    return df
-
-
-@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_detalle_operacional(
-    id_pedido: str,
-    estados_sub: tuple[str, ...],
-    almacenes: tuple[str, ...],
-    tipos_sub: tuple[str, ...],
-) -> pd.DataFrame:
-    """Retorna subpedidos y líneas de un pedido con filtros operacionales.
-
-    Args:
-        id_pedido: ID del pedido a detallar.
-        estados_sub: Tupla de estados de subpedido a incluir. Vacío = todos.
-        almacenes: Tupla de almacenes a incluir. Vacío = todos.
-        tipos_sub: Tupla de tipos de subpedido a incluir. Vacío = todos.
-
-    Returns:
-        DataFrame con una fila por línea de producto, ordenado por subpedido
-        y nombre de producto.
-    """
-    filtro_tipo = ""
-    params_tipo: list = []
-    if tipos_sub:
-        placeholders = ",".join("?" * len(tipos_sub))
-        filtro_tipo = f"AND s.tipo_subpedido IN ({placeholders})"
-        params_tipo = list(tipos_sub)
-
-    filtro_estado = ""
-    params_estado: list = []
-    if estados_sub:
-        placeholders = ",".join("?" * len(estados_sub))
-        filtro_estado = f"AND s.estado IN ({placeholders})"
-        params_estado = list(estados_sub)
-
-    filtro_almacen = ""
-    params_almacen: list = []
-    if almacenes:
-        placeholders = ",".join("?" * len(almacenes))
-        filtro_almacen = f"AND l.almacen IN ({placeholders})"
-        params_almacen = list(almacenes)
-
-    _use_view = _num_cols_exist()
-    _lineas_src = "v_lineas_pedido_num" if _use_view else "lineas_pedido"
-    monto_a_pagar = "l.monto_pagar" if _use_view else "NULL"
-    monto_final = "l.monto_final" if _use_view else "NULL"
-
-    sql = f"""
-        SELECT
-            s.numero_subpedido          AS "Subpedido",
-            s.tipo_subpedido            AS "Tipo",
-            s.estado                    AS "Estado subpedido",
-            s.alistador                 AS "Alistador",
-            s.inspector                 AS "Inspector",
-            l.almacen                   AS "Almacén",
-            l.nombre_producto           AS "Producto",
-            l.referencia                AS "Referencia",
-            l.presentacion              AS "Presentación",
-            l.cantidad_comprada         AS "Comprometido",
-            l.cantidad_entregada        AS "Entregado",
-            (l.cantidad_comprada
-             - l.cantidad_entregada)    AS "Pendiente",
-            {monto_a_pagar}             AS "Monto a pagar",
-            {monto_final}               AS "Monto final",
-            l.observaciones             AS "Observaciones"
-        FROM {_lineas_src} l
-        JOIN subpedidos s
-            ON l.id_pedido = s.id_pedido
-            AND l.numero_subpedido = s.numero_subpedido
-            {filtro_tipo}
-            {filtro_estado}
-        WHERE l.id_pedido = ?
-          {filtro_almacen}
-          AND l.nombre_producto IS NOT NULL
-          AND l.nombre_producto != ''
-        ORDER BY s.numero_subpedido, l.nombre_producto
-    """
-
-    params = params_tipo + params_estado + [id_pedido] + params_almacen
-    con = _conn()
-    try:
-        df = pd.read_sql_query(sql, con, params=params)
-    finally:
-        con.close()
-    return df
-
-
-@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_detalle_pedido(
-    id_pedido: str,
-    estados_sub: tuple[str, ...],
-    almacenes: tuple[str, ...],
-) -> pd.DataFrame:
-    filtro_estado_sub_en_join = ""
-    params_sub: list = []
-    if estados_sub:
-        placeholders = ",".join("?" * len(estados_sub))
-        filtro_estado_sub_en_join = f"AND s.estado IN ({placeholders})"
-        params_sub = list(estados_sub)
-
-    filtro_almacen_en_where = ""
-    params_alm: list = []
-    if almacenes:
-        placeholders = ",".join("?" * len(almacenes))
-        filtro_almacen_en_where = f"AND l.almacen IN ({placeholders})"
-        params_alm = list(almacenes)
-
-    _use_view = _num_cols_exist()
-    _lineas_src = "v_lineas_pedido_num" if _use_view else "lineas_pedido"
-    monto_a_pagar = "l.monto_pagar" if _use_view else "NULL"
-    monto_final = "l.monto_final" if _use_view else "NULL"
-
-    sql = f"""
-        SELECT
-            s.numero_subpedido              AS Subpedido,
-            s.estado                        AS "Estado subpedido",
-            s.alistador                     AS Alistador,
-            s.inspector                     AS Inspector,
-            l.almacen                       AS Almacén,
-            l.nombre_producto               AS Producto,
-            l.referencia                    AS Referencia,
-            l.presentacion                  AS Presentación,
-            l.cantidad_comprada             AS Comprometido,
-            l.cantidad_entregada            AS Entregado,
-            (l.cantidad_comprada
-             - l.cantidad_entregada)        AS Pendiente,
-            {monto_a_pagar}                 AS "Monto a pagar",
-            {monto_final}                   AS "Monto final",
-            l.observaciones                 AS Observaciones
-        FROM {_lineas_src} l
-        JOIN subpedidos s ON l.id_pedido = s.id_pedido
-                         AND l.numero_subpedido = s.numero_subpedido
-                         {filtro_estado_sub_en_join}
-        WHERE l.id_pedido = ?
-          {filtro_almacen_en_where}
-          AND l.nombre_producto IS NOT NULL
-          AND l.nombre_producto != ''
-        ORDER BY s.numero_subpedido, l.nombre_producto
-    """
-
-    params = params_sub + [id_pedido] + params_alm
-    con = _conn()
-    try:
-        df = pd.read_sql_query(sql, con, params=params)
-    finally:
-        con.close()
-    return df
