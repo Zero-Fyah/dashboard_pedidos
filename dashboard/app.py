@@ -85,23 +85,6 @@ paginas: dict[str, list[st.Page]] = {
             title="Consolidado",
             icon=":material/local_shipping:",
         ),
-        st.Page(
-            "pages/ciclo.py",
-            title="Ciclo de vida",
-            icon=":material/timeline:",
-        ),
-    ],
-    "Comercial": [
-        st.Page(
-            "pages/ventas.py",
-            title="Ventas y descuentos",
-            icon=":material/payments:",
-        ),
-        st.Page(
-            "pages/cobranza.py",
-            title="Cobranza y cartera",
-            icon=":material/account_balance:",
-        ),
     ],
     "Inventario": [
         st.Page(
@@ -137,14 +120,40 @@ paginas: dict[str, list[st.Page]] = {
             icon=":material/schedule:",
         ),
         st.Page(
+            "pages/excepciones.py",
+            title="Excepciones del proceso",
+            icon=":material/report_problem:",
+        ),
+    ],
+    # DEC-104 — «Fuera del alcance» significa fuera del alcance del ÁREA DE
+    # INVENTARIOS, no fuera del proyecto. El dashboard tiene dos propósitos y
+    # este bloque sirve al segundo: que las demás áreas consulten y analicen
+    # todo lo que el scraping trae, y que de ahí salgan las propuestas de
+    # mejora al sistema administrativo.
+    #
+    # Se separan porque quien trabaja el inventario a diario no debería tener
+    # que filtrar entre pantallas de cartera y de servicio para llegar a su
+    # cola de conteo.
+    "Fuera del alcance": [
+        st.Page(
+            "pages/ciclo.py",
+            title="Ciclo de vida del pedido",
+            icon=":material/timeline:",
+        ),
+        st.Page(
             "pages/entregas.py",
             title="Cumplimiento de entrega",
             icon=":material/local_shipping:",
         ),
         st.Page(
-            "pages/excepciones.py",
-            title="Excepciones del proceso",
-            icon=":material/report_problem:",
+            "pages/ventas.py",
+            title="Ventas y descuentos",
+            icon=":material/payments:",
+        ),
+        st.Page(
+            "pages/cobranza.py",
+            title="Cobranza y cartera",
+            icon=":material/account_balance:",
         ),
     ],
     # A medida que el proyecto evolucione, se agregan aquí nuevas

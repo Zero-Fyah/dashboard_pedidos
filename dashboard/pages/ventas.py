@@ -54,6 +54,18 @@ def _pesos(valor: float) -> str:
 
 st.markdown('<p class="dp-breadcrumb">Dashboard / Comercial</p>', unsafe_allow_html=True)
 st.title("💰 Ventas y descuentos")
+# DEC-104: esta página vive en «Fuera del alcance», que NO quiere decir fuera
+# del proyecto. El dashboard tiene dos propósitos y esta sirve al segundo:
+# consulta y análisis para las demás áreas, y base para las propuestas de
+# mejora al sistema administrativo.
+st.info(
+    "**Fuera del alcance del área de inventarios.** Esta página no es trabajo "
+    "diario de bodega: existe para que las demás áreas consulten y analicen lo "
+    "que el pipeline captura, y para sostener las propuestas de mejora al "
+    "sistema administrativo. Las cifras son igual de válidas que las del resto "
+    "del dashboard.",
+    icon="🧭",
+)
 
 try:
     _min_fecha, _max_fecha = get_rango_fechas()
