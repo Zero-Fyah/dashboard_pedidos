@@ -1,0 +1,39 @@
+# Configuración de Streamlit para acceso remoto por Tailscale (DEC-105).
+#
+# Sin este archivo el dashboard escucha SOLO en localhost y ninguna VPN ni
+# túnel lo alcanza — es el primer motivo por el que "no se ve desde afuera".
+
+[server]
+# Escucha en todas las interfaces. Quien restringe el acceso es el firewall
+# de Windows, que debe permitir el puerto ÚNICAMENTE en el adaptador de
+# Tailscale: así el dashboard queda accesible desde los equipos de la malla
+# y no desde el wifi de la casa ni desde ningún otro lado.
+address = "0.0.0.0"
+port = 8501
+
+# Sin esto Streamlit intenta abrir un navegador al arrancar, que en una tarea
+# programada no tiene sentido y puede dejar el proceso esperando.
+headless = true
+
+# La app es de solo lectura sobre `pedidos.db`; no recibe subidas salvo las
+# hojas de conteo del Plan de conteo, que sí las necesita.
+maxUploadSize = 50
+
+# Protección XSRF activa (default). No se toca: el acceso llega por una IP
+# privada de la malla, no por un dominio, así que no hace falta relajarla.
+
+[browser]
+# Telemetría de uso apagada. La base tiene nombres de clientes, NIT,
+# direcciones y teléfonos — no hay razón para que este proceso hable con
+# servidores externos.
+gatherUsageStats = false
+
+[runner]
+# Vuelve a ejecutar el script cuando cambia un archivo fuente. En la máquina
+# de casa esto es cómodo al desarrollar y no molesta en uso normal.
+fastReruns = true
+
+[client]
+# Los errores se muestran completos: es una herramienta interna y un
+# traceback visible ahorra tener que ir a mirar el log a la otra máquina.
+showErrorDetails = true
