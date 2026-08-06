@@ -3,14 +3,19 @@
 
 # dashboard_pedidos
 
-**Actualizado:** 2026-07-16
+**Actualizado:** 2026-08-05
 
-Scraper asíncrono de pedidos para un sistema administrativo interno (SPA Vue.js + Element Plus)
-de una empresa colombiana que gestiona su propia operación logística. Extrae pedidos, subpedidos,
-líneas de producto, línea de tiempo de alistamiento y registros operacionales; los almacena en
-SQLite en 28 tablas normalizadas y sirve como base de datos para un dashboard de análisis
-operacional. Los datos recopilados servirán como insumo para un futuro sistema de predicción
-de demanda.
+Pipeline de datos en tres etapas para un sistema administrativo interno (SPA Vue.js + Element
+Plus) de una empresa colombiana que gestiona su propia operación logística. Un scraper asíncrono
+extrae pedidos, subpedidos, líneas de producto, línea de tiempo de alistamiento, registros de
+pago y registros operacionales; un ETL los normaliza; y un dashboard de 15 páginas los publica.
+Todo vive en SQLite: **30 tablas y 23 VIEWs**. Los datos recopilados servirán como insumo para
+un futuro sistema de predicción de demanda.
+
+Sobre esa base se construyó además un **módulo de inventario** que cruza el catálogo del sistema
+administrativo, el reporte del sistema de bodega y el layout físico para estimar el inventario
+de picking, y que cierra un ciclo de conteo físico completo (el dashboard emite la hoja, se sube
+contada, el scheduler la ingiere y calcula el IRA).
 
 ---
 
@@ -26,8 +31,8 @@ analítica sobre:
 - **Diferencias en envíos:** frecuencia, montos y productos con mayor incidencia.
 - **Rendimiento por operador:** tiempos y volúmenes por alistador e inspector.
 
-Este scraper extrae esa información de forma automatizada, la normaliza en 28 tablas SQLite
-y la deja lista para análisis y visualización.
+Este pipeline extrae esa información de forma automatizada, la normaliza en 30 tablas SQLite
+y la publica en un dashboard. Corre desatendido cada hora.
 
 ---
 
@@ -69,10 +74,21 @@ scraper/scraper_principal.py
         data/pedidos.db (SQLite · modo WAL)
                 │
                 ▼
-        etl/etl_principal.py   ← normalización de montos + VIEWs analíticas
+   scraper.inventario + scraper.bochica   ← descarga de las dos fuentes de inventario
+                │
+                ▼
+   inventario.persistencia   ← cruce con el layout de bodega y escritura de tablas derivadas
+                │
+                ▼
+        etl/etl_principal.py   ← normalización de montos + VIEWs analíticas + ANALYZE
 ```
 
-El pipeline continúa hacia `dashboard/app.py` (Streamlit), que consume `data/pedidos.db` directamente.
+El mismo `.bat` encadena los cinco pasos en ese orden: el ETL va último para que normalice a
+`_num` todo lo que los pasos anteriores acaban de capturar. Un ciclo completo tarda **41 min de
+mediana** (20 ciclos medidos el 2026-08-05; rango 37,5-46,5 min).
+
+El pipeline termina en `dashboard/app.py` (Streamlit), que consume `data/pedidos.db` **solo por
+lectura** y, salvo excepción medida, a través de VIEWs.
 
 ### Principios de diseño
 
@@ -97,17 +113,24 @@ dashboard_pedidos/
 │   ├── pedidos.db            # Base de datos SQLite
 │   ├── debug/                # HTMLs de debug — pueden contener PII
 │   └── errors/               # Screenshots de errores del scraper
+├── .streamlit/
+│   └── config.toml           # Red, puerto y telemetría del dashboard
 ├── dashboard/                # Etapa 3 — visualización (Streamlit)
 │   ├── __init__.py
 │   ├── app.py                # Entry point: tema + st.navigation
 │   ├── theme.py              # Paleta e inyección de CSS global
 │   ├── db.py                 # Capa de lectura (VIEWs de SQLite)
+│   ├── filtros.py            # Filtros globales compartidos por session_state
 │   ├── tareas_db.py          # Tareas manuales — data/tareas.db
 │   ├── conteos_io.py         # Recibe y archiva las hojas de conteo
-│   ├── components/
-│   └── pages/                # 9 páginas: estado, alertas, pedidos,
-│                             # inventario, salud, ABC-XYZ, mapa,
-│                             # plan de conteo, operación y tareas
+│   └── pages/                # 15 páginas, en cuatro secciones:
+│                             #   inventario → estado del área, alertas, bodega vs.
+│                             #     sistema, salud, ABC-XYZ, mapa, plan de conteo
+│                             #   pedidos    → consolidado, excepciones, productividad
+│                             #   comercial  → ventas, cobranza
+│                             #   fuera del alcance del área → ciclo de vida,
+│                             #     cumplimiento de entrega
+│                             # (+ tareas, que se oculta sola si no hay pendientes)
 ├── inventario/               # Cruce bodega ↔ sistema y plan de conteo
 │   ├── layout.py             # Clasificación de ubicaciones del layout
 │   ├── normalizador.py       # Carga y normalización de las 3 fuentes
@@ -131,11 +154,13 @@ dashboard_pedidos/
 │   ├── __init__.py           # paquete importable por tests/
 │   └── etl_principal.py      # normalización de montos y VIEWs
 ├── logs/                     # Logs de ejecución — gitignored
-├── scraper/                  # Etapa 1 — extracción de datos (paquete de 6 módulos)
+├── scraper/                  # Etapa 1 — extracción de datos (paquete de 9 módulos)
 │   ├── __init__.py           # paquete importable por tests/
 │   ├── archive/              # Versión inicial del scraper — solo referencia
 │   ├── migrations/           # Scripts de migración de única ejecución
-│   │   └── reset_timeline_incompleto.py
+│   │   ├── reset_timeline_incompleto.py
+│   │   ├── corregir_entrega_ruta.py
+│   │   └── separar_descuento_tipo.py
 │   ├── actualizar_pedidos.bat
 │   ├── config.py             # CONFIG, credenciales, locks, rate limit, logging JSONL
 │   ├── db.py                 # esquema SQLite, migraciones y watermark
@@ -143,6 +168,8 @@ dashboard_pedidos/
 │   ├── persistencia.py       # persistencia_worker + helpers transaccionales
 │   ├── workers.py            # selección de modo, scraping por pedido, circuit breaker
 │   ├── orquestador.py        # main(): carriles, dead-letter, resumen y CLI
+│   ├── inventario.py         # descarga del catálogo del sistema administrativo
+│   ├── bochica.py            # descarga del reporte del sistema de bodega
 │   └── scraper_principal.py  # entry point + facade de re-exports
 ├── tests/                    # Suite de tests
 │   ├── conftest.py           # Fixtures y opciones de pytest
@@ -152,6 +179,7 @@ dashboard_pedidos/
 ├── scripts/
 │   ├── hooks/
 │   │   └── pre-commit        # gate: ruff check + format + mypy comun
+│   ├── iniciar_dashboard.bat # arranque del dashboard como tarea de Windows
 │   └── verify_db.py          # utilitario de inspección manual de la DB
 ├── .env                      # Credenciales locales — gitignored
 ├── .env.example              # Plantilla de variables de entorno
@@ -178,6 +206,8 @@ dashboard_pedidos/
 | `gestion_diferencias` | Resumen de diferencias entre lo pedido y lo despachado |
 | `detalle_diferencias` | Desglose por producto de las diferencias detectadas |
 | `registro_operaciones` | Log de acciones realizadas sobre el pedido: quién hizo qué y cuándo |
+| `registros_pago` | Comprobantes de pago: banco, cuenta receptora, monto, revisor y estado de revisión |
+| `catalogo_productos` | Catálogo de productos del sistema administrativo, por producto y almacén |
 | `errores` | Pedidos que fallaron el scraping, disponibles para reintento automático |
 | `meta` | Watermark de la última corrida OK del incremental |
 
@@ -186,6 +216,9 @@ Además, el módulo `inventario/` mantiene sus propias tablas derivadas
 clasificación ABC-XYZ, salud, tiempos de operación, conteos físicos,
 alertas y hallazgos de calidad), todas reconstruidas en cada corrida del
 scheduler salvo las que guardan historia.
+
+En total: **30 tablas y 23 VIEWs**. El dashboard consume las VIEWs como
+contrato de datos estable, no las tablas crudas del scraper.
 
 ---
 
@@ -232,6 +265,11 @@ python scraper/scraper_principal.py --desde 2026-01-01
 # y captura pedidos nuevos desde la última corrida OK
 python scraper/scraper_principal.py --modo incremental
 
+# Modo mantenimiento — re-extrae pedidos entregados cuya información de
+# entrega el origen dejó de renderizar. Selecciona desde la base, no recorre
+# el listado, y no avanza el watermark. Corre el día 1 de cada mes.
+python scraper/scraper_principal.py --modo mantenimiento
+
 # Normalizar montos y crear VIEWs analíticas (como módulo — E-7)
 python -m etl.etl_principal
 
@@ -275,7 +313,15 @@ en una sola pasada de workers paralelos.
 |---|---|
 | Etapa 1 — Scraper (extracción) | ✅ Completa |
 | Etapa 2 — ETL (normalización + VIEWs SQL) | ✅ Completa |
-| Etapa 3 — Dashboard (visualización) | 🔧 En desarrollo (vista de inventario operacional) |
+| Etapa 3 — Dashboard (visualización) | ✅ Construida — 15 páginas |
+| Módulo de inventario (cruce bodega ↔ sistema + ciclo de conteo) | ✅ Construido |
+
+El pipeline corre desatendido cada hora en Windows Task Scheduler y la suite
+tiene **864 tests**.
+
+El dashboard tiene dos propósitos: el trabajo diario del área de inventarios
+—el principal— y la consulta y el análisis general para las demás áreas, que
+además es la base de las propuestas de mejora al sistema administrativo.
 
 ---
 
