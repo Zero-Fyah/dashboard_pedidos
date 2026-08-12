@@ -152,121 +152,130 @@ st.caption(
 )
 
 nivel_1, nivel_2, nivel_3 = st.tabs(
-    ["1 · Familias", "2 · Referencias por familia", "3 · ID por referencia"]
+    ["1 · Familias", "2 · Referencias por familia", "3 · ID por referencia"],
+    on_change="rerun",
 )
 
 # ── Nivel 1 ────────────────────────────────────────────────────────────────────
-with nivel_1:
-    vivas = _con_consumo(familias)
-    st.subheader("ABC-XYZ de las familias completas")
+# on_change="rerun" (H1/H2, auditoría de rendimiento 2026-08-10/12): sin esto,
+# Streamlit computa las 3 pestañas en cada rerun aunque solo una esté visible.
+if nivel_1.open:
+    with nivel_1:
+        vivas = _con_consumo(familias)
+        st.subheader("ABC-XYZ de las familias completas")
 
-    c1, c2 = st.columns([1.3, 1])
-    with c1:
-        orden = vivas.sort_values("valor_consumo", ascending=False)
-        fig = go.Figure()
-        fig.add_bar(
-            x=orden["clave"],
-            y=orden["valor_consumo"],
-            marker_color=GRAFICO_SERIES[0],
-            marker_line=dict(color=BG_DEEP, width=2),
-            marker_cornerradius=4,
-            hovertemplate="<b>%{x}</b><br>%{y:,.0f} de ingreso<extra></extra>",
-        )
-        fig.update_layout(
-            title=dict(text="Ingreso por familia", font=dict(color=TEXT_SECONDARY, size=13)),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color=TEXT_SECONDARY, size=12),
-            margin=dict(l=10, r=10, t=40, b=10),
-            height=260,
-            showlegend=False,
-            bargap=0.35,
-        )
-        fig.update_xaxes(showgrid=False, tickfont=dict(color=TEXT_PRIMARY), automargin=True)
-        fig.update_yaxes(
-            gridcolor=GRAFICO_GRID, zerolinecolor=GRAFICO_GRID, tickformat=",.0f", automargin=True
-        )
-        st.plotly_chart(fig, config={"displayModeBar": False})
-    with c2:
-        _dibujar_matriz(vivas, "Familias por celda")
+        c1, c2 = st.columns([1.3, 1])
+        with c1:
+            orden = vivas.sort_values("valor_consumo", ascending=False)
+            fig = go.Figure()
+            fig.add_bar(
+                x=orden["clave"],
+                y=orden["valor_consumo"],
+                marker_color=GRAFICO_SERIES[0],
+                marker_line=dict(color=BG_DEEP, width=2),
+                marker_cornerradius=4,
+                hovertemplate="<b>%{x}</b><br>%{y:,.0f} de ingreso<extra></extra>",
+            )
+            fig.update_layout(
+                title=dict(text="Ingreso por familia", font=dict(color=TEXT_SECONDARY, size=13)),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color=TEXT_SECONDARY, size=12),
+                margin=dict(l=10, r=10, t=40, b=10),
+                height=260,
+                showlegend=False,
+                bargap=0.35,
+            )
+            fig.update_xaxes(showgrid=False, tickfont=dict(color=TEXT_PRIMARY), automargin=True)
+            fig.update_yaxes(
+                gridcolor=GRAFICO_GRID,
+                zerolinecolor=GRAFICO_GRID,
+                tickformat=",.0f",
+                automargin=True,
+            )
+            st.plotly_chart(fig, config={"displayModeBar": False})
+        with c2:
+            _dibujar_matriz(vivas, "Familias por celda")
 
-    _tabla(familias, "Familia")
+        _tabla(familias, "Familia")
 
 # ── Nivel 2 ────────────────────────────────────────────────────────────────────
-with nivel_2:
-    st.subheader("ABC-XYZ de las referencias, dentro de su familia")
-    disponibles = sorted(referencias["padre"].dropna().unique())
-    familia_sel = st.selectbox("Familia", disponibles, key="fam_n2")
+if nivel_2.open:
+    with nivel_2:
+        st.subheader("ABC-XYZ de las referencias, dentro de su familia")
+        disponibles = sorted(referencias["padre"].dropna().unique())
+        familia_sel = st.selectbox("Familia", disponibles, key="fam_n2")
 
-    del_grupo = referencias[referencias["padre"] == familia_sel]
-    vivas = _con_consumo(del_grupo)
+        del_grupo = referencias[referencias["padre"] == familia_sel]
+        vivas = _con_consumo(del_grupo)
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Referencias", f"{len(del_grupo):,}")
-    k2.metric("Con consumo", f"{len(vivas):,}")
-    k3.metric("Clase A", f"{int((del_grupo['abc'] == 'A').sum()):,}")
-    k4.metric("Ingreso de la familia", f"{del_grupo['valor_consumo'].sum():,.0f}")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Referencias", f"{len(del_grupo):,}")
+        k2.metric("Con consumo", f"{len(vivas):,}")
+        k3.metric("Clase A", f"{int((del_grupo['abc'] == 'A').sum()):,}")
+        k4.metric("Ingreso de la familia", f"{del_grupo['valor_consumo'].sum():,.0f}")
 
-    if vivas.empty:
-        st.info("Ninguna referencia de esta familia registró consumo en la ventana.")
-    else:
-        _dibujar_matriz(vivas, f"Referencias de {familia_sel} por celda")
-        st.caption(
-            "Los porcentajes son sobre el ingreso **de esta familia**: una referencia "
-            "puede ser A acá sin serlo en el total del catálogo."
-        )
-    _tabla(del_grupo, "Referencia")
+        if vivas.empty:
+            st.info("Ninguna referencia de esta familia registró consumo en la ventana.")
+        else:
+            _dibujar_matriz(vivas, f"Referencias de {familia_sel} por celda")
+            st.caption(
+                "Los porcentajes son sobre el ingreso **de esta familia**: una referencia "
+                "puede ser A acá sin serlo en el total del catálogo."
+            )
+        _tabla(del_grupo, "Referencia")
 
 # ── Nivel 3 ────────────────────────────────────────────────────────────────────
-with nivel_3:
-    st.subheader("ABC-XYZ de los ID, dentro de su referencia")
+if nivel_3.open:
+    with nivel_3:
+        st.subheader("ABC-XYZ de los ID, dentro de su referencia")
 
-    con_ids = _con_consumo(ids)
-    por_referencia = con_ids.groupby("padre").agg(
-        ids=("clave", "size"), clases=("abc", "nunique"), celdas=("celda", "nunique")
-    )
-    mixtas = por_referencia[(por_referencia["ids"] > 1) & (por_referencia["clases"] > 1)]
-
-    if len(mixtas):
-        st.warning(
-            f"**{len(mixtas):,} referencias contienen ID de clases ABC distintas** "
-            f"(de {int((por_referencia['ids'] > 1).sum()):,} con más de un ID vendido). "
-            "Como el slotting se hace por referencia, hoy esas variantes comparten una "
-            "misma ubicación lógica aunque roten de forma muy distinta — es exactamente "
-            "el recorrido de picking que se puede acortar bajando el slotting a nivel ID.",
-            icon="🎯",
+        con_ids = _con_consumo(ids)
+        por_referencia = con_ids.groupby("padre").agg(
+            ids=("clave", "size"), clases=("abc", "nunique"), celdas=("celda", "nunique")
         )
+        mixtas = por_referencia[(por_referencia["ids"] > 1) & (por_referencia["clases"] > 1)]
 
-    solo_mixtas = st.checkbox(
-        "Ver solo referencias con ID de clases distintas",
-        value=bool(len(mixtas)),
-        help="Las que más ganarían con un slotting por ID.",
-    )
-    candidatas = sorted(mixtas.index if solo_mixtas else por_referencia.index)
-
-    if not candidatas:
-        st.info("No hay referencias con ID clasificables para este filtro.")
-    else:
-        ref_sel = st.selectbox("Referencia", candidatas, key="ref_n3")
-        del_grupo = ids[ids["padre"] == ref_sel]
-        vivos = _con_consumo(del_grupo)
-
-        k1, k2, k3 = st.columns(3)
-        k1.metric("ID de la referencia", f"{len(del_grupo):,}")
-        k2.metric("Clases ABC distintas", f"{del_grupo['abc'].nunique():,}")
-        k3.metric("Ingreso de la referencia", f"{del_grupo['valor_consumo'].sum():,.0f}")
-
-        if not vivos.empty:
-            _dibujar_matriz(vivos, f"ID de {ref_sel} por celda")
-            st.caption(
-                "Los porcentajes son sobre el ingreso **de esta referencia**. Si los ID "
-                "caen en celdas distintas, conviene asignarles ubicaciones distintas."
+        if len(mixtas):
+            st.warning(
+                f"**{len(mixtas):,} referencias contienen ID de clases ABC distintas** "
+                f"(de {int((por_referencia['ids'] > 1).sum()):,} con más de un ID vendido). "
+                "Como el slotting se hace por referencia, hoy esas variantes comparten una "
+                "misma ubicación lógica aunque roten de forma muy distinta — es exactamente "
+                "el recorrido de picking que se puede acortar bajando el slotting a nivel ID.",
+                icon="🎯",
             )
-        _tabla(del_grupo, "ID de especificación", mostrar_etiqueta=True)
 
-    st.caption(
-        f"Se clasificaron {len(ids):,} ID. La atribución de una venta a un ID usa el par "
-        "referencia/código de barras: **el 80,8% de las líneas resuelve a un ID único**, "
-        "el resto queda sin atribuir porque su par apunta a más de una especificación. "
-        "Esa ambigüedad es una de las tareas de calidad de datos pendientes."
-    )
+        solo_mixtas = st.checkbox(
+            "Ver solo referencias con ID de clases distintas",
+            value=bool(len(mixtas)),
+            help="Las que más ganarían con un slotting por ID.",
+        )
+        candidatas = sorted(mixtas.index if solo_mixtas else por_referencia.index)
+
+        if not candidatas:
+            st.info("No hay referencias con ID clasificables para este filtro.")
+        else:
+            ref_sel = st.selectbox("Referencia", candidatas, key="ref_n3")
+            del_grupo = ids[ids["padre"] == ref_sel]
+            vivos = _con_consumo(del_grupo)
+
+            k1, k2, k3 = st.columns(3)
+            k1.metric("ID de la referencia", f"{len(del_grupo):,}")
+            k2.metric("Clases ABC distintas", f"{del_grupo['abc'].nunique():,}")
+            k3.metric("Ingreso de la referencia", f"{del_grupo['valor_consumo'].sum():,.0f}")
+
+            if not vivos.empty:
+                _dibujar_matriz(vivos, f"ID de {ref_sel} por celda")
+                st.caption(
+                    "Los porcentajes son sobre el ingreso **de esta referencia**. Si los ID "
+                    "caen en celdas distintas, conviene asignarles ubicaciones distintas."
+                )
+            _tabla(del_grupo, "ID de especificación", mostrar_etiqueta=True)
+
+        st.caption(
+            f"Se clasificaron {len(ids):,} ID. La atribución de una venta a un ID usa el par "
+            "referencia/código de barras: **el 80,8% de las líneas resuelve a un ID único**, "
+            "el resto queda sin atribuir porque su par apunta a más de una especificación. "
+            "Esa ambigüedad es una de las tareas de calidad de datos pendientes."
+        )
