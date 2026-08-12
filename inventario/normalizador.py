@@ -69,7 +69,16 @@ def cargar_admin(path: Path) -> pd.DataFrame:
         DataFrame con columnas snake_case; `id_especificacion` (str) es
         la llave de cruce contra `cargar_bochica()`.
     """
-    df = pd.read_excel(path)
+    # dtype=str en esta columna puntual: son enteros de 19 dígitos guardados
+    # como texto en el Excel de origen. Si alguna fila llega sin valor (pasó
+    # el 2026-08-10 con 16 filas de PS12), pandas no puede mezclar int64 con
+    # NaN y sube la columna ENTERA a float64 — un float64 no representa un
+    # entero de 19 dígitos sin perder precisión, así que el resto de los IDs
+    # (buenos) se corrompen a notación científica ('2.08e+18') y el cruce con
+    # Bochica por id_especificacion pasa a matchear cero filas, en silencio.
+    # Forzar el dtype en la lectura evita que la inferencia numérica de
+    # pandas alcance a tocar la columna.
+    df = pd.read_excel(path, dtype={"ID de especificación": str})
     df = df.rename(
         columns={
             "Identificación del producto": "id_producto_admin",

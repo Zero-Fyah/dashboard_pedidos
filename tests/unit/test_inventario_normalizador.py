@@ -53,12 +53,16 @@ _BOCHICA_RAW = pd.DataFrame(
 
 @pytest.fixture
 def admin_read_excel(monkeypatch):
-    monkeypatch.setattr("inventario.normalizador.pd.read_excel", lambda _path: _ADMIN_RAW.copy())
+    monkeypatch.setattr(
+        "inventario.normalizador.pd.read_excel", lambda _path, **_kw: _ADMIN_RAW.copy()
+    )
 
 
 @pytest.fixture
 def bochica_read_excel(monkeypatch):
-    monkeypatch.setattr("inventario.normalizador.pd.read_excel", lambda _path: _BOCHICA_RAW.copy())
+    monkeypatch.setattr(
+        "inventario.normalizador.pd.read_excel", lambda _path, **_kw: _BOCHICA_RAW.copy()
+    )
 
 
 def test_cargar_admin_renombra_columnas_y_castea_id(admin_read_excel):
