@@ -34,6 +34,14 @@ gatherUsageStats = false
 fastReruns = true
 
 [client]
-# Los errores se muestran completos: es una herramienta interna y un
-# traceback visible ahorra tener que ir a mirar el log a la otra máquina.
-showErrorDetails = true
+# Auditoría Zero Trust 2026-08-05, hallazgo C-4: el dashboard NO tiene
+# autenticación, así que un traceback en pantalla entrega rutas absolutas,
+# nombres de tabla y fragmentos de SQL a cualquiera que alcance el puerto.
+#
+# Esto revierte a propósito la comodidad que había antes ("full"). El error
+# NO se pierde: sigue yendo a stderr y de ahí a logs/dashboard_YYYY-MM-DD.log
+# por la redirección de scripts/iniciar_dashboard.bat.
+#
+# Valores de Streamlit 1.59: full | stacktrace | type | none.
+# Volver a "full" solo mientras se depura, y con el dashboard fuera de la malla.
+showErrorDetails = "none"
