@@ -1286,7 +1286,14 @@ _JS_SUBPEDIDOS = """
                 lineas: [],
             });
         } else if (fila.querySelector('td.el-table__expanded-cell') && subpedidos.length > 0) {
-            const prodRows = Array.from(fila.querySelectorAll('div.goods-table-row'));
+            // La fila de resumen ('Total', clase adicional 'summary-row') matchea
+            // el mismo selector de clase que las filas de producto — sin este
+            // filtro se cuela como una línea fantasma con cantidad_comprada
+            // igual a la suma de las demás (hallazgo del Arquitecto, subpedido
+            // 181314, 2026-08-12). Mismo patrón que 'subtotal-row' en
+            // _JS_REGISTROS_PAGO.
+            const prodRows = Array.from(fila.querySelectorAll('div.goods-table-row'))
+                .filter((r) => !r.classList.contains('summary-row'));
             for (const prodRow of prodRows) {
                 const cols = Array.from(prodRow.querySelectorAll('div.goods-col'));
                 const colTxt = (i) => (i < cols.length ? cols[i].textContent.trim() : '');

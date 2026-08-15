@@ -36,6 +36,13 @@ REM ni el scraping de pedidos ni el ETL.
 %PYEXE% -m scraper.inventario >> %LOGFILE% 2>&1
 %PYEXE% -m scraper.bochica >> %LOGFILE% 2>&1
 
+REM TASK-001: captura diaria de "Cambios de inventario". Sin condición de
+REM fecha/hora acá a propósito — el propio módulo decide si ya capturó el
+REM día anterior (ya_capturado()) y termina de inmediato si sí, así que
+REM esta línea puede correr en cualquiera de los ciclos horarios sin
+REM duplicar trabajo ni necesitar que el scheduler acierte una hora exacta.
+%PYEXE% -m scraper.cambios_inventario >> %LOGFILE% 2>&1
+
 REM DEC-043: cruce de inventario y persistencia en pedidos.db. Va después
 REM de las dos descargas (necesita ambos Excel frescos) y con el mismo
 REM criterio de aislamiento: si falla, no bloquea el ETL. El dashboard lee

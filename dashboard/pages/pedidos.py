@@ -4,18 +4,23 @@ Consolidado de pedidos — una fila por línea de pedido (DEC-045).
 Reemplaza la vista operacional anterior (KPIs, tabla de activos y
 drill-downs), que queda recuperable en el historial de git.
 
-La columna "ID del producto" viene de `catalogo_productos`, el puente
+La columna "ID de especificación" viene de `catalogo_productos`, el puente
 `(referencia, código de barras)` → ID que arma `inventario/persistencia.py`
 en cada corrida del scheduler: `lineas_pedido` no guarda ningún ID de
-producto.
+producto. DEC-111: reemplaza a "ID del producto" — `id_especificacion` es
+el identificador único de cada producto (variantes de color/lote incluidas),
+`id_producto` es más agregado. Tiene más líneas vacías que antes porque es
+un dato más fino y por lo tanto más ambiguo por par: medido 2026-08-12,
+9,29% de los pares del admin no resuelven a un único `id_especificacion`
+contra 0,66% que no resolvían a un único `id_producto`.
 """
 
 import sqlite3
-from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 from filtros import aviso_alcance, barra_lateral, recortar
+from tz import a_hora_colombia
 
 from db import (
     get_comprometido,
@@ -35,6 +40,13 @@ LIMITE_FILAS = 50_000
 # Medido: 7 días = 4,4 s · histórico completo = 42,7 s sobre 875.059 líneas.
 # 31 días es el punto donde sigue siendo usable sin volverse un exportador lento.
 DIAS_MAXIMOS = 31
+# DEC-112: ventana inicial de esta página — antes arrancaba con todo el
+# histórico (dias_por_defecto=None), la más lenta de las dos consultas de
+# arriba. Solo aplica "la primera vez de la sesión" (docstring de
+# barra_lateral): si el usuario visita otra página con filtro de fecha antes
+# de entrar acá, el rango compartido ya quedó sembrado con el default de esa
+# otra página y este valor no vuelve a aplicarse.
+DIAS_INICIALES = 15
 
 st.markdown('<p class="dp-breadcrumb">Dashboard / Pedidos</p>', unsafe_allow_html=True)
 st.title("📦 Consolidado de pedidos")
@@ -60,16 +72,14 @@ if not _min_fecha:
     st.stop()
 
 if _ultima:
-    try:
-        _ultima_fmt = datetime.fromisoformat(_ultima).strftime("%Y-%m-%d %H:%M UTC")
-    except ValueError:
-        _ultima_fmt = _ultima
-    st.caption(f"📅 Datos al: {_ultima_fmt}")
+    st.caption(f"📅 Datos al: {a_hora_colombia(_ultima)} (UTC-5)")
 
 # ── Filtros ────────────────────────────────────────────────────────────────────
 # DEC-101: el rango sale del filtro global; los controles propios de esta página
 # son los que ninguna otra usa (almacén y el subfiltro de picking).
-_f = barra_lateral(_min_fecha, _max_fecha, get_opciones_comerciales())
+_f = barra_lateral(
+    _min_fecha, _max_fecha, get_opciones_comerciales(), dias_por_defecto=DIAS_INICIALES
+)
 # Esta es la única página que consulta a nivel de línea sobre las 875.059 de
 # `lineas_pedido`: medido, 7 días cuestan 4,4 s y el histórico completo 42,7 s.
 # El recorte es local — el filtro global del sidebar queda intacto para el resto.
@@ -107,8 +117,9 @@ with col4:
         "Solo previos a picking",
         value=False,
         help=(
-            "Deja únicamente los subpedidos cuyo alistamiento físico todavía no "
-            "terminó. Misma definición que usa el cruce de inventario."
+            "Deja únicamente los subpedidos comprometidos y aún sin alistar: "
+            "Pendiente de pago (pago inmediato), Pendiente de recolección o "
+            "Aprobación de pagos, con alistamiento físico sin terminar (DEC-109)."
         ),
     )
 
@@ -162,8 +173,8 @@ if agg["sin_id"]:
     pct = agg["sin_id"] / agg["lineas"] * 100
     st.caption(
         f"⚠️ {agg['sin_id']:,} de {agg['lineas']:,} líneas ({pct:.1f}%) no tienen ID "
-        "de producto: no están en el catálogo administrativo vigente, o su par "
-        "referencia/código de barras apunta a más de un ID."
+        "de especificación: no están en el catálogo administrativo vigente, o su par "
+        "referencia/código de barras apunta a más de un ID de especificación (DEC-111)."
     )
 
 if agg["lineas"] > len(df):
@@ -179,7 +190,7 @@ st.dataframe(
     column_config={
         "Cantidad comprada": st.column_config.NumberColumn(format="%g"),
         "Pedido padre": st.column_config.TextColumn(width="medium"),
-        "ID del producto": st.column_config.TextColumn(width="medium"),
+        "ID de especificación": st.column_config.TextColumn(width="medium"),
     },
 )
 

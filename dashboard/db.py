@@ -12,9 +12,9 @@ import streamlit as st
 # del script.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from comun import (
-    ESTADOS_ACTIVOS_INVENTARIO,
     ESTADOS_CERRADOS,
     ESTADOS_DESPACHADOS,
+    ESTADOS_PREVIOS_PICKING,
     VIGENCIA_ACTIVO,
 )
 
@@ -25,12 +25,16 @@ _cerr = ",".join(f"'{e}'" for e in sorted(ESTADOS_CERRADOS))
 # DEC-069: cerrados menos cancelado — un subpedido cancelado no salió corto.
 _despachados = ",".join(f"'{e}'" for e in sorted(ESTADOS_DESPACHADOS))
 
-# DEC-045: el subfiltro "previos a picking" replica la definición de
-# DEC-039 pregunta 5 (corregida por HAL-013), que son DOS condiciones:
-# el subpedido está activo para inventario **y** su alistamiento físico no
-# terminó. Con solo `inicio_inspeccion='-'` se colarían los cancelados
-# (5.738 nunca se alistaron porque murieron antes) y algunos completados.
-_activos_inv = ",".join(f"'{e}'" for e in ESTADOS_ACTIVOS_INVENTARIO)
+# DEC-045/DEC-109: el subfiltro "previos a picking" son DOS condiciones: el
+# subpedido está en uno de los 3 estados de ESTADOS_PREVIOS_PICKING **y** su
+# alistamiento físico no terminó. Con solo `inicio_inspeccion='-'` se
+# colarían los cancelados (5.738 nunca se alistaron porque murieron antes) y
+# algunos completados. DEC-109 angostó la lista de estados de las 12 de
+# ESTADOS_ACTIVOS_INVENTARIO a estas 3: "pendiente de entrega" y "en
+# inspección" ya pasaron por alistamiento, y "pendiente de confirmación"
+# todavía no compromete mercancía — ninguno de los tres debería tener nada
+# físicamente en picking.
+_previos_picking = ",".join(f"'{e}'" for e in ESTADOS_PREVIOS_PICKING)
 
 # AUD-B6: Colombia opera en UTC-5 sin horario de verano desde 1993 — un
 # offset fijo es correcto todo el año y no depende de la zona horaria
@@ -1868,13 +1872,15 @@ def get_pedidos_consolidado(
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """Tabla consolidada de líneas de pedido, una fila por línea (DEC-045).
 
-    El `LEFT JOIN` contra `catalogo_productos` aporta el ID del producto,
-    que `lineas_pedido` no tiene. Es LEFT y no INNER a propósito: el 4,1%
-    de líneas sin ID en el catálogo (códigos legados o pares ambiguos)
-    debe seguir viéndose, con el ID vacío, en vez de desaparecer de un
-    consolidado que el analista va a sumar. Y la tabla puente guarda solo
-    pares inequívocos, así que el join **no puede multiplicar filas** —
-    verificado: 840.179 líneas antes y después.
+    El `LEFT JOIN` contra `catalogo_productos` aporta el ID de
+    especificación, que `lineas_pedido` no tiene. Es LEFT y no INNER a
+    propósito: las líneas sin ID en el catálogo (códigos legados, pares con
+    `id_producto` ambiguo, o pares con `id_especificacion` ambiguo —
+    DEC-111) deben seguir viéndose, con el ID vacío, en vez de desaparecer
+    de un consolidado que el analista va a sumar. Y la tabla puente guarda
+    a lo sumo una fila por par `(referencia, código de barras)`, así que el
+    join **no puede multiplicar filas** — verificado: 840.179 líneas antes
+    y después.
 
     Args:
         fecha_desde: Fecha inicial inclusive (YYYY-MM-DD).
@@ -1882,10 +1888,13 @@ def get_pedidos_consolidado(
         estado_pedido: "Todos", "Abiertos" o "Cerrados" — clasifica el
             pedido padre según tenga o no algún subpedido abierto.
         almacenes: Almacenes a incluir; vacío = todos.
-        solo_previos_picking: Si True, deja solo subpedidos cuyo
-            alistamiento físico no terminó (`inicio_inspeccion = '-'`,
-            DEC-039 pregunta 5 corregida por HAL-013) — la misma
-            definición que usa el cruce de inventario.
+        solo_previos_picking: Si True, deja solo subpedidos en uno de los 3
+            estados de `comun.ESTADOS_PREVIOS_PICKING` (comprometidos, sin
+            alistar) y cuyo alistamiento físico no terminó
+            (`inicio_inspeccion = '-'`, DEC-039 pregunta 5 corregida por
+            HAL-013). DEC-109: definición angostada respecto a la que usa
+            el cruce de inventario (`ESTADOS_ACTIVOS_INVENTARIO`, 12
+            estados) — ya no es la misma.
         limite: Máximo de filas a traer. Los agregados se calculan en SQL
             sobre el conjunto completo, no sobre el recorte: mezclar un
             total con métricas derivadas de la muestra daría cifras que
@@ -1915,7 +1924,7 @@ def get_pedidos_consolidado(
         params.extend(almacenes)
 
     if solo_previos_picking:
-        filtros.append(f"LOWER(s.estado) IN ({_activos_inv}) AND s.inicio_inspeccion = '-'")
+        filtros.append(f"LOWER(s.estado) IN ({_previos_picking}) AND s.inicio_inspeccion = '-'")
 
     where = " AND ".join(filtros)
     base = f"""
@@ -1936,7 +1945,7 @@ def get_pedidos_consolidado(
                        COUNT(DISTINCT p.id_pedido),
                        COUNT(DISTINCT l.referencia),
                        COALESCE(SUM(l.cantidad_comprada), 0),
-                       SUM(CASE WHEN c.id_producto IS NULL THEN 1 ELSE 0 END)
+                       SUM(CASE WHEN c.id_especificacion IS NULL THEN 1 ELSE 0 END)
                 {base}""",
             params,
         ).fetchone()
@@ -1956,7 +1965,7 @@ def get_pedidos_consolidado(
                    s.tipo_subpedido     AS "Tipo de subpedido",
                    s.estado             AS "Estado del subpedido",
                    l.almacen            AS "Almacén",
-                   c.id_producto        AS "ID del producto",
+                   c.id_especificacion  AS "ID de especificación",
                    l.referencia         AS "Referencia",
                    l.codigo_barras      AS "Código de barras",
                    l.presentacion       AS "Presentación",

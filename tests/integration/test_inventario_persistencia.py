@@ -454,6 +454,38 @@ def test_catalogo_descarta_pares_ambiguos():
     assert list(puente["referencia"]) == ["PJ91"], "el par ambiguo debe quedar fuera"
 
 
+def test_catalogo_id_especificacion_ambiguo_queda_null():
+    """DEC-111: id_producto único no garantiza id_especificacion único."""
+    from inventario.persistencia import construir_catalogo_productos
+
+    admin = _admin_catalogo(
+        [
+            ("E1", "P1", "PR13", "7700001", "Arena"),
+            ("E2", "P1", "PR13", "7700001", "Arena"),  # mismo par y producto, otra especificación
+        ]
+    )
+    puente = construir_catalogo_productos(admin)
+    assert len(puente) == 1, "el par sigue entrando: id_producto es único"
+    assert puente["id_especificacion"].isna().all(), (
+        "pero id_especificacion queda vacío, no arbitrario"
+    )
+
+
+def test_catalogo_id_especificacion_inequivoco_se_asigna():
+    """Caso normal: mismo par, mismo producto, misma especificación → se puebla."""
+    from inventario.persistencia import construir_catalogo_productos
+
+    admin = _admin_catalogo(
+        [
+            ("E1", "P1", "PR13", "7700001", "Arena"),
+            ("E1", "P1", "PR13", "7700001", "Arena"),
+        ]
+    )
+    puente = construir_catalogo_productos(admin)
+    assert len(puente) == 1
+    assert puente["id_especificacion"].iloc[0] == "E1"
+
+
 def test_catalogo_es_llave_unica_por_par(db):
     """La PK (referencia, codigo_barras) es la garantía de que el join no multiplica."""
     from inventario.persistencia import construir_catalogo_productos

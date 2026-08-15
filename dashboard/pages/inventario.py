@@ -19,11 +19,11 @@ de montacarga se hayan registrado.
 """
 
 import sqlite3
-from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from tz import a_hora_colombia
 
 from db import (
     get_cancelaciones,
@@ -59,17 +59,10 @@ if corrida is None or df.empty:
 
 
 # ── Frescura de las fuentes ────────────────────────────────────────────────────
-def _fmt(iso: object) -> str:
-    try:
-        return datetime.fromisoformat(str(iso)).strftime("%Y-%m-%d %H:%M UTC")
-    except (ValueError, TypeError):
-        return str(iso)
-
-
 st.caption(
-    f"📅 Cruce ejecutado: {_fmt(corrida['ejecutado_en'])} · "
-    f"Sistema administrativo: {_fmt(corrida['admin_actualizado_en'])} · "
-    f"Bochica: {_fmt(corrida['bochica_actualizado_en'])}"
+    f"📅 Cruce ejecutado: {a_hora_colombia(corrida['ejecutado_en'])} · "
+    f"Sistema administrativo: {a_hora_colombia(corrida['admin_actualizado_en'])} · "
+    f"Bochica: {a_hora_colombia(corrida['bochica_actualizado_en'])} (UTC-5)"
 )
 
 if corrida["datos_desactualizados"]:

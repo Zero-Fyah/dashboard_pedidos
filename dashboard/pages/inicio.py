@@ -24,6 +24,7 @@ import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from tz import a_hora_colombia
 
 from comun import META_IRA_POR_CLASE, VIGENCIA_ACTIVO
 from db import (
@@ -90,6 +91,15 @@ criticas = (
 )
 horas_fuente = _valor(corrida, "fuente_mas_vieja_h")
 desactualizado = bool(_valor(corrida, "datos_desactualizados", 0))
+# DEC-109: la hora de la fuente más vieja (admin o Bochica) en vez de las
+# horas transcurridas — mismo dato que fuente_mas_vieja_h, mostrado como
+# reloj. min() porque "más vieja" es la fecha más temprana de las dos.
+_fuentes_ts = [
+    t
+    for t in (_valor(corrida, "admin_actualizado_en"), _valor(corrida, "bochica_actualizado_en"))
+    if t
+]
+fuente_vieja_ts = min(_fuentes_ts) if _fuentes_ts else None
 ira_global = None
 if not ira.empty and "Global" in set(ira["clase"]):
     ira_global = float(ira[ira["clase"] == "Global"].iloc[0]["ira"])
@@ -103,11 +113,17 @@ c1.metric(
     help="Meta: 0. Quiebres de clase A, discrepancias de conteo en clase A y fuentes vencidas.",
 )
 c2.metric(
-    "📅 Frescura de las fuentes",
-    f"{horas_fuente:.1f} h" if horas_fuente is not None else "—",
+    "📅 Última actualización",
+    a_hora_colombia(fuente_vieja_ts) if fuente_vieja_ts else "—",
     delta="Al día" if not desactualizado else "Vencida",
     delta_color="normal" if not desactualizado else "inverse",
-    help="Meta: menos de 3 horas. Por encima, todo lo demás habla del pasado.",
+    help=(
+        "Hora de la fuente más antigua entre admin y Bochica, en hora Colombia (UTC-5). "
+        f"Meta: menos de 3 horas de antigüedad ({horas_fuente:.1f} h ahora)."
+        if horas_fuente is not None
+        else "Hora de la fuente más antigua entre admin y Bochica, en hora Colombia (UTC-5). "
+        "Meta: menos de 3 horas de antigüedad."
+    ),
 )
 if ira_global is not None:
     c3.metric(
@@ -237,6 +253,9 @@ if not corridas.empty and len(corridas) > 2:
     hist = corridas.sort_values("ejecutado_en").copy()
     hist["ejecutado_en"] = pd.to_datetime(hist["ejecutado_en"], errors="coerce", utc=True)
     hist = hist.dropna(subset=["ejecutado_en"])
+    # DEC-109: hora Colombia en el hover — antes se veía UTC crudo sin
+    # ninguna etiqueta de zona horaria (más engañoso que un "UTC" explícito).
+    hist["ejecutado_en"] = hist["ejecutado_en"].dt.tz_convert("Etc/GMT+5")
 
     fig = go.Figure()
     for campo, etiqueta, color in (
@@ -251,7 +270,7 @@ if not corridas.empty and len(corridas) > 2:
                     mode="lines",
                     name=etiqueta,
                     line={"color": color, "width": 2},
-                    hovertemplate="%{x|%d %b %H:%M}<br>%{y:,.0f} unidades<extra>"
+                    hovertemplate="%{x|%d %b %H:%M} (hora Colombia)<br>%{y:,.0f} unidades<extra>"
                     + etiqueta
                     + "</extra>",
                 )

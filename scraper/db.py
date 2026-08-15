@@ -5,10 +5,13 @@ init_db() crea las 10 tablas si no existen; las columnas nuevas se agregan
 con ALTER TABLE tolerante para bases existentes (DEC-013).
 """
 
-import sqlite3
-
 import aiosqlite
 
+from comun import (
+    DDL_ERROR_COLUMNA_DUPLICADA,
+    DDL_ERROR_COLUMNA_INEXISTENTE,
+    ejecutar_ddl_idempotente,
+)
 from scraper.config import log_event
 
 # ─────────────────────────────────────────────
@@ -253,16 +256,11 @@ async def init_db(db_path: str) -> None:
             "ALTER TABLE pedidos ADD COLUMN pago_saldo           TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN pago_progreso        TEXT    DEFAULT NULL",
         ):
-            try:
-                await db.execute(ddl)
-                await db.commit()
-            except sqlite3.OperationalError as exc:
-                # AUD-B8: el único error esperado aquí es que la columna ya
-                # exista (migración ya aplicada). Cualquier otro
-                # OperationalError (DB corrupta, disco lleno, tabla ausente)
-                # debe propagarse, no enmascararse.
-                if "duplicate column name" not in str(exc).lower():
-                    raise
+            # AUD-B8: el único error esperado aquí es que la columna ya
+            # exista (migración ya aplicada). Cualquier otro
+            # OperationalError (DB corrupta, disco lleno, tabla ausente)
+            # se propaga sin enmascarar — ver comun.ejecutar_ddl_idempotente.
+            await ejecutar_ddl_idempotente(db, ddl, DDL_ERROR_COLUMNA_DUPLICADA)
 
         # BUG-004 (confirmado con el Arquitecto 2026-07-22): el timeline es
         # a nivel de pedido padre, no de subpedido — numero_subpedido nunca
@@ -270,12 +268,11 @@ async def init_db(db_path: str) -> None:
         # el schema ya no la crea para DBs nuevas. DROP COLUMN (SQLite ≥
         # 3.35) para las DBs existentes; catch específico de "no such
         # column" para idempotencia (DB ya migrada, o nueva sin la columna).
-        try:
-            await db.execute("ALTER TABLE timeline_pedido DROP COLUMN numero_subpedido")
-            await db.commit()
-        except sqlite3.OperationalError as exc:
-            if "no such column" not in str(exc).lower():
-                raise
+        await ejecutar_ddl_idempotente(
+            db,
+            "ALTER TABLE timeline_pedido DROP COLUMN numero_subpedido",
+            DDL_ERROR_COLUMNA_INEXISTENTE,
+        )
 
         for ddl_idx in (
             "CREATE INDEX IF NOT EXISTS idx_subpedidos_pedido   ON subpedidos(id_pedido)",

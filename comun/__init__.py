@@ -15,7 +15,9 @@ desde estas constantes, el ETL genera los literales SQL de sus VIEWs desde
 ellas y el dashboard deriva sus filtros de las mismas.
 """
 
+import sqlite3
 from pathlib import Path
+from typing import Protocol
 
 # ─────────────────────────────────────────────
 # CONSTANTES DE DOMINIO — estados de subpedido
@@ -75,6 +77,20 @@ ESTADOS_ACTIVOS_INVENTARIO: tuple[str, ...] = (
     # a alistamiento (re-pick); si no aparece, se aprueba el faltante y
     # avanza a inspección. Antes sin clasificar (CLAUDE.md pendiente).
     "auditoría de faltantes",
+)
+
+# Subconjunto de ESTADOS_ACTIVOS_INVENTARIO que el consolidado de Pedidos usa
+# para "Solo previos a picking" (DEC-109, 2026-08-12, decisión del
+# Arquitecto). Antes ese filtro usaba las 12 de ESTADOS_ACTIVOS_INVENTARIO
+# completas; se angosta a las 3 en las que el pedido está comprometido pero
+# la mercancía todavía no se movió de picking — ni "pendiente de entrega" ni
+# "en inspección" (ya pasaron por alistamiento) ni "pendiente de
+# confirmación" (todavía no comprometido) califican. Tupla, no frozenset,
+# mismo motivo que ESTADOS_ACTIVOS_INVENTARIO: SQL determinístico.
+ESTADOS_PREVIOS_PICKING: tuple[str, ...] = (
+    "pendiente de pago (pago inmediato)",
+    "pendiente de recolección",
+    "aprobación de pagos",
 )
 
 # Dominio completo de estados conocidos — para checks defensivos (AUD-M8).
@@ -343,6 +359,64 @@ def get_db_path() -> str:
     path = Path(__file__).parent.parent / "data" / "pedidos.db"
     path.parent.mkdir(parents=True, exist_ok=True)
     return str(path)
+
+
+# ─────────────────────────────────────────────
+# Migraciones SQLite idempotentes (DEC-108)
+# ─────────────────────────────────────────────
+# El patrón "ALTER TABLE ... try/except OperationalError buscando la frase
+# del error esperado" vivía copiado 3 veces (scraper/db.py y dos sitios de
+# etl/etl_principal.py) antes de esta factorización — hallazgo de la
+# auditoría de Skills del 2026-08-12
+# (docs/reports/auditoria_skills_2026-08-12.md), prerrequisito del Skill
+# sqlite-wal-concurrente: documentar un patrón triplicado lo perpetuaría.
+#
+# Protocol en vez de importar aiosqlite: AUD-M5 exige que comun/ no cargue
+# dependencias pesadas ni de terceros — esto solo describe los dos métodos
+# async que la función necesita, sin acoplarse a la librería concreta.
+
+
+class _ConexionAsincrona(Protocol):
+    async def execute(self, sql: str) -> object: ...
+    async def commit(self) -> None: ...
+
+
+# Frases exactas que sqlite3.OperationalError incluye cuando el DDL ya se
+# aplicó antes. La comparación es case-insensitive, pero la frase se guarda
+# una sola vez acá para que no haya una segunda copia que se desalinee.
+DDL_ERROR_COLUMNA_DUPLICADA = "duplicate column name"
+DDL_ERROR_COLUMNA_INEXISTENTE = "no such column"
+
+
+async def ejecutar_ddl_idempotente(db: _ConexionAsincrona, ddl: str, error_esperado: str) -> None:
+    """Ejecuta un DDL (ALTER TABLE...) tolerando que ya se haya aplicado.
+
+    Sin esto, re-ejecutar una migración sobre una base ya migrada revienta
+    con OperationalError. Solo se traga el error si su mensaje contiene
+    `error_esperado` (típicamente DDL_ERROR_COLUMNA_DUPLICADA para ADD
+    COLUMN, o DDL_ERROR_COLUMNA_INEXISTENTE para DROP COLUMN) — cualquier
+    otro OperationalError (DB corrupta, disco lleno, tabla ausente) se
+    propaga sin enmascarar (mismo criterio que AUD-B8).
+
+    Args:
+        db: Conexión aiosqlite abierta (o cualquier objeto con los mismos
+            dos métodos async — no se importa aiosqlite acá, ver AUD-M5).
+        ddl: Sentencia DDL completa a ejecutar, ej.
+            "ALTER TABLE pedidos ADD COLUMN hora TEXT DEFAULT NULL".
+        error_esperado: Fragmento del mensaje de error que indica que la
+            migración ya se aplicó antes (comparación sin distinguir
+            mayúsculas/minúsculas).
+
+    Raises:
+        sqlite3.OperationalError: Si el error no coincide con
+            `error_esperado` — es un fallo real, no idempotencia.
+    """
+    try:
+        await db.execute(ddl)
+        await db.commit()
+    except sqlite3.OperationalError as exc:
+        if error_esperado.lower() not in str(exc).lower():
+            raise
 
 
 # ─────────────────────────────────────────────

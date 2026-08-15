@@ -59,6 +59,7 @@ class ConfigDict(TypedDict):
     url_pedidos: str
     url_detalle: str
     url_inventario: str
+    url_cambios_inventario: str
     usuario: str
     clave: str
     bochica_url: str
@@ -99,6 +100,9 @@ CONFIG: ConfigDict = {
     # DEC-039: pantalla de gestión de inventario del sistema administrativo
     # — flujo de descarga distinto al scraping de pedidos, misma sesión.
     "url_inventario": os.environ.get("SCRAPER_URL_INVENTARIO", ""),
+    # TASK-001: vista "Cambios de inventario" — misma sesión que arriba,
+    # pantalla distinta (log de movimientos, no snapshot de catálogo).
+    "url_cambios_inventario": os.environ.get("SCRAPER_URL_CAMBIOS_INVENTARIO", ""),
     # Credenciales (configuradas via variables de entorno)
     "usuario": os.environ.get("SCRAPER_USUARIO", ""),
     "clave": os.environ.get("SCRAPER_PASSWORD", ""),

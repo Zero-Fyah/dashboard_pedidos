@@ -64,6 +64,10 @@ Thumbs.db
 
 # Configuración local de Claude Code — por máquina, no compartible (DEC-017)
 .claude/settings.local.json
+# Skills atados al proyecto (ej. tailscale-expert) documentan topología real,
+# IPs y postura de seguridad medida — mismo criterio que docs/ abajo: nunca
+# al repo público mientras eso siga siendo cierto (DEC-017).
+.claude/skills/
 
 # Documentación interna de negocio — NO versionar mientras el repo sea público (DEC-017)
 docs/

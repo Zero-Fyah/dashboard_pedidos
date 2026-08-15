@@ -13,7 +13,6 @@ import asyncio
 import json
 import logging
 import re
-import sqlite3
 import sys
 from datetime import datetime, timezone
 
@@ -23,7 +22,9 @@ import aiosqlite
 # carga el scraper (ni Playwright, ni sus efectos secundarios de import).
 from comun import (
     COLUMNAS_GUION_ES_CERO,
+    DDL_ERROR_COLUMNA_DUPLICADA,
     ESTADOS_CONOCIDOS,
+    ejecutar_ddl_idempotente,
     es_placeholder,
     get_db_path,
     normalizar_numerico,
@@ -202,15 +203,12 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
     for tabla, columnas in columnas_por_tabla.items():
         # Paso 1: agregar columnas con ALTER TABLE
         for col_num in columnas.values():
-            try:
-                await db.execute(f"ALTER TABLE {tabla} ADD COLUMN {col_num} REAL")
-                await db.commit()
-            except sqlite3.OperationalError as exc:
-                # Solo "duplicate column name" es esperado (idempotencia);
-                # cualquier otro error (no such table, DB locked, corrupta)
-                # debe fallar aquí y no más adelante en el SELECT.
-                if "duplicate column name" not in str(exc):
-                    raise
+            # Solo "duplicate column name" es esperado (idempotencia);
+            # cualquier otro error (no such table, DB locked, corrupta)
+            # debe fallar aquí y no más adelante en el SELECT.
+            await ejecutar_ddl_idempotente(
+                db, f"ALTER TABLE {tabla} ADD COLUMN {col_num} REAL", DDL_ERROR_COLUMNA_DUPLICADA
+            )
 
         # Paso 2: poblar en batches de 500 filas.
         # Filtra por col_num IS NULL para procesar únicamente
@@ -372,12 +370,11 @@ async def separar_concepto_tasa(db: aiosqlite.Connection) -> None:
         db: Conexión abierta a pedidos.db.
     """
     for columna, tipo_sql in (("concepto_base", "TEXT"), ("tasa_iva", "REAL")):
-        try:
-            await db.execute(f"ALTER TABLE estadisticas_monto ADD COLUMN {columna} {tipo_sql}")
-            await db.commit()
-        except sqlite3.OperationalError as exc:
-            if "duplicate column name" not in str(exc):
-                raise
+        await ejecutar_ddl_idempotente(
+            db,
+            f"ALTER TABLE estadisticas_monto ADD COLUMN {columna} {tipo_sql}",
+            DDL_ERROR_COLUMNA_DUPLICADA,
+        )
 
     last_id = 0
     total = 0

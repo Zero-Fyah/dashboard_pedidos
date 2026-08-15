@@ -81,11 +81,12 @@ _TABLAS = {
     """,
     "catalogo_productos": """
         CREATE TABLE IF NOT EXISTS catalogo_productos (
-            referencia    TEXT NOT NULL,
-            codigo_barras TEXT NOT NULL,
-            id_producto   TEXT NOT NULL,
-            nombre_comercial TEXT,
-            corrida_id    INTEGER,
+            referencia        TEXT NOT NULL,
+            codigo_barras     TEXT NOT NULL,
+            id_producto       TEXT NOT NULL,
+            id_especificacion TEXT,
+            nombre_comercial  TEXT,
+            corrida_id        INTEGER,
             PRIMARY KEY (referencia, codigo_barras)
         )
     """,
@@ -462,7 +463,13 @@ _COLUMNAS_COMPARACION = (
 
 _COLUMNAS_ANOMALIAS = ("motivo", "ubicacion", "id_especificacion", "cantidad")
 
-_COLUMNAS_CATALOGO = ("referencia", "codigo_barras", "id_producto", "nombre_comercial")
+_COLUMNAS_CATALOGO = (
+    "referencia",
+    "codigo_barras",
+    "id_producto",
+    "id_especificacion",
+    "nombre_comercial",
+)
 
 _COLUMNAS_OPERACION = (
     "id_pedido",
@@ -616,20 +623,32 @@ _COLUMNAS_SALUD = (
 
 
 def construir_catalogo_productos(df_admin: pd.DataFrame) -> pd.DataFrame:
-    """Arma el puente `(referencia, código de barras)` → ID de producto (DEC-045).
+    """Arma el puente `(referencia, código de barras)` → IDs de producto (DEC-045/DEC-111).
 
     `lineas_pedido` no guarda ningún ID de producto: identifica el artículo
     por referencia, código de barras, nombre y presentación. Los IDs viven
     solo en el catálogo del admin, así que esta tabla es la que permite
     mostrarlos en la vista consolidada de Pedidos.
 
-    **Solo se conservan los pares que resuelven a un único `id_producto`.**
+    **La fila solo existe si el par resuelve a un único `id_producto`.**
     El código de barras no es único por ID (un mismo código cuelga de hasta
     21 referencias — la misma arena vendida por unidad, tonelada o
     corporativo), y si un par quedara con dos IDs el LEFT JOIN del dashboard
     **duplicaría la línea de pedido e inflaría `Cantidad comprada`**. Medido:
-    el 99,6% de los pares es inequívoco; el 0,4% restante se descarta a
-    propósito y esas líneas muestran el ID vacío.
+    el 99,3% de los pares es inequívoco; el resto se descarta a propósito y
+    esas líneas muestran el ID vacío. `inventario/hallazgos.py` (detector
+    `lineas_sin_id_producto`) depende de este criterio — no cambia con
+    DEC-111.
+
+    **`id_especificacion` se resuelve aparte, con su propio criterio de
+    unicidad, dentro del mismo grupo (DEC-111).** Es más fino que
+    `id_producto` — variantes de color o lote comparten producto pero no
+    especificación — así que un par ya incluido por `id_producto` puede
+    seguir sin `id_especificacion` (queda NULL, no se descarta la fila).
+    Medido 2026-08-12 contra el admin real (6.212 pares, 9.018 filas): de
+    los 6.171 pares que entran por `id_producto`, 552 (8,9%) tienen más de
+    un `id_especificacion` y quedan con ese campo vacío — el dashboard
+    consolida sobre `id_especificacion`, no sobre `id_producto`.
 
     Se usa el catálogo **sin filtrar por alcance**: acá interesa poder
     nombrar cualquier producto que aparezca en un pedido, incluidas las
@@ -640,13 +659,22 @@ def construir_catalogo_productos(df_admin: pd.DataFrame) -> pd.DataFrame:
         df_admin: Resultado de `inventario.normalizador.cargar_admin()`.
 
     Returns:
-        DataFrame con `referencia`, `codigo_barras`, `id_producto` y
-        `nombre_comercial`; una fila por par inequívoco.
+        DataFrame con `referencia`, `codigo_barras`, `id_producto`,
+        `id_especificacion` (puede ser NULL) y `nombre_comercial`; una fila
+        por par cuyo `id_producto` es inequívoco.
     """
-    df = df_admin[["referencia", "codigo_barras", "id_producto_admin", "nombre_comercial"]].copy()
+    columnas = [
+        "referencia",
+        "codigo_barras",
+        "id_producto_admin",
+        "id_especificacion",
+        "nombre_comercial",
+    ]
+    df = df_admin[columnas].copy()
     df["referencia"] = df["referencia"].astype(str).str.strip()
     df["codigo_barras"] = df["codigo_barras"].astype(str).str.strip()
     df["id_producto"] = df["id_producto_admin"].astype(str).str.strip()
+    df["id_especificacion"] = df["id_especificacion"].astype(str).str.strip()
 
     total = df[["referencia", "codigo_barras"]].drop_duplicates().shape[0]
     por_par = df.groupby(["referencia", "codigo_barras"])["id_producto"].nunique()
@@ -666,6 +694,19 @@ def construir_catalogo_productos(df_admin: pd.DataFrame) -> pd.DataFrame:
             descartados,
             total,
         )
+
+    # DEC-111: id_especificacion resuelto con su propio criterio de unicidad,
+    # calculado sobre el df completo (no sobre `puente`, que ya perdió las
+    # filas descartadas por id_producto ambiguo). None cuando el mismo par
+    # tiene más de un id_especificacion distinto.
+    espec_unico = df.groupby(["referencia", "codigo_barras"])["id_especificacion"].agg(
+        lambda s: s.iloc[0] if s.nunique() == 1 else None
+    )
+    puente = puente.drop(columns=["id_especificacion"]).merge(
+        espec_unico.rename("id_especificacion"),
+        on=["referencia", "codigo_barras"],
+        how="left",
+    )
     return puente[list(_COLUMNAS_CATALOGO)]
 
 
