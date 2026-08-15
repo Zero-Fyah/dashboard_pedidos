@@ -15,7 +15,9 @@ from comun import (
     ESTADOS_CERRADOS,
     ESTADOS_DESPACHADOS,
     ESTADOS_PREVIOS_PICKING,
+    PRODUCTOS_RELLENO,
     VIGENCIA_ACTIVO,
+    clasificar_modalidad_arena,
 )
 
 DB_PATH = Path(__file__).parent.parent / "data" / "pedidos.db"
@@ -35,6 +37,10 @@ _despachados = ",".join(f"'{e}'" for e in sorted(ESTADOS_DESPACHADOS))
 # todavía no compromete mercancía — ninguno de los tres debería tener nada
 # físicamente en picking.
 _previos_picking = ",".join(f"'{e}'" for e in ESTADOS_PREVIOS_PICKING)
+
+# DEC-115/DEC-117: líneas de relleno para el monto mínimo, listas para
+# interpolar en IN (...) / NOT IN (...) — mismo patrón que _cerr arriba.
+_relleno = ",".join(f"'{p}'" for p in PRODUCTOS_RELLENO)
 
 # AUD-B6: Colombia opera en UTC-5 sin horario de verano desde 1993 — un
 # offset fijo es correcto todo el año y no depende de la zona horaria
@@ -282,6 +288,68 @@ def get_inventario_salud() -> pd.DataFrame:
     else:
         df["vigencia"] = df["vigencia"].fillna(VIGENCIA_ACTIVO)
     return df
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_arena_inventario() -> pd.DataFrame:
+    """Inventario de la categoría Arena por código de barras/modalidad/ciudad (DEC-118)."""
+    if not _objeto_existe("v_arena_inventario", "view"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql("SELECT * FROM v_arena_inventario", con)
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_arena_balance() -> pd.DataFrame:
+    """Proporción histórica de bolsas vendidas por modalidad (DEC-118) — medida, no asumida.
+
+    Se mide sobre `lineas_pedido`, que trae `referencia` con el esquema
+    previo a la migración a `PRA ARENA TONELADA`/`PRA13` nacionales —
+    `comun.clasificar_modalidad_arena()` reconoce ambos esquemas (100% de
+    cobertura verificada sobre 113.807 líneas de Arena, DEC-118).
+    `cantidad_comprada` es cantidad de bolsas, no kilogramos — verificado
+    que las tres modalidades usan la misma unidad antes de compararlas.
+
+    Returns:
+        Una fila por modalidad (`modalidad`, `bolsas`), más `cobertura`
+        (fracción de líneas que el clasificador reconoció) repetida en
+        cada fila, para que la página la declare junto a la cifra.
+    """
+    if not _objeto_existe("arena_inventario"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        codigos = pd.read_sql("SELECT DISTINCT codigo_barras FROM arena_inventario", con)
+        if codigos.empty:
+            return pd.DataFrame()
+        marcas = ",".join("?" * len(codigos))
+        lp = pd.read_sql(
+            f"SELECT referencia, cantidad_comprada FROM lineas_pedido "
+            f"WHERE codigo_barras IN ({marcas})",
+            con,
+            params=codigos["codigo_barras"].tolist(),
+        )
+    finally:
+        con.close()
+
+    if lp.empty:
+        return pd.DataFrame()
+
+    lp["modalidad"] = lp["referencia"].map(clasificar_modalidad_arena)
+    lp["cantidad_comprada"] = pd.to_numeric(lp["cantidad_comprada"], errors="coerce")
+    cobertura = float(lp["modalidad"].notna().mean())
+    resumen = (
+        lp[lp["modalidad"].notna()]
+        .groupby("modalidad")["cantidad_comprada"]
+        .sum()
+        .rename("bolsas")
+        .reset_index()
+    )
+    resumen["cobertura"] = cobertura
+    return resumen
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
@@ -1653,6 +1721,150 @@ def get_alertas() -> pd.DataFrame:
         return pd.read_sql("SELECT * FROM v_alertas", con)
     finally:
         con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_faltantes_clasificados() -> pd.DataFrame:
+    """Pedidos/subpedidos con diferencia registrada, clasificados en 3 grupos
+    (DEC-115/DEC-117): "Interno" (relleno de monto mínimo, sin faltante
+    real), "Real" (faltante físico de unidades) y "Monetario" (diferencia
+    sin faltante de mercancía).
+
+    La clasificación se construye entera desde `lineas_pedido` —
+    `gestion_diferencias`/`detalle_diferencias` no tienen columna de
+    subpedido (limitación del origen, no del scraper), así que no sirven
+    para atribuir a nivel subpedido. `lineas_pedido` sí trae
+    `numero_subpedido`, y es indexada por `(id_pedido, numero_subpedido)`.
+
+    Devuelve una fila por subpedido afectado, salvo el grupo "Monetario"
+    en un pedido con más de un subpedido: como el origen no identifica cuál
+    causó la diferencia, esa fila queda a nivel pedido
+    (`numero_subpedido` es `None`, `atribuible` es `False`).
+
+    Columnas: `id_pedido`, `numero_subpedido`, `fecha`, `grupo`,
+    `unidades_faltantes` (solo grupo "Real"), `monto_diferencia`,
+    `cancelado` (algún subpedido del pedido en estado Cancelado),
+    `atribuible` (False solo para "Monetario" con varios subpedidos).
+    """
+    if not _objeto_existe("gestion_diferencias") or not _objeto_existe("lineas_pedido"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        crudo = pd.read_sql(
+            f"""
+            WITH universo AS (
+                SELECT p.id_pedido, p.fecha, gd.monto_diferencia
+                FROM pedidos p
+                JOIN gestion_diferencias gd ON gd.id_pedido = p.id_pedido
+                WHERE p.hay_diferencia = 1
+            ),
+            -- Filtra lineas_pedido (875k+ filas) al universo ANTES de
+            -- agregar: sin este paso, el GROUP BY de abajo escanea la tabla
+            -- completa por índice en vez de buscar por id_pedido (medido:
+            -- 60s vs 0,3s sobre datos reales, 2026-08-14).
+            lineas_universo AS (
+                SELECT lp.id_pedido, lp.numero_subpedido, lp.nombre_producto,
+                       lp.cantidad_comprada, lp.cantidad_entregada
+                FROM lineas_pedido lp
+                JOIN universo u ON u.id_pedido = lp.id_pedido
+            ),
+            lineas_reales AS (
+                SELECT id_pedido, numero_subpedido,
+                       SUM(CAST(cantidad_comprada AS REAL)) comprada,
+                       SUM(CAST(cantidad_entregada AS REAL)) entregada
+                FROM lineas_universo
+                WHERE nombre_producto NOT IN ({_relleno})
+                GROUP BY id_pedido, numero_subpedido
+            ),
+            lineas_relleno AS (
+                SELECT DISTINCT id_pedido, numero_subpedido
+                FROM lineas_universo
+                WHERE nombre_producto IN ({_relleno})
+            ),
+            subpedidos_universo AS (
+                SELECT sp.id_pedido, sp.numero_subpedido, sp.estado
+                FROM subpedidos sp
+                JOIN universo u ON u.id_pedido = sp.id_pedido
+            ),
+            conteo AS (
+                SELECT id_pedido, COUNT(*) n_subpedidos,
+                       MAX(CASE WHEN estado = 'Cancelado' THEN 1 ELSE 0 END) algun_cancelado
+                FROM subpedidos_universo
+                GROUP BY id_pedido
+            )
+            SELECT
+                su.id_pedido,
+                su.numero_subpedido,
+                u.fecha,
+                u.monto_diferencia,
+                cs.n_subpedidos,
+                cs.algun_cancelado,
+                lr.comprada,
+                lr.entregada,
+                (lrel.id_pedido IS NOT NULL) AS tiene_relleno
+            FROM subpedidos_universo su
+            JOIN universo u ON u.id_pedido = su.id_pedido
+            JOIN conteo cs ON cs.id_pedido = su.id_pedido
+            LEFT JOIN lineas_reales lr
+                ON lr.id_pedido = su.id_pedido AND lr.numero_subpedido = su.numero_subpedido
+            LEFT JOIN lineas_relleno lrel
+                ON lrel.id_pedido = su.id_pedido AND lrel.numero_subpedido = su.numero_subpedido
+            """,
+            con,
+        )
+    finally:
+        con.close()
+
+    if crudo.empty:
+        return pd.DataFrame()
+
+    faltantes = (crudo["comprada"].fillna(0) - crudo["entregada"].fillna(0)).round(6)
+    crudo["unidades_faltantes"] = faltantes
+    crudo["es_real"] = faltantes != 0
+    crudo["grupo_subpedido"] = None
+    crudo.loc[crudo["es_real"], "grupo_subpedido"] = "Real"
+    crudo.loc[~crudo["es_real"] & crudo["tiene_relleno"].astype(bool), "grupo_subpedido"] = (
+        "Interno"
+    )
+
+    # Vectorizado — un loop fila por fila sobre ~4.600 pedidos medía ~16s
+    # sobre datos reales (2026-08-14); esto baja el total a ~3s.
+    con_senal = crudo["grupo_subpedido"].notna()
+    # transform("count") cuenta valores no nulos por grupo (semántica de
+    # pandas) — evita una lambda de Python por grupo.
+    tiene_senal_pedido = crudo.groupby("id_pedido")["grupo_subpedido"].transform("count") > 0
+
+    # "Real"/"Interno": una fila por subpedido con señal propia.
+    grupo_a = crudo.loc[con_senal].copy()
+    grupo_a["grupo"] = grupo_a["grupo_subpedido"]
+    grupo_a.loc[grupo_a["grupo"] != "Real", "unidades_faltantes"] = 0
+    grupo_a["atribuible"] = True
+
+    # "Monetario": ningún subpedido del pedido tiene señal de cantidad.
+    # Colapsa a una fila por pedido — fecha/monto/n_subpedidos son iguales
+    # en todas sus filas, así que `first()` no pierde información salvo
+    # numero_subpedido, que se resuelve aparte.
+    sin_senal_pedidos = crudo.loc[~tiene_senal_pedido]
+    grupo_b = sin_senal_pedidos.groupby("id_pedido", as_index=False).first()
+    un_solo_subpedido = grupo_b["n_subpedidos"] == 1
+    grupo_b["numero_subpedido"] = grupo_b["numero_subpedido"].where(un_solo_subpedido)
+    grupo_b["grupo"] = "Monetario"
+    grupo_b["unidades_faltantes"] = 0
+    grupo_b["atribuible"] = un_solo_subpedido
+
+    columnas = [
+        "id_pedido",
+        "numero_subpedido",
+        "fecha",
+        "grupo",
+        "unidades_faltantes",
+        "monto_diferencia",
+        "algun_cancelado",
+        "atribuible",
+    ]
+    resultado = pd.concat([grupo_a[columnas], grupo_b[columnas]], ignore_index=True)
+    resultado["cancelado"] = resultado["algun_cancelado"].astype(bool)
+    return resultado.drop(columns="algun_cancelado")
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)

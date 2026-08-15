@@ -107,6 +107,22 @@ _TABLAS = {
             corrida_id     INTEGER
         )
     """,
+    "arena_inventario": """
+        CREATE TABLE IF NOT EXISTS arena_inventario (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            codigo_barras         TEXT,
+            especificacion        TEXT,
+            nombre_comercial      TEXT,
+            referencia            TEXT,
+            almacen               TEXT,
+            peso_g                REAL,
+            inventario            REAL,
+            existencias_restantes REAL,
+            producto_activo       TEXT,
+            modalidad             TEXT,
+            corrida_id            INTEGER
+        )
+    """,
     "inventario_abc": """
         CREATE TABLE IF NOT EXISTS inventario_abc (
             nivel           TEXT NOT NULL,
@@ -350,6 +366,12 @@ _VIEWS = {
                demanda_30d, demanda_90d, demanda_diaria,
                dias_cobertura, ultima_salida, dias_sin_salida, estado
         FROM inventario_salud
+    """,
+    "v_arena_inventario": """
+        SELECT codigo_barras, especificacion, nombre_comercial, referencia,
+               almacen, peso_g, inventario, existencias_restantes,
+               producto_activo, modalidad
+        FROM arena_inventario
     """,
     "v_inventario_abc": """
         SELECT nivel, clave, padre, etiqueta, valor_consumo, pct_valor,
@@ -619,6 +641,19 @@ _COLUMNAS_SALUD = (
     "ultima_salida",
     "dias_sin_salida",
     "estado",
+)
+
+_COLUMNAS_ARENA = (
+    "codigo_barras",
+    "especificacion",
+    "nombre_comercial",
+    "referencia",
+    "almacen",
+    "peso_g",
+    "inventario",
+    "existencias_restantes",
+    "producto_activo",
+    "modalidad",
 )
 
 
@@ -921,6 +956,7 @@ def persistir(
     hallazgos: list | None = None,
     salud: pd.DataFrame | None = None,
     abc: pd.DataFrame | None = None,
+    arena: pd.DataFrame | None = None,
     operacion: pd.DataFrame | None = None,
     ventanas: pd.DataFrame | None = None,
     ubicaciones: pd.DataFrame | None = None,
@@ -955,6 +991,8 @@ def persistir(
             Si es None, `inventario_salud` queda intacta.
         abc: Resultado de `inventario.clasificacion.calcular_clasificacion()`
             (DEC-050). Si es None, `inventario_abc` queda intacta.
+        arena: Resultado de `inventario.arena.calcular_arena()` (DEC-118).
+            Si es None, `arena_inventario` queda intacta.
         operacion: Resultado de `inventario.operacion.calcular_operacion()`
             (DEC-054). Si es None, `operacion_ciclos` queda intacta.
         ventanas: Resultado de `inventario.operacion.calcular_ventanas()`
@@ -1073,6 +1111,19 @@ def persistir(
                     [
                         (*_normalizar(fila), corrida_id)
                         for fila in salud[list(_COLUMNAS_SALUD)].itertuples(index=False)
+                    ],
+                )
+
+            # DEC-118: inventario de Arena por código de barras/modalidad/ciudad.
+            if arena is not None:
+                con.execute("DELETE FROM arena_inventario")
+                con.executemany(
+                    f"INSERT INTO arena_inventario "
+                    f"({', '.join(_COLUMNAS_ARENA)}, corrida_id) "
+                    f"VALUES ({', '.join('?' * len(_COLUMNAS_ARENA))}, ?)",
+                    [
+                        (*_normalizar(fila), corrida_id)
+                        for fila in arena[list(_COLUMNAS_ARENA)].itertuples(index=False)
                     ],
                 )
 
@@ -1352,6 +1403,7 @@ def main() -> int:
         escritura.
     """
     from inventario.alertas import generar_alertas
+    from inventario.arena import calcular_arena
     from inventario.cancelaciones import calcular_cancelaciones
     from inventario.clasificacion import calcular_clasificacion
     from inventario.comparacion import anomalias_layout, calcular_vendido_no_alistado, comparar
@@ -1391,6 +1443,10 @@ def main() -> int:
         # interesa nombrar cualquier producto que aparezca en un pedido,
         # incluidas arenas y otros almacenes.
         catalogo = construir_catalogo_productos(catalogo_completo)
+        # DEC-118: Arena vive fuera de `filtrar_alcance_admin()` (excluye la
+        # categoría a propósito, DEC-041) — usa el catálogo SIN filtrar,
+        # igual que el puente de arriba.
+        arena = calcular_arena(catalogo_completo)
 
         admin = filtrar_alcance_admin(catalogo_completo)
         layout = cargar_layout()
@@ -1449,6 +1505,7 @@ def main() -> int:
             hallazgos=hallazgos,
             salud=salud,
             abc=abc,
+            arena=arena,
             operacion=operacion,
             ventanas=ventanas,
             ubicaciones=ubicaciones,

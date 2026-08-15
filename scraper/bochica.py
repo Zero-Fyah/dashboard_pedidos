@@ -17,6 +17,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from scraper.config import CONFIG, log_event
 
 DESTINO_DEFAULT = Path(__file__).parent.parent / "data" / "inventario" / "bochica_inventario.xlsx"
+SESION_DEFAULT = Path(__file__).parent.parent / "data" / "sesiones" / "bochica_storage_state.json"
 
 
 async def login_bochica(page: Page, usuario: str, clave: str) -> None:
@@ -24,6 +25,15 @@ async def login_bochica(page: Page, usuario: str, clave: str) -> None:
 
     Dos pantallas secuenciales (correo, luego contraseña) — a diferencia
     del login del admin, los campos no coexisten en la misma pantalla.
+
+    Envía cada pantalla con Enter en vez de hacer clic en el botón "Siguiente"
+    por nombre: Google no fija el idioma de forma consistente entre sesiones
+    de un navegador automatizado (contexto nuevo sin idioma guardado en cada
+    corrida), así que el texto del botón varía entre "Siguiente" y "Next" —
+    Enter es independiente del idioma. También se agregó `:visible` al
+    selector de contraseña porque esa pantalla puede traer un campo
+    `type='password'` oculto (señuelo anti-autofill de Google) antes del
+    real (hallazgo en vivo, 2026-08-14).
 
     Args:
         page: Página Playwright sobre la que operar.
@@ -33,17 +43,97 @@ async def login_bochica(page: Page, usuario: str, clave: str) -> None:
     await page.goto(CONFIG["bochica_url"], timeout=CONFIG["NAV_TIMEOUT_MS"])
 
     await page.locator("input[type='email']").first.fill(usuario)
-    await page.get_by_role("button", name="Siguiente").click()
+    await page.keyboard.press("Enter")
 
-    await page.wait_for_selector("input[type='password']", timeout=CONFIG["ELEM_TIMEOUT_MS"])
-    await page.locator("input[type='password']").first.fill(clave)
-    await page.get_by_role("button", name="Siguiente").click()
+    await page.wait_for_selector(
+        "input[type='password']:visible", timeout=CONFIG["ELEM_TIMEOUT_MS"]
+    )
+    await page.locator("input[type='password']:visible").first.fill(clave)
+    await page.keyboard.press("Enter")
 
     await page.wait_for_function(
         f"() => window.location.href.startsWith({json.dumps(CONFIG['bochica_url'])})",
         timeout=CONFIG["NAV_TIMEOUT_MS"],
     )
     log_event("login_bochica_ok", msg="Autenticación exitosa en Bochica (Google)")
+
+
+async def pagina_con_sesion_guardada(browser, ruta_sesion: Path = SESION_DEFAULT) -> Page:
+    """Abre una página reutilizando la sesión de Google guardada por
+    `sembrar_sesion()`, sin volver a pasar por el login (DEC-116).
+
+    Google detecta el login automatizado de `login_bochica()` (vía
+    Playwright/CDP) como bot y responde con un CAPTCHA que ningún selector
+    puede resolver — confirmado en vivo el 2026-08-14: el mismo login manual,
+    en incógnito o en una ventana normal, nunca lo pide. La única vía estable
+    para la corrida horaria es no volver a autenticar: reutilizar las cookies
+    de una sesión ya validada por una persona.
+
+    Args:
+        browser: Browser de Playwright ya lanzado.
+        ruta_sesion: Archivo de `storage_state` generado por `sembrar_sesion()`.
+
+    Returns:
+        La página, ya en `CONFIG["bochica_url"]` con la sesión activa.
+
+    Raises:
+        RuntimeError: si no hay sesión guardada o si ya expiró (Google
+            redirige de vuelta al login) — requiere correr
+            `python -m scraper.bochica --sembrar-sesion` de nuevo.
+    """
+    if not ruta_sesion.exists():
+        raise RuntimeError(
+            f"No hay sesión guardada en {ruta_sesion}. "
+            "Corre `python -m scraper.bochica --sembrar-sesion` una vez, con "
+            "una persona completando el login de Google en la ventana visible."
+        )
+    ctx = await browser.new_context(locale="es-CO", storage_state=str(ruta_sesion))
+    page = await ctx.new_page()
+    await page.goto(CONFIG["bochica_url"], timeout=CONFIG["NAV_TIMEOUT_MS"])
+    if not page.url.startswith(CONFIG["bochica_url"]):
+        raise RuntimeError(
+            f"La sesión guardada en {ruta_sesion} ya expiró (Google redirigió a "
+            f"{page.url}). Corre `python -m scraper.bochica --sembrar-sesion` de nuevo."
+        )
+    log_event("bochica_sesion_reutilizada", msg="Sesión de Google cargada desde storage_state")
+    return page
+
+
+async def sembrar_sesion(ruta_sesion: Path = SESION_DEFAULT) -> None:
+    """Modo manual, con navegador visible: una persona completa el login de
+    Google una sola vez y el resultado (cookies) queda guardado para que
+    `pagina_con_sesion_guardada()` lo reutilice en cada corrida automática.
+
+    No llena ningún campo — deliberado. Es la persona quien escribe correo y
+    contraseña, con mouse y teclado reales, para que Google la trate como el
+    login humano que ya confirmamos que no dispara CAPTCHA (2026-08-14). Este
+    proceso solo abre el navegador y espera a que la navegación llegue de
+    vuelta a `bochica_url`, la misma señal de éxito que usa `login_bochica()`.
+
+    Args:
+        ruta_sesion: Dónde guardar el `storage_state` resultante.
+    """
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=False)
+        ctx = await browser.new_context(locale="es-CO")
+        page = await ctx.new_page()
+        await page.goto(CONFIG["bochica_url"], timeout=CONFIG["NAV_TIMEOUT_MS"])
+        print(
+            "\nCompleta el login de Google en la ventana del navegador "
+            f"(usuario: {CONFIG['bochica_usuario']}).\n"
+            "Esperando hasta 10 minutos a que la navegación llegue de vuelta a Bochica...\n"
+        )
+        await page.wait_for_function(
+            f"() => window.location.href.startsWith({json.dumps(CONFIG['bochica_url'])})",
+            timeout=600_000,
+        )
+        ruta_sesion.parent.mkdir(parents=True, exist_ok=True)
+        await ctx.storage_state(path=str(ruta_sesion))
+        print(f"Sesión guardada en {ruta_sesion}")
+        log_event("bochica_sesion_sembrada", msg=f"storage_state guardado en {ruta_sesion}")
+        await browser.close()
 
 
 async def _frame_con_selector(page: Page, selector: str, timeout_ms: int) -> Frame:
@@ -150,6 +240,7 @@ async def descargar_inventario_global(page: Page, destino: Path = DESTINO_DEFAUL
 
 if __name__ == "__main__":
     import asyncio
+    import sys
 
     from playwright.async_api import async_playwright
 
@@ -174,9 +265,12 @@ if __name__ == "__main__":
                 headless=CONFIG["HEADLESS"],
                 slow_mo=CONFIG["SLOW_MO"],
             )
-            ctx = await browser.new_context(locale="es-CO")
-            page = await ctx.new_page()
-            await login_bochica(page, CONFIG["bochica_usuario"], CONFIG["bochica_clave"])
+            # DEC-116: el login de Google vía Playwright dispara CAPTCHA — se
+            # reutiliza una sesión sembrada manualmente en vez de autenticar
+            # en cada corrida. login_bochica() queda disponible para
+            # sembrar_sesion() y para investigación puntual, pero la corrida
+            # automática ya no la llama.
+            page = await pagina_con_sesion_guardada(browser)
             await login_app_bochica(
                 page, CONFIG["bochica_app_usuario"], CONFIG["bochica_app_clave"]
             )
@@ -184,4 +278,7 @@ if __name__ == "__main__":
             print(f"Inventario de Bochica descargado en: {ruta}")
             await browser.close()
 
-    asyncio.run(_main())
+    if "--sembrar-sesion" in sys.argv:
+        asyncio.run(sembrar_sesion())
+    else:
+        asyncio.run(_main())

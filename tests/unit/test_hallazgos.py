@@ -15,6 +15,7 @@ import pandas as pd
 import pytest
 
 from inventario.hallazgos import (
+    arena_referencias_no_reconocidas,
     codigos_barras_multiples_ids,
     detectar_todos,
     especificacion_discrepante,
@@ -469,3 +470,32 @@ def test_fuera_de_catalogo_sin_la_tabla_de_ubicaciones_no_explota():
 
     assert h.cantidad == 0
     assert h.filas.empty
+
+
+def _admin_arena(filas):
+    """filas: dicts con referencia/nombre_comercial/almacen/inventario."""
+    base = {"nombre_comercial": "x", "almacen": "Bogotá", "inventario": 0}
+    return pd.DataFrame([{"categoria": "Arena", **base, **fila} for fila in filas])
+
+
+def test_arena_sin_referencias_desconocidas_no_hay_hallazgo():
+    """PRA13 es una referencia conocida (Unidades) — el detector se apaga
+    solo cuando todo lo que trae el admin ya está mapeado (DEC-118)."""
+    admin = _admin_arena([{"referencia": "PRA13"}])
+
+    assert arena_referencias_no_reconocidas(admin).cantidad == 0
+
+
+def test_arena_referencia_no_reconocida_se_detecta():
+    admin = _admin_arena([{"referencia": "ARENA SABOR NUEVO CARTAGENA"}])
+
+    h = arena_referencias_no_reconocidas(admin)
+    assert h.cantidad == 1
+    assert h.filas.iloc[0]["Referencia"] == "ARENA SABOR NUEVO CARTAGENA"
+
+
+def test_arena_excluidas_conocidas_no_cuentan_como_no_reconocidas():
+    """PB008/PS0199/PRA-T01/PRA-001 son exclusiones ya decididas, no hallazgos."""
+    admin = _admin_arena([{"referencia": "PB008"}, {"referencia": "PRA-T01"}])
+
+    assert arena_referencias_no_reconocidas(admin).cantidad == 0

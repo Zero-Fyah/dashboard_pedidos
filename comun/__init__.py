@@ -141,6 +141,122 @@ def familia_de(referencia: str | None) -> str | None:
     return prefijo if prefijo in FAMILIAS_PRODUCTO else None
 
 
+# Líneas de relleno para completar el monto mínimo de pedido ($300.000,
+# DEC-115) — no representan mercancía real. `nombre_producto` tal como lo
+# persiste `lineas_pedido`/`detalle_diferencias`; sus referencias son
+# `AV ACC`/`AV AR`/`AV AL`. Comportamiento estructural del origen: siempre
+# `cantidad_comprada=1, cantidad_entregada=0` (verificado por DOM en vivo,
+# pedido 2014370644) — nunca se marcan como entregadas porque no hay
+# producto real detrás. Cualquier comparación de cantidades que no las
+# excluya produce falsos positivos de faltante.
+PRODUCTOS_RELLENO: tuple[str, ...] = ("Interno Acc", "Interno Are", "Interno Ali")
+
+
+# Modalidades de venta de la categoría Arena (DEC-118), verificadas fila por
+# fila contra `admin_inventario.xlsx` — no inferidas del nombre de la
+# referencia por patrón, salvo Corporativo (ver abajo). `referencia` es la
+# columna `Referencia del producto.` del admin (`referencia` en
+# `lineas_pedido`/`inventario/normalizador.cargar_admin`).
+MODALIDAD_UNIDADES = "Unidades"
+MODALIDAD_TONELADA = "Tonelada"
+MODALIDAD_CORPORATIVO = "Corporativo"
+MODALIDAD_RESPALDO = "Respaldo"
+MODALIDAD_YUMBO_HUB = "Yumbo (hub)"
+
+# Activas para venta directa (`producto_activo == 'Fue'`, confirmado con el
+# Arquitecto — el campo del origen es contraintuitivo: 'Fue' = activo,
+# 'No hay' = inactivo para venta directa). Sus `Nombre comercial` dicen
+# literalmente "...unidades".
+ARENA_REFERENCIAS_UNIDADES: tuple[str, ...] = (
+    "PRA13",
+    "PRA36",
+    "PRA63",
+    "PRA75",
+    "PRA76",
+    "PRA77",
+    "PRA78",
+)
+# Pool nacional de tonelada, distribuido por ciudad vía su propia columna
+# `almacen` — no reparte a través de YUMBO TONELADA.
+ARENA_REFERENCIA_TONELADA_NACIONAL = "PRA ARENA TONELADA"
+# `producto_activo == 'No hay'` a propósito: no se venden por catálogo
+# público, se asignan bajo solicitud del comercial.
+ARENA_REFERENCIAS_RESPALDO: tuple[str, ...] = (
+    "ARENA AVERIA BOGOTA",
+    "ARENA AVERIA MEDELLIN",
+)
+# Buckets operativos del hub de Yumbo, no SKU de venta directa. YUMBO EN
+# TRANSITO (nombre comercial real: "Yumbo traslados nacionales") está en 0
+# en toda la historia disponible — el concepto existe en el origen pero sin
+# dato usable todavía.
+ARENA_REFERENCIAS_YUMBO_HUB: tuple[str, ...] = ("YUMBO TONELADA", "YUMBO EN TRANSITO")
+# Las 12 ciudades donde el admin registra inventario de Arena (columna
+# `almacen`), verificadas contra `admin_inventario.xlsx` — DEC-118.
+ARENA_CIUDADES: tuple[str, ...] = (
+    "Bogotá",
+    "Medellin",
+    "Cali",
+    "Pereira",
+    "Bucaramanga",
+    "Cucuta",
+    "Barranquilla",
+    "Yumbo",
+    "Popayan",
+    "Pasto",
+    "Ibague",
+    "Villavicencio",
+)
+
+# Confirmadas por su propio `Nombre comercial` ("PRA-T01 test", "test猫砂") o,
+# en el caso de PB008/PS0199, excluidas por decisión del Arquitecto sin
+# investigar todavía qué son (no siguen el patrón PRA/ARENA de ninguna otra
+# fila de la categoría).
+ARENA_REFERENCIAS_EXCLUIDAS: tuple[str, ...] = ("PRA-T01", "PRA-001", "PB008", "PS0199")
+
+
+def clasificar_modalidad_arena(referencia: str | None) -> str | None:
+    """Modalidad de venta de una referencia de la categoría Arena (DEC-118).
+
+    Corporativo es la única regla por patrón (`"CORPORATIVO" in referencia`)
+    porque hoy son 7 ciudades y una ciudad nueva no debe requerir tocar
+    código — las demás modalidades son listas cerradas, verificadas contra
+    el dato real.
+
+    Returns:
+        La modalidad, o `None` si la referencia está en
+        `ARENA_REFERENCIAS_EXCLUIDAS` o no se reconoce (este segundo caso
+        debe registrarse como hallazgo — una referencia de Arena nueva que
+        caiga acá es una modalidad real sin clasificar, no ruido).
+    """
+    if not referencia:
+        return None
+    ref = str(referencia).strip()
+    if ref in ARENA_REFERENCIAS_EXCLUIDAS:
+        return None
+    if ref in ARENA_REFERENCIAS_UNIDADES:
+        return MODALIDAD_UNIDADES
+    if ref == ARENA_REFERENCIA_TONELADA_NACIONAL:
+        return MODALIDAD_TONELADA
+    if ref in ARENA_REFERENCIAS_RESPALDO:
+        return MODALIDAD_RESPALDO
+    if ref in ARENA_REFERENCIAS_YUMBO_HUB:
+        return MODALIDAD_YUMBO_HUB
+    if "CORPORATIVO" in ref.upper():
+        return MODALIDAD_CORPORATIVO
+    # Esquema anterior a la migración a `PRA ARENA TONELADA`/`PRA13`
+    # nacionales (~marzo 2026, medido por vigencia en `movimientos_inventario`).
+    # No aparece en `admin_inventario.xlsx` de hoy — solo en `lineas_pedido`
+    # de pedidos viejos ("BOGOTA TONELADA", "CALI UNIDADES", etc.). Sin esta
+    # regla, medir el balance histórico Unidades/Tonelada perdía 22,4% de las
+    # ventas de Arena (verificado contra 113.807 líneas reales, DEC-118).
+    ref_alta = ref.upper()
+    if ref_alta.endswith(" TONELADA"):
+        return MODALIDAD_TONELADA
+    if ref_alta.endswith(" UNIDADES"):
+        return MODALIDAD_UNIDADES
+    return None
+
+
 # Vigencia comercial de una referencia (DEC-065). Es un contrato entre
 # etapas: `inventario/salud.py` escribe estas etiquetas en
 # `inventario_salud.vigencia` y el dashboard las lee de la VIEW, así que

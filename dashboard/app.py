@@ -112,6 +112,16 @@ paginas: dict[str, list[st.Page]] = {
             title="Plan de conteo",
             icon=":material/checklist:",
         ),
+        st.Page(
+            "pages/faltantes.py",
+            title="Faltantes de inventario",
+            icon=":material/remove_shopping_cart:",
+        ),
+        st.Page(
+            "pages/arena.py",
+            title="Arena",
+            icon=":material/scatter_plot:",
+        ),
     ],
     "Operación": [
         st.Page(

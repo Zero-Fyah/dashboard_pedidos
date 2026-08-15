@@ -909,6 +909,57 @@ def cobertura_de_campos_cayendo(con: sqlite3.Connection) -> Hallazgo:
     )
 
 
+def arena_referencias_no_reconocidas(df_admin: pd.DataFrame) -> Hallazgo:
+    """Referencias de la categoría Arena que ningún grupo de modalidad reconoce (DEC-118).
+
+    `comun.clasificar_modalidad_arena()` mapea las referencias de Arena
+    contra listas verificadas contra el dato real (Unidades, Tonelada
+    nacional, Corporativo por patrón, Respaldo, hub de Yumbo) más una lista
+    de exclusión conocida (relleno de prueba, `PB008`/`PS0199` pendientes
+    de investigar). Una referencia que no cae en ninguna de las dos cosas
+    es una modalidad real sin mapear — `inventario.arena.calcular_arena()`
+    la deja fuera de `arena_inventario` en silencio si nadie lo revisa acá.
+    """
+    from comun import ARENA_REFERENCIAS_EXCLUIDAS, clasificar_modalidad_arena
+
+    arena = df_admin[df_admin["categoria"] == "Arena"].copy()
+    arena["modalidad"] = arena["referencia"].map(clasificar_modalidad_arena)
+    no_reconocidas = arena[
+        arena["modalidad"].isna() & ~arena["referencia"].isin(ARENA_REFERENCIAS_EXCLUIDAS)
+    ]
+
+    filas = (
+        no_reconocidas[["referencia", "nombre_comercial", "almacen", "inventario"]]
+        .drop_duplicates(subset=["referencia"])
+        .sort_values("referencia")
+        .rename(
+            columns={
+                "referencia": "Referencia",
+                "nombre_comercial": "Nombre comercial",
+                "almacen": "Almacén (ejemplo)",
+                "inventario": "Inventario (ejemplo)",
+            }
+        )
+    )
+    return Hallazgo(
+        clave="arena_referencias_no_reconocidas",
+        titulo="Referencias de Arena sin modalidad reconocida",
+        explicacion=(
+            "El módulo de Arena clasifica cada referencia en Unidades, Tonelada, "
+            "Corporativo, Respaldo o hub de Yumbo. Estas no caen en ninguna — puede "
+            "ser una modalidad o ciudad nueva que el clasificador todavía no conoce "
+            "(`comun.clasificar_modalidad_arena`). Mientras no se revise, quedan "
+            "fuera de `arena_inventario` sin aviso."
+        ),
+        categoria="Códigos y referencias",
+        prioridad="Alta",
+        origen="DEC-118",
+        unidad="referencias",
+        cantidad=filas["Referencia"].nunique(),
+        filas=filas,
+    )
+
+
 def detectar_todos(df_admin: pd.DataFrame, con: sqlite3.Connection) -> list[Hallazgo]:
     """Corre todos los detectores y devuelve solo los que encontraron algo.
 
@@ -938,6 +989,7 @@ def detectar_todos(df_admin: pd.DataFrame, con: sqlite3.Connection) -> list[Hall
         lambda: sku_en_bodega_fuera_de_catalogo(df_admin, con),
         lambda: vocabulario_nuevo_en_origen(con),
         lambda: cobertura_de_campos_cayendo(con),
+        lambda: arena_referencias_no_reconocidas(df_admin),
     ]
 
     encontrados: list[Hallazgo] = []
