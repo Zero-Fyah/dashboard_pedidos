@@ -146,6 +146,50 @@ def inject_global_css() -> None:
 
         /* Tarjeta base reutilizable para KPIs y gráficos */
 
+        /* Botones (st.button/st.download_button). Streamlit los pinta con su
+        fondo claro por defecto — nunca overrideado acá — y la regla de arriba
+        (p {{ color: {TEXT_SECONDARY} }}, blanco al 40%, pensada para fondo
+        oscuro) deja el texto casi invisible sobre ese blanco. Encontrado en
+        revisión visual con navegador real (2026-08-15): "Limpiar filtros"
+        del sidebar compartido (dashboard/filtros.py, en las 7 páginas con
+        filtro global) y los st.download_button de exportación en varias
+        páginas — no era nuevo de esta sesión, solo nadie lo había visto. */
+        [data-testid="stBaseButton-secondary"] {{
+            background-color: {BG_DEEP};
+            border: 1px solid {BORDER_SUBTLE};
+        }}
+        [data-testid="stBaseButton-secondary"] p {{
+            color: {TEXT_PRIMARY} !important;
+        }}
+        [data-testid="stBaseButton-secondary"]:hover {{
+            border-color: {ACCENT_TEAL};
+        }}
+        [data-testid="stBaseButton-secondary"]:hover p {{
+            color: {ACCENT_TEAL_LIGHT} !important;
+        }}
+        [data-testid="stBaseButton-primary"] p {{
+            color: {TEXT_PRIMARY} !important;
+        }}
+
+        /* st.segmented_control (stButtonGroup) — mismo problema: las
+        opciones NO seleccionadas caen al blanco por defecto y su texto
+        queda ilegible. Primer uso en la app (faltantes.py, "Agrupar por"),
+        DEC-117; encontrado en la misma revisión visual. */
+        [data-testid="stButtonGroup"] button[data-variant="segmented_control"] {{
+            background-color: {BG_DEEP};
+            border: 1px solid {BORDER_SUBTLE};
+        }}
+        [data-testid="stButtonGroup"] button[data-variant="segmented_control"] p {{
+            color: {TEXT_SECONDARY} !important;
+        }}
+        [data-testid="stButtonGroup"] button[data-variant="segmented_control"][aria-checked="true"] {{
+            background-color: rgba(29, 158, 117, 0.16);
+            border-color: {ACCENT_TEAL};
+        }}
+        [data-testid="stButtonGroup"] button[data-variant="segmented_control"][aria-checked="true"] p {{
+            color: {TEXT_PRIMARY} !important;
+        }}
+
         </style>
         """,
         unsafe_allow_html=True,
