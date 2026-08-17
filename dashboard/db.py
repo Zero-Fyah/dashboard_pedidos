@@ -353,6 +353,49 @@ def get_arena_balance() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_arena_movimiento() -> pd.DataFrame:
+    """Líneas de venta de Arena con fecha/ciudad/estado (DEC-119).
+
+    Filtro `codigo_barras IN (arena_inventario)` igual que
+    `get_arena_balance()`, pero acá hace falta además la fecha (ventana de
+    demanda) y el estado del subpedido (para excluir cancelados, mismo
+    criterio que `inventario/salud.py`). **Medido**: unir eso con SQL
+    (`JOIN pedidos` + `JOIN subpedidos`) tardó 39,6 s — mismo patrón que ya
+    documentó `inventario/salud.py` (el costo es el join de las tablas
+    grandes, no la búsqueda). Se resuelve igual que ahí:
+    `pedidos`/`subpedidos` se leen completos pero angostos (pocas columnas,
+    sin condición) y el cruce lo hace pandas — **medido en 3,8-4,0 s** sobre
+    114.190 líneas (3 corridas), dentro del caché de 10 min.
+    """
+    if not _objeto_existe("arena_inventario"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        codigos = pd.read_sql("SELECT DISTINCT codigo_barras FROM arena_inventario", con)
+        if codigos.empty:
+            return pd.DataFrame()
+        marcas = ",".join("?" * len(codigos))
+        lineas = pd.read_sql(
+            f"""SELECT id_pedido, numero_subpedido, referencia, codigo_barras,
+                       almacen, cantidad_comprada
+                FROM lineas_pedido
+                WHERE codigo_barras IN ({marcas})""",
+            con,
+            params=codigos["codigo_barras"].tolist(),
+        )
+        if lineas.empty:
+            return pd.DataFrame()
+        pedidos = pd.read_sql("SELECT id_pedido, fecha FROM pedidos", con)
+        subpedidos = pd.read_sql("SELECT id_pedido, numero_subpedido, estado FROM subpedidos", con)
+    finally:
+        con.close()
+
+    return lineas.merge(pedidos, on="id_pedido").merge(
+        subpedidos, on=["id_pedido", "numero_subpedido"]
+    )
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def get_despacho_diario() -> pd.DataFrame:
     """Cumplimiento de despacho por día — la mitad "in full" de E.1 (DEC-065).
 

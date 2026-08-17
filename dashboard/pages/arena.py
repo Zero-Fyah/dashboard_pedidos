@@ -21,7 +21,10 @@ import sqlite3
 
 import streamlit as st
 
-from db import get_arena_balance, get_arena_inventario
+from comun import ARENA_MODALIDADES_NUCLEO
+from comun.arena import alertas_quiebre_arena, demanda_arena_por_ciudad
+from comun.reposicion import ESTADO_PEDIR_PRONTO, ESTADO_PEDIR_YA
+from db import get_arena_balance, get_arena_inventario, get_arena_movimiento
 
 st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_html=True)
 st.title("🏖️ Arena — inventario por código de barras")
@@ -40,7 +43,7 @@ if inv.empty:
     )
     st.stop()
 
-MODALIDADES_NUCLEO = ["Unidades", "Tonelada", "Corporativo"]
+MODALIDADES_NUCLEO = list(ARENA_MODALIDADES_NUCLEO)
 MODALIDADES_APARTE = ["Respaldo", "Yumbo (hub)"]
 
 # ── Filtro de ciudad ─────────────────────────────────────────────────────
@@ -125,6 +128,123 @@ else:
         tabla.to_csv(index=False).encode("utf-8-sig"),
         file_name="arena_inventario.csv",
         mime="text/csv",
+    )
+
+# ── Alertas de quiebre — cuándo se agota cada código de barras por ciudad ──
+st.divider()
+st.subheader("Alertas de quiebre — cuándo se agota cada código de barras por ciudad")
+st.markdown(
+    "La tabla de arriba dice **cuánto hay hoy**. Esto dice **cuándo se agota** "
+    "en cada ciudad, al ritmo de venta de los últimos 90 días."
+)
+
+p1, p2 = st.columns(2)
+lead_time_arena = p1.number_input(
+    "Plazo de reposición/traslado (días)",
+    min_value=1,
+    max_value=365,
+    value=60,
+    step=5,
+    help="Desde que se pide hasta que llega a la ciudad. **No sale de los "
+    "datos** — Arena se recibe por peso y no hay tabla de compras ni de "
+    "traslados en el sistema (mismo límite que DEC-071 documenta para el "
+    "catálogo general). Poné el plazo real.",
+)
+objetivo_arena = p2.number_input(
+    "Cobertura objetivo (días)",
+    min_value=0,
+    max_value=365,
+    value=30,
+    step=5,
+    help="Días de venta que se quiere tener encima al recibir el traslado.",
+)
+
+movimiento = get_arena_movimiento()
+demanda_arena = demanda_arena_por_ciudad(movimiento)
+alertas = alertas_quiebre_arena(
+    inv,
+    demanda_arena,
+    lead_time_dias=int(lead_time_arena),
+    dias_cobertura_objetivo=int(objetivo_arena),
+)
+alertas_vista = alertas[alertas["almacen"].isin(ciudad_sel)] if not alertas.empty else alertas
+
+if alertas_vista.empty:
+    st.info(
+        "Sin demanda medida en los últimos 90 días para la ciudad "
+        "seleccionada, o todavía no hay ventas de Arena en la base."
+    )
+else:
+    ya = alertas_vista[alertas_vista["estado_reposicion"] == ESTADO_PEDIR_YA]
+    pronto = alertas_vista[alertas_vista["estado_reposicion"] == ESTADO_PEDIR_PRONTO]
+
+    a1, a2, a3 = st.columns(3)
+    a1.metric(
+        "Pedir ya",
+        f"{len(ya):,}",
+        help="Sin stock y con demanda: ya se está perdiendo venta en esa ciudad.",
+    )
+    a2.metric(
+        "Bajo el punto de reorden",
+        f"{len(pronto):,}",
+        help="Todavía hay stock, pero no alcanza para cubrir el plazo de traslado.",
+    )
+    a3.metric(
+        "Códigos con demanda",
+        f"{len(alertas_vista):,}",
+        help="Combinaciones código de barras × ciudad con venta en los últimos 90 días.",
+    )
+
+    st.dataframe(
+        alertas_vista[
+            [
+                "almacen",
+                "codigo_barras",
+                "especificacion",
+                "demanda_diaria",
+                "disponible",
+                "cobertura_dias",
+                "fecha_quiebre_proyectada",
+                "punto_reorden",
+                "estado_reposicion",
+            ]
+        ],
+        hide_index=True,
+        width="stretch",
+        height=380,
+        column_config={
+            "almacen": st.column_config.TextColumn("Ciudad", width="small"),
+            "codigo_barras": st.column_config.TextColumn("Código de barras", width="medium"),
+            "especificacion": st.column_config.TextColumn("Especificación", width="medium"),
+            "demanda_diaria": st.column_config.NumberColumn("Demanda/día", format="%.1f"),
+            "disponible": st.column_config.NumberColumn("Disponible", format="%.0f"),
+            "cobertura_dias": st.column_config.NumberColumn("Días cobertura", format="%.0f"),
+            "fecha_quiebre_proyectada": st.column_config.DateColumn(
+                "Fecha de quiebre proyectada", format="YYYY-MM-DD"
+            ),
+            "punto_reorden": st.column_config.NumberColumn(
+                "Punto de reorden",
+                format="%.0f",
+                help="Cuando el disponible baja de acá, hay que pedir el traslado.",
+            ),
+            "estado_reposicion": st.column_config.TextColumn("Estado", width="medium"),
+        },
+    )
+    st.download_button(
+        "⬇️ Descargar alertas (CSV)",
+        alertas_vista.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"arena_quiebre_lt{int(lead_time_arena)}d.csv",
+        mime="text/csv",
+    )
+
+    st.caption(
+        f"⚠️ **Todo este bloque depende del plazo de {int(lead_time_arena)} días "
+        "que pusiste arriba.** Es el único número acá que no sale de los datos: "
+        "la demanda diaria sale del histórico real de venta (90 días), la fecha "
+        "de quiebre es proyección lineal sobre ese ritmo — no anticipa "
+        "estacionalidad ni promociones. El disponible es la foto de la corrida "
+        "más reciente, no un histórico — `arena_inventario` guarda una sola "
+        "corrida a la vez (DEC-119)."
     )
 
 # ── Respaldo y hub de Yumbo — aparte, no son modalidad de venta ────────

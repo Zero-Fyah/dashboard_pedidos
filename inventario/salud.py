@@ -32,6 +32,7 @@ import pandas as pd
 from comun import (
     COBERTURA_ALTA_D,
     COBERTURA_RIESGO_D,
+    VENTANA_DEMANDA_D,
     VIGENCIA_ACTIVO,
     VIGENCIA_DESCONTINUADO,
     familia_de,
@@ -40,15 +41,13 @@ from inventario.normalizador import vigencia_por_referencia
 
 logger = logging.getLogger("inventario.salud")
 
-# Ventana para la demanda diaria. 90 días equilibra dos errores: muy corta
-# reacciona a picos puntuales, muy larga diluye un cambio real de ritmo.
-VENTANA_DEMANDA_D = 90
 VENTANA_CORTA_D = 30
 
-# Los umbrales de cobertura viven en `comun/` desde DEC-066: dejaron de ser
-# defaults de implementación y pasaron a ser política de negocio, y la página
-# de Salud los cita al usuario. Se reexportan acá porque este módulo es donde
-# se clasifica con ellos, y para no romper a quien ya los importaba de acá.
+# Los umbrales de cobertura y la ventana de demanda viven en `comun/` desde
+# DEC-066/DEC-119: dejaron de ser defaults de implementación (o, en el caso
+# de la ventana, la necesita también comun/arena.py) y la página de Salud
+# los cita al usuario. Se reexportan acá porque este módulo es donde se
+# clasifica con ellos, y para no romper a quien ya los importaba de acá.
 #
 # Sigue sin existir un indicador de "exceso sobre el máximo objetivo": eso
 # necesita un stock objetivo por referencia, que el negocio no tiene definido.

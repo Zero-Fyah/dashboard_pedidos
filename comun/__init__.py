@@ -213,6 +213,14 @@ ARENA_CIUDADES: tuple[str, ...] = (
 # fila de la categoría).
 ARENA_REFERENCIAS_EXCLUIDAS: tuple[str, ...] = ("PRA-T01", "PRA-001", "PB008", "PS0199")
 
+# Modalidades de venta directa de Arena — excluye Respaldo (reserva para
+# averías) y Yumbo-hub (acopio/tránsito, no un SKU que un cliente compre),
+# que la página separa en una sección aparte. Vivía como literal local en
+# dashboard/pages/arena.py; se promueve acá porque comun/arena.py (DEC-119)
+# también la necesita para filtrar demanda, y comun/ no puede depender de
+# dashboard/ ni de inventario/ (DEC-022).
+ARENA_MODALIDADES_NUCLEO: tuple[str, ...] = ("Unidades", "Tonelada", "Corporativo")
+
 
 def clasificar_modalidad_arena(referencia: str | None) -> str | None:
     """Modalidad de venta de una referencia de la categoría Arena (DEC-118).
@@ -289,6 +297,15 @@ VIGENCIA_DESCONTINUADO = "Descontinuado"
 # no está tomada — ver DEC-066.
 COBERTURA_RIESGO_D = 15
 COBERTURA_ALTA_D = 390
+
+# Ventana para la demanda diaria (DEC-049). 90 días equilibra dos errores:
+# muy corta reacciona a picos puntuales, muy larga diluye un cambio real de
+# ritmo. Vivía en inventario/salud.py; se promueve acá en DEC-119 porque
+# comun/arena.py también la necesita y comun/ no puede depender de
+# inventario/ (sería un ciclo, DEC-022) — mismo movimiento que ya se hizo
+# con COBERTURA_ALTA_D/COBERTURA_RIESGO_D en DEC-066. inventario/salud.py
+# la reexporta para no romper a quien ya la importaba de ahí.
+VENTANA_DEMANDA_D = 90
 
 # Subpedidos que efectivamente se despacharon (DEC-069). Es
 # `ESTADOS_CERRADOS` menos `cancelado`: un subpedido cancelado no salió
