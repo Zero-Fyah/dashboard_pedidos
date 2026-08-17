@@ -56,6 +56,11 @@ htmlcov/
 playwright-report/
 test-results/
 
+# Capturas de verificación visual del skill run-dashboard-pedidos — pueden
+# traer datos de negocio reales (montos, IDs de pedido). Encontrado 2026-08-16
+# en auditoría: el skill afirmaba que ya estaba cubierta y no lo estaba.
+_verify/
+
 # Windows
 Desktop.ini
 Thumbs.db
@@ -70,6 +75,10 @@ Thumbs.db
 # IPs y postura de seguridad medida — mismo criterio que docs/ abajo: nunca
 # al repo público mientras eso siga siendo cierto (DEC-017).
 .claude/skills/
+# Subagentes del skill orchestrator — sus prompts referencian el mismo tipo
+# de contexto interno (DEC-116 Bochica, checkpoint DEC-118 Arena, etc.) que
+# ya excluye .claude/skills/ arriba. Mismo criterio, misma razón (DEC-017).
+.claude/agents/
 
 # Documentación interna de negocio — NO versionar mientras el repo sea público (DEC-017)
 docs/
