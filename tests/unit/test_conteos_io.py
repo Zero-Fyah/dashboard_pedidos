@@ -12,9 +12,15 @@ import conteos_io  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def carpeta_temporal(tmp_path, monkeypatch):
-    """Aísla las escrituras: los tests no pueden tocar los conteos reales."""
+    """Aísla las escrituras: los tests no pueden tocar los conteos reales.
+
+    Incluye CARPETA_RESPALDO — sin este monkeypatch, cada test que llama a
+    `guardar()`/`anular()` escribiría de verdad en el disco E: real de la
+    máquina que corre la suite.
+    """
     monkeypatch.setattr(conteos_io, "CARPETA_CONTEOS", tmp_path / "conteos")
     monkeypatch.setattr(conteos_io, "CARPETA_ANULADOS", tmp_path / "conteos" / "anulados")
+    monkeypatch.setattr(conteos_io, "CARPETA_RESPALDO", tmp_path / "respaldo" / "conteos")
     return tmp_path
 
 
@@ -114,3 +120,32 @@ def test_existe_responde_sobre_las_activas():
 
     assert conteos_io.existe("hoja.xlsx")
     assert not conteos_io.existe("otra.xlsx")
+
+
+def test_guardar_respalda_a_la_carpeta_de_respaldo():
+    conteos_io.guardar("hoja.xlsx", b"contenido")
+
+    respaldo = conteos_io.CARPETA_RESPALDO / "hoja.xlsx"
+    assert respaldo.exists()
+    assert respaldo.read_bytes() == b"contenido"
+
+
+def test_anular_respalda_incluida_la_carpeta_anulados():
+    conteos_io.guardar("hoja.xlsx", b"datos")
+    conteos_io.anular("hoja.xlsx")
+
+    assert (conteos_io.CARPETA_RESPALDO / "anulados" / "hoja.xlsx").exists()
+
+
+def test_guardar_no_falla_si_el_disco_de_respaldo_no_esta(monkeypatch):
+    """El disco E: puede estar desconectado — la subida no debe romperse."""
+
+    def _copytree_falla(*args, **kwargs):
+        raise OSError("disco no disponible")
+
+    monkeypatch.setattr(conteos_io.shutil, "copytree", _copytree_falla)
+
+    destino = conteos_io.guardar("hoja.xlsx", b"contenido")
+
+    assert destino.exists()
+    assert destino.read_bytes() == b"contenido"

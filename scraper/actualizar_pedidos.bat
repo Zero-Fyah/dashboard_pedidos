@@ -24,8 +24,15 @@ for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd"') d
 set LOGFILE=logs\scraper_scheduler_%LOGDATE%.log
 forfiles /p logs /m "*.log" /d -30 /c "cmd /c del @path" >nul 2>nul
 
+REM Notificación de fallo (deuda de mediano plazo, CLAUDE.md) — cada paso
+REM abajo corre aunque el anterior falle (aislamiento a propósito, ver
+REM comentarios de cada bloque); FALLO solo acumula si hubo AL MENOS uno
+REM para avisar una vez al final, no interrumpir la corrida.
+set FALLO=0
+
 REM Ejecutar el scraper en modo incremental desde la raíz
 %PYEXE% scraper/scraper_principal.py --modo incremental >> %LOGFILE% 2>&1
+if errorlevel 1 set FALLO=1
 
 REM DEC-039: descarga del inventario de los dos sistemas fuente, pegada
 REM al final del scraper de pedidos — minimiza la ventana de desfase
@@ -34,7 +41,9 @@ REM inventario (ver docs/decisions.md). Cada línea corre aunque la
 REM anterior falle: una descarga de inventario caída no debe bloquear
 REM ni el scraping de pedidos ni el ETL.
 %PYEXE% -m scraper.inventario >> %LOGFILE% 2>&1
+if errorlevel 1 set FALLO=1
 %PYEXE% -m scraper.bochica >> %LOGFILE% 2>&1
+if errorlevel 1 set FALLO=1
 
 REM TASK-001: captura diaria de "Cambios de inventario". Sin condición de
 REM fecha/hora acá a propósito — el propio módulo decide si ya capturó el
@@ -42,6 +51,7 @@ REM día anterior (ya_capturado()) y termina de inmediato si sí, así que
 REM esta línea puede correr en cualquiera de los ciclos horarios sin
 REM duplicar trabajo ni necesitar que el scheduler acierte una hora exacta.
 %PYEXE% -m scraper.cambios_inventario >> %LOGFILE% 2>&1
+if errorlevel 1 set FALLO=1
 
 REM DEC-043: cruce de inventario y persistencia en pedidos.db. Va después
 REM de las dos descargas (necesita ambos Excel frescos) y con el mismo
@@ -51,6 +61,7 @@ REM Registra la antigüedad de cada fuente: si una descarga de arriba falló
 REM y dejó el Excel viejo, la corrida se marca datos_desactualizados=1 y
 REM el dashboard lo advierte en vez de mostrar un número que parece fresco.
 %PYEXE% -m inventario.persistencia >> %LOGFILE% 2>&1
+if errorlevel 1 set FALLO=1
 
 REM DEC-092: pasada mensual de mantenimiento — el día 1, una sola vez.
 REM
@@ -73,8 +84,19 @@ for /f %%i in ('powershell -NoProfile -Command "(Get-Date).Hour"') do set HORA_D
 if "%DIA_MES%"=="1" if "%HORA_DIA%"=="5" (
     echo [mantenimiento] pasada mensual — dia 1 >> %LOGFILE%
     %PYEXE% scraper/scraper_principal.py --modo mantenimiento >> %LOGFILE% 2>&1
+    if errorlevel 1 set FALLO=1
 )
 
 REM Ejecutar el ETL después del scraper — como módulo (E-7, DEC-018:
 REM el paquete editable resuelve los imports, sin hack de sys.path)
 %PYEXE% -m etl.etl_principal >> %LOGFILE% 2>&1
+if errorlevel 1 set FALLO=1
+
+REM Aviso best-effort si hubo al menos un fallo (deuda de mediano plazo,
+REM CLAUDE.md). No verificado en vivo si se ve: esta tarea corre con
+REM LogonType=Password ("esté o no el usuario conectado"), que puede no
+REM tener escritorio interactivo adjunto — ver el aviso al tope de
+REM notificar_fallo_scheduler.ps1 y docs/decisions.md.
+if "%FALLO%"=="1" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\notificar_fallo_scheduler.ps1" -LogFile "%CD%\%LOGFILE%" >> %LOGFILE% 2>&1
+)

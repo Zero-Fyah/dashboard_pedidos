@@ -12,12 +12,23 @@ contrato entre etapas: el dashboard escribe **un archivo**, no una tabla.
 
 from __future__ import annotations
 
+import logging
 import re
+import shutil
 import unicodedata
 from pathlib import Path
 
+logger = logging.getLogger("conteos_io")
+
 CARPETA_CONTEOS = Path(__file__).parent.parent / "data" / "conteos"
 CARPETA_ANULADOS = CARPETA_CONTEOS / "anulados"
+
+# Respaldo a disco externo (deuda cerrada, ver docs/decisions.md): antes de
+# esto, data/conteos/ no tenía ninguna copia fuera de este equipo. E: es un
+# disco fijo dedicado a respaldo en esta máquina, no un USB intermitente —
+# aun así la copia es best-effort: si no está montado no debe romper la
+# subida, que ya dejó el archivo a salvo en CARPETA_CONTEOS (DEC-058).
+CARPETA_RESPALDO = Path("E:/dashboard_pedidos_respaldo/conteos")
 
 EXTENSION = ".xlsx"
 
@@ -51,6 +62,22 @@ def existe(nombre: str) -> bool:
     return (CARPETA_CONTEOS / nombre_seguro(nombre)).exists()
 
 
+def _respaldar() -> None:
+    """Copia `data/conteos/` completa a `CARPETA_RESPALDO`, best-effort.
+
+    Nunca debe tumbar el flujo de subida/anulación: el archivo ya quedó a
+    salvo en `CARPETA_CONTEOS`, que sigue siendo el origen de verdad
+    (DEC-058). Si el disco de respaldo no está conectado, la copia falla
+    con `OSError` y acá solo se registra — no se propaga.
+    """
+    try:
+        shutil.copytree(CARPETA_CONTEOS, CARPETA_RESPALDO, dirs_exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "Respaldo de conteos a %s falló (¿disco desconectado?): %s", CARPETA_RESPALDO, exc
+        )
+
+
 def guardar(nombre: str, contenido: bytes) -> Path:
     """Deja la hoja en `data/conteos/`, lista para la próxima corrida.
 
@@ -60,6 +87,7 @@ def guardar(nombre: str, contenido: bytes) -> Path:
     destino = CARPETA_CONTEOS / nombre_seguro(nombre)
     destino.parent.mkdir(parents=True, exist_ok=True)
     destino.write_bytes(contenido)
+    _respaldar()
     return destino
 
 
@@ -84,6 +112,7 @@ def anular(nombre: str) -> Path:
         destino = CARPETA_ANULADOS / f"{Path(seguro).stem}_{contador}{EXTENSION}"
         contador += 1
     origen.replace(destino)
+    _respaldar()
     return destino
 
 
