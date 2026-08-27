@@ -34,9 +34,11 @@ extend-exclude = [
 select = ["E4", "E7", "E9", "F", "I", "B"]
 
 [tool.ruff.lint.isort]
-# `theme`, `components` y `db` se importan sin el prefijo `dashboard.`
-# porque Streamlit pone el directorio del entry point (dashboard/) en
-# sys.path — son módulos propios aunque el import no lo parezca.
+# `theme` y `db` se importan sin el prefijo `dashboard.` porque Streamlit
+# pone el directorio del entry point (dashboard/) en sys.path — son
+# módulos propios aunque el import no lo parezca. (`components` se
+# eliminó del proyecto en DEC-103 — retirado de esta lista el 2026-08-27,
+# hallazgo de la auditoría de documentación del 2026-08-26.)
 known-first-party = [
     "comun",
     "scraper",
@@ -44,7 +46,6 @@ known-first-party = [
     "dashboard",
     "inventario",
     "theme",
-    "components",
     "db",
 ]
 
