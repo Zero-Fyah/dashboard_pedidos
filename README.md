@@ -3,13 +3,13 @@
 
 # dashboard_pedidos
 
-**Actualizado:** 2026-08-05
+**Actualizado:** 2026-08-26
 
 Pipeline de datos en tres etapas para un sistema administrativo interno (SPA Vue.js + Element
 Plus) de una empresa colombiana que gestiona su propia operación logística. Un scraper asíncrono
 extrae pedidos, subpedidos, líneas de producto, línea de tiempo de alistamiento, registros de
-pago y registros operacionales; un ETL los normaliza; y un dashboard de 15 páginas los publica.
-Todo vive en SQLite: **30 tablas y 23 VIEWs**. Los datos recopilados servirán como insumo para
+pago y registros operacionales; un ETL los normaliza; y un dashboard de 17 páginas los publica.
+Todo vive en SQLite: **35 tablas y 24 VIEWs**. Los datos recopilados servirán como insumo para
 un futuro sistema de predicción de demanda.
 
 Sobre esa base se construyó además un **módulo de inventario** que cruza el catálogo del sistema
@@ -60,7 +60,7 @@ scraper/scraper_principal.py
   │   sentinel None al final, uno por worker     │
   └──┬──────┬───────┬─────────┬────────┬─────────┘
      │      │       │         │        │
-   W-0    W-1     W-2       W-3      W-4    ← 5 workers
+   W-0    W-1     W-2       W-3      W-4    W-5   ← 6 workers
      │      │       │         │        │      BrowserContext independiente
      ┴──────┴───────┴─────────┴────────┘      circuit breaker + re-login
                 │
@@ -80,12 +80,16 @@ scraper/scraper_principal.py
    inventario.persistencia   ← cruce con el layout de bodega y escritura de tablas derivadas
                 │
                 ▼
+   scraper.cambios_inventario + scraper.movimientos_bochica   ← captura diaria de
+                │                                                movimientos (admin + Bochica)
+                ▼
         etl/etl_principal.py   ← normalización de montos + VIEWs analíticas + ANALYZE
 ```
 
-El mismo `.bat` encadena los cinco pasos en ese orden: el ETL va último para que normalice a
-`_num` todo lo que los pasos anteriores acaban de capturar. Un ciclo completo tarda **41 min de
-mediana** (20 ciclos medidos el 2026-08-05; rango 37,5-46,5 min).
+El mismo `.bat` encadena siete pasos en ese orden: el ETL va último para que normalice a
+`_num` todo lo que los pasos anteriores acaban de capturar. Un ciclo completo tarda **~30-32
+min** en producción real (auditoría de rendimiento, 2026-08-26 — navegación interna vía Vue
+Router en vez de recargar la SPA por cada pedido).
 
 El pipeline termina en `dashboard/app.py` (Streamlit), que consume `data/pedidos.db` **solo por
 lectura** y, salvo excepción medida, a través de VIEWs.
@@ -109,6 +113,12 @@ dashboard_pedidos/
 ├── .github/
 │   └── workflows/
 │       └── ci.yml            # CI: ruff+mypy, pytest (ubuntu+windows), gitleaks
+├── comun/                    # Módulo común — único origen de verdad del dominio
+│   ├── __init__.py           # to_num, get_db_path, ESTADOS_*, umbrales
+│   ├── entregas.py           # los tres formatos de hora_entrega y el OTIF
+│   ├── motivos.py            # clasificación del motivo de cancelación
+│   ├── arena.py              # dominio compartido del módulo Arena (DEC-117)
+│   └── reposicion.py         # punto de reorden y cantidad sugerida
 ├── data/                     # Datos locales — gitignored
 │   ├── pedidos.db            # Base de datos SQLite
 │   ├── debug/                # HTMLs de debug — pueden contener PII
@@ -123,9 +133,10 @@ dashboard_pedidos/
 │   ├── filtros.py            # Filtros globales compartidos por session_state
 │   ├── tareas_db.py          # Tareas manuales — data/tareas.db
 │   ├── conteos_io.py         # Recibe y archiva las hojas de conteo
-│   └── pages/                # 15 páginas, en cuatro secciones:
+│   └── pages/                # 17 páginas, en cuatro secciones:
 │                             #   inventario → estado del área, alertas, bodega vs.
-│                             #     sistema, salud, ABC-XYZ, mapa, plan de conteo
+│                             #     sistema, salud, ABC-XYZ, mapa, plan de conteo,
+│                             #     faltantes, Arena (módulo aparte, checkpoint DEC-118)
 │                             #   pedidos    → consolidado, excepciones, productividad
 │                             #   comercial  → ventas, cobranza
 │                             #   fuera del alcance del área → ciclo de vida,
@@ -143,6 +154,7 @@ dashboard_pedidos/
 │   ├── cancelaciones.py      # Mercancía alistada que se canceló
 │   ├── hallazgos.py          # Detectores de calidad de datos
 │   ├── alertas.py            # Centro de excepciones
+│   ├── arena.py              # Inventario del módulo Arena por ciudad (DEC-117)
 │   └── persistencia.py       # Esquema, VIEWs y escritura transaccional
 ├── docs/                     # Contexto persistente del proyecto
 │   ├── integral.md           # Visión, problema y objetivo de negocio
@@ -160,16 +172,22 @@ dashboard_pedidos/
 │   ├── migrations/           # Scripts de migración de única ejecución
 │   │   ├── reset_timeline_incompleto.py
 │   │   ├── corregir_entrega_ruta.py
-│   │   └── separar_descuento_tipo.py
+│   │   ├── separar_descuento_tipo.py
+│   │   ├── backfill_cambios_inventario.py
+│   │   ├── cargar_inicial_movimientos_bochica.py
+│   │   └── borrar_lineas_fantasma_total.py
 │   ├── actualizar_pedidos.bat
 │   ├── config.py             # CONFIG, credenciales, locks, rate limit, logging JSONL
 │   ├── db.py                 # esquema SQLite, migraciones y watermark
-│   ├── extractores.py        # login, listado de pedidos y extractores del detalle
+│   ├── extractores.py        # login, listado de pedidos, extractores del detalle,
+│   │                         # navegación interna vía Vue Router (DEC-124)
 │   ├── persistencia.py       # persistencia_worker + helpers transaccionales
 │   ├── workers.py            # selección de modo, scraping por pedido, circuit breaker
 │   ├── orquestador.py        # main(): carriles, dead-letter, resumen y CLI
 │   ├── inventario.py         # descarga del catálogo del sistema administrativo
 │   ├── bochica.py            # descarga del reporte del sistema de bodega
+│   ├── cambios_inventario.py # captura diaria de "Cambios de inventario" del admin
+│   ├── movimientos_bochica.py # captura diaria de movimientos de BOCHICA (DEC-123)
 │   └── scraper_principal.py  # entry point + facade de re-exports
 ├── tests/                    # Suite de tests
 │   ├── conftest.py           # Fixtures y opciones de pytest
@@ -217,8 +235,9 @@ clasificación ABC-XYZ, salud, tiempos de operación, conteos físicos,
 alertas y hallazgos de calidad), todas reconstruidas en cada corrida del
 scheduler salvo las que guardan historia.
 
-En total: **30 tablas y 23 VIEWs**. El dashboard consume las VIEWs como
-contrato de datos estable, no las tablas crudas del scraper.
+En total: **35 tablas y 24 VIEWs** (verificado en vivo el 2026-08-26). El
+dashboard consume las VIEWs como contrato de datos estable, no las tablas
+crudas del scraper.
 
 ---
 
@@ -313,11 +332,12 @@ en una sola pasada de workers paralelos.
 |---|---|
 | Etapa 1 — Scraper (extracción) | ✅ Completa |
 | Etapa 2 — ETL (normalización + VIEWs SQL) | ✅ Completa |
-| Etapa 3 — Dashboard (visualización) | ✅ Construida — 15 páginas |
+| Etapa 3 — Dashboard (visualización) | ✅ Construida — 17 páginas |
 | Módulo de inventario (cruce bodega ↔ sistema + ciclo de conteo) | ✅ Construido |
+| Módulo Arena (inventario por ciudad) | ✅ Construido — alcance ampliado bajo checkpoint de autorización (DEC-118) |
 
 El pipeline corre desatendido cada hora en Windows Task Scheduler y la suite
-tiene **864 tests**.
+tiene **987 tests** (987 passed + 2 skipped, medido 2026-08-26).
 
 El dashboard tiene dos propósitos: el trabajo diario del área de inventarios
 —el principal— y la consulta y el análisis general para las demás áreas, que
