@@ -50,13 +50,26 @@ ALMACEN_BODEGA = "Bogotá"
 CATEGORIA_AVERIA = "Outlet %"
 _PATRON_AVERIA = r"\sAVER[ÍI]A$"
 
-# Los dos valores crudos de `producto_activo` en el export del admin
-# (DEC-065). Vocabulario del sistema origen, así que vive acá; las
-# etiquetas que se publican hacia el dashboard son `comun.VIGENCIA_*`,
-# porque son contrato entre etapas. Qué significa cada uno —y cómo se
-# estableció— está en `vigencia_por_referencia()`.
+# Los valores crudos de `producto_activo` en el export del admin (DEC-065).
+# Vocabulario del sistema origen, así que vive acá; las etiquetas que se
+# publican hacia el dashboard son `comun.VIGENCIA_*`, porque son contrato
+# entre etapas. Qué significa cada uno —y cómo se estableció— está en
+# `vigencia_por_referencia()`.
+#
+# El origen cambió de vocabulario entre el 2026-08-19 y el 2026-08-20, el
+# mismo cambio que retiró el punto final de dos encabezados (DEC-122): pasó
+# de las etiquetas mal traducidas `Fue`/`No hay` a las literales `Sí`/`No`.
+# Medido igual que en DEC-065 para no asumir por la etiqueta: `Sí` trae
+# 55,3% de filas con inventario > 0 contra 9,4% de `No` — mismo patrón que
+# `Fue` (69%) y `No hay` (6%), así que es el mismo corte con nombre nuevo.
+# Se aceptan las dos parejas para no romper si algún archivo viejo se
+# reprocesa.
 ADMIN_ACTIVO = "Fue"
 ADMIN_DESCONTINUADO = "No hay"
+ADMIN_ACTIVO_SI = "Sí"
+ADMIN_DESCONTINUADO_NO = "No"
+_VALORES_ACTIVO = frozenset({ADMIN_ACTIVO, ADMIN_ACTIVO_SI})
+_VALORES_DESCONTINUADO = frozenset({ADMIN_DESCONTINUADO, ADMIN_DESCONTINUADO_NO})
 
 
 def cargar_admin(path: Path) -> pd.DataFrame:
@@ -79,20 +92,26 @@ def cargar_admin(path: Path) -> pd.DataFrame:
     # Forzar el dtype en la lectura evita que la inferencia numérica de
     # pandas alcance a tocar la columna.
     df = pd.read_excel(path, dtype={"ID de especificación": str})
+    # El origen ha traído algunos encabezados con un punto final
+    # (p. ej. "Referencia del producto.") y en algún momento entre el
+    # 2026-08-19 y el 2026-08-20 dejó de hacerlo en dos de ellos, sin aviso
+    # (DEC-122). Quitarlo antes de mapear vuelve el cruce tolerante a las dos
+    # variantes sin tener que declararlas a mano una por una.
+    df = df.rename(columns=lambda c: c.rstrip(".") if isinstance(c, str) else c)
     df = df.rename(
         columns={
             "Identificación del producto": "id_producto_admin",
             "ID de especificación": "id_especificacion",
             "Nombre comercial": "nombre_comercial",
             "Inventario": "inventario",
-            "Referencia del producto.": "referencia",
+            "Referencia del producto": "referencia",
             "ALMACEN": "almacen",
             "Categoria del producto": "categoria",
             "Especificación": "especificacion",
-            "Código de barras.": "codigo_barras",
+            "Código de barras": "codigo_barras",
             "Peso": "peso",
             "Precio": "precio",
-            "Existencias restantes.": "existencias_restantes",
+            "Existencias restantes": "existencias_restantes",
             "Producto activo o inactivo": "producto_activo",
             "Descuento": "descuento",
             "IVA": "iva",
@@ -116,6 +135,17 @@ def cargar_admin(path: Path) -> pd.DataFrame:
         "descuento",
         "iva",
     ]
+    # El mismo cambio de origen retiró "Existencias restantes" por completo
+    # en algunas corridas (no solo el punto). Es dato de exhibición —hoy solo
+    # lo consume `inventario/arena.py`, sin entrar en ningún cálculo— así que
+    # se rellena NULL y se avisa, en vez de tumbar toda la carga por una
+    # columna que nadie usa para decidir nada (DEC-122).
+    if "existencias_restantes" not in df.columns:
+        logger.warning(
+            "cargar_admin: el origen (%s) no trae 'Existencias restantes' — columna queda NULL",
+            path,
+        )
+        df["existencias_restantes"] = pd.NA
     return df[columnas]
 
 
@@ -211,6 +241,37 @@ def marcar_averias(df_admin: pd.DataFrame) -> pd.Series:
     return por_categoria | por_referencia
 
 
+def clasificar_vigencia(valores: pd.Series) -> pd.Series:
+    """Mapea `producto_activo` (texto crudo del admin) a Activo/Descontinuado.
+
+    Único punto de traducción de ese vocabulario (DEC-122): un valor nuevo
+    cae del lado "descontinuado" por diseño — nunca se asume vigente en
+    silencio — y queda registrado por log. Reusado por
+    `vigencia_por_referencia()` y por `inventario.ubicaciones.
+    sin_ubicacion_conocida()`, que antes de DEC-122 (corrección de
+    2026-08-22) tenían cada uno su propio mapeo y solo uno se corrigió
+    cuando el origen cambió de "Fue"/"No hay" a "Sí"/"No".
+
+    Args:
+        valores: Serie con los valores crudos de `producto_activo`.
+
+    Returns:
+        Serie del mismo largo/índice con `Activo` o `Descontinuado`.
+    """
+    valores = valores.astype(str).str.strip()
+    activo = valores.isin(_VALORES_ACTIVO)
+
+    desconocidos = set(valores) - _VALORES_ACTIVO - _VALORES_DESCONTINUADO
+    if desconocidos:
+        logger.warning(
+            "clasificar_vigencia: valores de producto_activo fuera de los "
+            "conocidos %s — se tratan como descontinuados: %s",
+            sorted(_VALORES_ACTIVO | _VALORES_DESCONTINUADO),
+            sorted(desconocidos),
+        )
+    return activo.map({True: VIGENCIA_ACTIVO, False: VIGENCIA_DESCONTINUADO})
+
+
 def vigencia_por_referencia(df_admin: pd.DataFrame) -> pd.Series:
     """Clasifica cada referencia en vigente o descontinuada (DEC-065).
 
@@ -241,21 +302,7 @@ def vigencia_por_referencia(df_admin: pd.DataFrame) -> pd.Series:
     """
     df = df_admin[["referencia", "producto_activo"]].copy()
     df["referencia"] = df["referencia"].astype(str).str.strip()
-    activo = df["producto_activo"].astype(str).str.strip() == ADMIN_ACTIVO
-
-    desconocidos = set(df["producto_activo"].astype(str).str.strip()) - {
-        ADMIN_ACTIVO,
-        ADMIN_DESCONTINUADO,
-    }
-    if desconocidos:
-        # Un valor nuevo cae del lado "descontinuado" por el == de arriba y
-        # sacaría referencias del universo de salud sin que nadie lo note.
-        logger.warning(
-            "vigencia_por_referencia: valores de producto_activo fuera de "
-            "los conocidos %s — se tratan como descontinuados: %s",
-            (ADMIN_ACTIVO, ADMIN_DESCONTINUADO),
-            sorted(desconocidos),
-        )
+    activo = clasificar_vigencia(df["producto_activo"]) == VIGENCIA_ACTIVO
 
     por_referencia = activo.groupby(df["referencia"]).any()
     return por_referencia.map({True: VIGENCIA_ACTIVO, False: VIGENCIA_DESCONTINUADO}).rename(

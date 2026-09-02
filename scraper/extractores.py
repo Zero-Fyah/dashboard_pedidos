@@ -177,6 +177,7 @@ async def login(page: Page, usuario: str, clave: str) -> None:
         RuntimeError: Si la autenticación falla tras 3 intentos consecutivos.
     """
     for intento in range(1, 4):
+        t_intento_ini = time.monotonic()
         try:
             await page.goto(CONFIG["url_login"], timeout=CONFIG["NAV_TIMEOUT_MS"])
             await page.wait_for_selector(
@@ -211,7 +212,11 @@ async def login(page: Page, usuario: str, clave: str) -> None:
                     await asyncio.sleep(1.0)
                     break
 
-            log_event("login_ok", msg=f"Autenticación exitosa (intento {intento})")
+            log_event(
+                "login_ok",
+                duracion_ms=int((time.monotonic() - t_intento_ini) * 1000),
+                msg=f"Autenticación exitosa (intento {intento})",
+            )
             return
 
         except Exception as exc:
@@ -224,6 +229,88 @@ async def login(page: Page, usuario: str, clave: str) -> None:
                 await asyncio.sleep(CONFIG["BACKOFF_BASE_S"])
 
     raise RuntimeError("Login fallido tras 3 intentos")
+
+
+# ─────────────────────────────────────────────
+# NAVEGACIÓN INTERNA DE LA SPA (Vue Router)
+# ─────────────────────────────────────────────
+
+_RUTA_DETALLE_PEDIDO = "/country/CO/orders/parent-orders/detail/{id_pedido}"
+
+_JS_ROUTER_PUSH = """async (ruta) => {
+    const app = document.querySelector('#app').__vue_app__;
+    await app.config.globalProperties.$router.push(ruta);
+}"""
+
+# Buscar por la ETIQUETA "Número de pedido", no por la posición del primer
+# div.info-item — misma lección de BUG-019/DEC-023: indexar por posición
+# rompe en silencio si el origen reordena los campos de la tarjeta.
+_JS_ESPERAR_ID_EN_PANTALLA = """(idObjetivo) => {
+    const items = document.querySelectorAll('div.info-item');
+    for (const item of items) {
+        const label = item.querySelector('.info-label');
+        const value = item.querySelector('.info-value');
+        if (label && value && /número de pedido/i.test(label.textContent)) {
+            return value.textContent.trim() === idObjetivo;
+        }
+    }
+    return false;
+}"""
+
+
+async def navegar_a_detalle_via_router(page: Page, id_pedido: str) -> bool:
+    """Navega al detalle de un pedido reutilizando la SPA ya montada, vía
+    Vue Router, en vez de recargar la página completa con `page.goto()`.
+
+    Auditoría de rendimiento 2026-08-26 + piloto a escala real (2.280
+    pedidos, 6 workers concurrentes, 2.280/2.280 correctos): evita el
+    reinicio completo del bundle de Vue en cada pedido — la causa
+    identificada del 55-60% del tiempo por pedido (`render_ms`) medido en
+    producción. Reducción proyectada de la fase de pedidos: ~43 min → ~16
+    min, sobre el mismo volumen real.
+
+    Espera EXPLÍCITAMENTE a que el campo "Número de pedido" visible
+    coincida con el ID objetivo antes de dar la navegación por buena. Sin
+    este paso, una condición de carrera real de Vue devuelve datos del
+    pedido ANTERIOR bajo carga concurrente — medido en el piloto: 64% de
+    resultados incorrectos sin esta espera, 0% de 2.280 con ella. Mismo
+    patrón que `_esperar_cambio_primer_id()` de la paginación
+    (DEC-030/BUG-016): un selector que ya apareció no prueba que el
+    contenido correspondiente haya terminado de actualizarse.
+
+    Si la SPA no expone el router (`__vue_app__` ausente, versión distinta
+    del origen) o la navegación no confirma el ID a tiempo, retorna False
+    sin lanzar excepción — el llamador debe recurrir a `page.goto()`, que
+    sigue siendo el camino probado y siempre disponible como red de
+    seguridad (validado en el mismo piloto: recupera limpio tras un fallo
+    de navegación interna).
+
+    Args:
+        page: Página Playwright con la SPA ya montada (una navegación
+            previa exitosa a cualquier ruta del sistema administrativo).
+        id_pedido: ID del pedido a mostrar.
+
+    Returns:
+        True si la navegación interna funcionó y el ID quedó confirmado
+        en pantalla. False ante cualquier fallo — sin excepción.
+    """
+    ruta = _RUTA_DETALLE_PEDIDO.format(id_pedido=id_pedido)
+    try:
+        await page.evaluate(_JS_ROUTER_PUSH, ruta)
+        await page.wait_for_function(
+            _JS_ESPERAR_ID_EN_PANTALLA,
+            arg=id_pedido,
+            timeout=CONFIG["ELEM_TIMEOUT_MS"],
+        )
+        return True
+    except Exception as exc:
+        log_event(
+            "router_push_fallback",
+            level="WARNING",
+            id_pedido=id_pedido,
+            msg=f"Navegación interna vía router falló, se recurre a page.goto(): {exc}",
+        )
+        return False
 
 
 # ─────────────────────────────────────────────

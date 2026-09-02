@@ -39,6 +39,28 @@ _ADMIN_RAW = pd.DataFrame(
     }
 )
 
+# Formato real desde 2026-08-20 (DEC-122): el origen dejó de mandar el
+# punto final en dos encabezados y retiró "Existencias restantes" por
+# completo, sin aviso — cargar_admin() debe seguir funcionando.
+_ADMIN_RAW_SIN_PUNTO = pd.DataFrame(
+    {
+        "Identificación del producto": [111, 222],
+        "ID de especificación": [1001, 1002],
+        "Nombre comercial": ["Producto A", "Producto B"],
+        "Inventario": [10, 0],
+        "Referencia del producto": ["PA01", "PB02"],
+        "ALMACEN": ["Bogotá", "Bogotá"],
+        "Categoria del producto": ["Juguetes", "Aseo"],
+        "Especificación": ["Color: Rojo;", "Talla: M;"],
+        "Código de barras": [7700000000001, 7700000000002],
+        "Peso": [500, 1000],
+        "Precio": [10000, 20000],
+        "Producto activo o inactivo": ["Fue", "No hay"],
+        "Descuento": ["0%", "10%"],
+        "IVA": ["19%", "19%"],
+    }
+)
+
 _BOCHICA_RAW = pd.DataFrame(
     {
         "ID Producto": [1002, 1002, 0, 9999],
@@ -89,6 +111,36 @@ def test_cargar_admin_renombra_columnas_y_castea_id(admin_read_excel):
     ]
     assert df["id_especificacion"].tolist() == ["1001", "1002"]
     assert all(isinstance(v, str) for v in df["id_especificacion"])
+
+
+def test_cargar_admin_tolera_formato_sin_punto_ni_existencias(monkeypatch):
+    """DEC-122: el origen cambió de formato el 2026-08-20 sin aviso."""
+    monkeypatch.setattr(
+        "inventario.normalizador.pd.read_excel",
+        lambda _path, **_kw: _ADMIN_RAW_SIN_PUNTO.copy(),
+    )
+    df = cargar_admin("cualquier-ruta.xlsx")
+
+    assert list(df.columns) == [
+        "id_especificacion",
+        "id_producto_admin",
+        "nombre_comercial",
+        "referencia",
+        "almacen",
+        "categoria",
+        "especificacion",
+        "codigo_barras",
+        "peso",
+        "inventario",
+        "existencias_restantes",
+        "precio",
+        "producto_activo",
+        "descuento",
+        "iva",
+    ]
+    assert df["referencia"].tolist() == ["PA01", "PB02"]
+    assert df["codigo_barras"].tolist() == [7700000000001, 7700000000002]
+    assert df["existencias_restantes"].isna().all()
 
 
 def test_cargar_bochica_excluye_placeholders_por_default(bochica_read_excel):

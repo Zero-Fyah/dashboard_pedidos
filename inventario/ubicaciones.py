@@ -32,7 +32,7 @@ from comun import (
     VIGENCIA_DESCONTINUADO,
     familia_de,
 )
-from inventario.normalizador import ADMIN_ACTIVO, ADMIN_DESCONTINUADO
+from inventario.normalizador import clasificar_vigencia
 
 logger = logging.getLogger("inventario.ubicaciones")
 
@@ -401,9 +401,7 @@ def sin_ubicacion_conocida(df_admin: pd.DataFrame, lineas: pd.DataFrame) -> pd.D
     if fuera.empty:
         return pd.DataFrame(columns=columnas)
 
-    fuera["vigencia"] = fuera["producto_activo"].map(
-        {ADMIN_ACTIVO: VIGENCIA_ACTIVO, ADMIN_DESCONTINUADO: VIGENCIA_DESCONTINUADO}
-    )
+    fuera["vigencia"] = clasificar_vigencia(fuera["producto_activo"])
     fuera = fuera.sort_values("inventario", ascending=False)
 
     logger.info(

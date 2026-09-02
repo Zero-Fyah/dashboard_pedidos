@@ -227,16 +227,19 @@ async def descargar_cambios_inventario(page: Page, fecha: date, destino: Path) -
     rango de fechas (inicio = fin = `fecha`) directamente en los inputs del
     daterange, sin abrir el panel de calendario.
 
-    PENDIENTE DE VALIDAR CONTRA LA APP REAL (primera corrida, headed): si
-    Element Plus acepta el valor tecleado sin abrir el calendario. Por eso
-    se relee el input después de llenarlo y se falla ruidoso si no quedó
-    el valor esperado — filtrar mal esta fecha significaría traer el
-    histórico completo en vez de un día, silenciosamente.
+    Validado contra la app real: Element Plus acepta el valor tecleado sin
+    abrir el calendario (confirmado en producción, 5 días consecutivos sin
+    fallo desde 2026-08-14). Se relee el input después de llenarlo y se
+    falla ruidoso si no quedó el valor esperado — filtrar mal esta fecha
+    significaría traer el histórico completo en vez de un día,
+    silenciosamente; el guard queda como defensa permanente, no por duda
+    sobre si el llenado funciona.
 
     El clic en "Exportar" usa LISTADO_TIMEOUT_S (600s), no NAV_TIMEOUT_MS
-    (45s): no hay medición en vivo de cuánto tarda el servidor en generar
-    el Excel de un día — el precedente de bochica.py mide ~111s para
-    ~21.300 filas de otro export similar.
+    (45s): medido en producción, un día individual tarda 2,5-21,6s —
+    bastante margen frente al límite, y muy por debajo del precedente de
+    bochica.py (~111s para ~21.300 filas de otro export similar, un
+    volumen mucho mayor por corrida).
 
     Args:
         page: Página Playwright con sesión autenticada (login()).

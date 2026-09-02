@@ -45,7 +45,19 @@ from scraper.extractores import (
     extraer_total_subpedidos,
     guardar_debug,
     login,
+    navegar_a_detalle_via_router,
 )
+
+# Auditoría de rendimiento 2026-08-26 + piloto a escala real: cada worker
+# reutiliza UNA página para muchos pedidos (navegación interna de Vue
+# Router) en vez de una página nueva por pedido. Cada REFRESH_CADA_N_PEDIDOS
+# pedidos, la página se refresca con un page.goto() completo — red de
+# seguridad validada en el piloto (2.280 pedidos, 6 workers, 0 fallos, sin
+# tendencia de degradación) aunque el conteo de nodos DOM no mostró
+# acumulación real (Vue desmonta el detalle anterior al navegar). N=50 es
+# el valor probado, no necesariamente el óptimo — subirlo exige su propio
+# piloto, igual que _REFRESH_CADA_N_PAGINAS en el listado (DEC-030).
+REFRESH_CADA_N_PEDIDOS = 50
 
 # ─────────────────────────────────────────────
 # SELECCIÓN DE MODO
@@ -98,6 +110,7 @@ async def procesar_pedido(
     resultados_queue: asyncio.Queue,
     db_path: str,
     max_reintentos: int | None = None,
+    usar_push: bool = False,
 ) -> bool:
     """Determina el modo de extracción, navega al detalle y publica en la cola.
 
@@ -119,6 +132,13 @@ async def procesar_pedido(
         db_path: Ruta al archivo SQLite para consultar el estado previo.
         max_reintentos: Tope de intentos. None usa CONFIG["MAX_REINTENTOS"]
                         (AUD-B4: el dead-letter pasa 2 en vez de mutar CONFIG).
+        usar_push: Si True, el primer intento navega vía
+            `navegar_a_detalle_via_router()` (Vue Router interno) en vez de
+            `page.goto()` — auditoría de rendimiento 2026-08-26. Solo aplica
+            al intento 1; cualquier reintento usa `page.goto()` sin
+            excepción, como red de seguridad de "reinicio limpio" (validado
+            en el piloto). Default False preserva el comportamiento previo
+            exacto — quien no pase este parámetro no nota ningún cambio.
 
     Returns:
         True si el pedido fue extraído y publicado con éxito, False si no.
@@ -174,26 +194,34 @@ async def procesar_pedido(
     for intento in range(1, max_reintentos + 1):
         try:
             t_nav_ini = time.monotonic()
-            await page.goto(
-                CONFIG["url_detalle"] + id_pedido,
-                timeout=CONFIG["NAV_TIMEOUT_MS"],
-                **nav_kwargs,
+            # Navegación interna vía router solo en el primer intento — un
+            # reintento siempre usa page.goto() sin excepción: un "reinicio
+            # limpio" tras un fallo previo, validado en el piloto de
+            # rendimiento (Fase C, recuperación 100% de un ID inválido).
+            navego_via_router = (
+                usar_push and intento == 1 and await navegar_a_detalle_via_router(page, id_pedido)
             )
-
-            if "/login" in page.url:
-                async with LOGIN_LOCK:
-                    log_event(
-                        "session_expired",
-                        worker_id=worker_id,
-                        id_pedido=id_pedido,
-                        msg="Sesión expirada — re-login",
-                    )
-                    await login(page, USUARIO, CLAVE)
+            if not navego_via_router:
                 await page.goto(
                     CONFIG["url_detalle"] + id_pedido,
                     timeout=CONFIG["NAV_TIMEOUT_MS"],
                     **nav_kwargs,
                 )
+
+                if "/login" in page.url:
+                    async with LOGIN_LOCK:
+                        log_event(
+                            "session_expired",
+                            worker_id=worker_id,
+                            id_pedido=id_pedido,
+                            msg="Sesión expirada — re-login",
+                        )
+                        await login(page, USUARIO, CLAVE)
+                    await page.goto(
+                        CONFIG["url_detalle"] + id_pedido,
+                        timeout=CONFIG["NAV_TIMEOUT_MS"],
+                        **nav_kwargs,
+                    )
             nav_ms = int((time.monotonic() - t_nav_ini) * 1000)
             # DEC-030 Fase 0: t_render_ini/t_extract_ini separan cuánto cuesta
             # esperar el render de Vue vs. extraer el DOM ya renderizado — los
@@ -434,6 +462,17 @@ async def scraper_worker(
     El handler solo señaliza via registrar_rate_limit() (AUD-M2); la pausa real
     la ejecuta este loop consultando rate_limit_pendiente() antes de cada pedido.
 
+    Auditoría de rendimiento 2026-08-26: la página se crea UNA vez por
+    worker, no una vez por pedido — procesar_pedido() navega entre pedidos
+    reutilizando esa misma página vía Vue Router
+    (`navegar_a_detalle_via_router()`), con `page.goto()` completo cada
+    REFRESH_CADA_N_PEDIDOS pedidos como refresco de seguridad, y también
+    tras cualquier fallo o cooldown de circuit breaker (reinicio limpio
+    antes de seguir). El primer pedido de cada worker siempre usa
+    `page.goto()` (arranque). Validado en un piloto a escala real: 2.280
+    pedidos, 6 workers concurrentes, 2.280/2.280 correctos, sin
+    degradación por reutilizar la página.
+
     Args:
         worker_id: Identificador único (0 a NUM_WORKERS-1).
         context: BrowserContext independiente de Playwright.
@@ -443,8 +482,6 @@ async def scraper_worker(
         max_reintentos: Tope de intentos por pedido, pasado a
                         procesar_pedido (AUD-B4). None usa el de CONFIG.
     """
-    consecutive_failures = 0
-    circuit_reopenings = 0
     current_pedido: list[str] = [""]
 
     async def _response_handler(response: Response) -> None:
@@ -460,8 +497,65 @@ async def scraper_worker(
             msg=f"HTTP 429 — pausa de {wait_s:.0f}s señalizada para los workers",
         )
 
+    page = await context.new_page()
+    page.on("response", _response_handler)
+
+    try:
+        await _consumir_cola(
+            worker_id,
+            page,
+            pedidos_queue,
+            resultados_queue,
+            db_path,
+            max_reintentos,
+            current_pedido,
+        )
+    finally:
+        await page.close()
+
+
+async def _consumir_cola(
+    worker_id: int,
+    page: Page,
+    pedidos_queue: asyncio.Queue,
+    resultados_queue: asyncio.Queue,
+    db_path: str,
+    max_reintentos: int | None,
+    current_pedido: list[str],
+) -> None:
+    """Cuerpo del loop de scraper_worker() — extraído para que la página
+    se cree y se cierre una sola vez en el llamador, con garantía de
+    cierre (try/finally) sin importar por cuál salida termine el loop."""
+    consecutive_failures = 0
+    circuit_reopenings = 0
+    contador_desde_refresh = 0
+
     while True:
+        # Auditoría de rendimiento 2026-08-26: la ocupación medida de los
+        # workers era 76,7% del tiempo (4,6/6 activos en promedio) y no
+        # había forma de atribuir el resto a una causa concreta. Este timer
+        # mide cuánto espera el worker por un ítem de la cola — junto con
+        # `duracion_ms` en rate_limit_espera/circuit_open (abajo), las tres
+        # causas de inactividad quedan medidas por separado en vez de
+        # mezcladas en un solo "% ocupado" sin explicación.
+        t_espera_ini = time.monotonic()
         id_pedido = await pedidos_queue.get()
+        espera_cola_ms = int((time.monotonic() - t_espera_ini) * 1000)
+        # Umbral de 500ms: con la cola pre-llenada por _fill() antes de que
+        # los workers arranquen, un get() normal resuelve en microsegundos —
+        # solo vale la pena loguear cuando el worker genuinemente se quedó
+        # sin trabajo (cola casi agotada) o muy atrás de los demás.
+        if espera_cola_ms > 500:
+            log_event(
+                "worker_espera_cola",
+                worker_id=worker_id,
+                duracion_ms=espera_cola_ms,
+                msg=(
+                    "Worker sin ítems disponibles en la cola"
+                    if id_pedido is not None
+                    else "Worker esperando la señal de cierre (cola ya agotada)"
+                ),
+            )
         if id_pedido is None:
             break
 
@@ -473,13 +567,18 @@ async def scraper_worker(
                 "rate_limit_espera",
                 worker_id=worker_id,
                 id_pedido=id_pedido,
+                duracion_ms=int(espera_rl * 1000),
                 msg=f"Pausando {espera_rl:.0f}s por rate limit activo",
             )
             await asyncio.sleep(espera_rl)
 
         current_pedido[0] = id_pedido
-        page = await context.new_page()
-        page.on("response", _response_handler)
+        # Auditoría de rendimiento 2026-08-26: la página se reutiliza (viene
+        # del llamador, no se crea ni se cierra por pedido). usar_push=True
+        # salvo el primer pedido de la página (contador en 0) y cada
+        # REFRESH_CADA_N_PEDIDOS (refresco de seguridad con page.goto()
+        # completo) — mismo criterio que _REFRESH_CADA_N_PAGINAS del listado.
+        usar_push = (contador_desde_refresh % REFRESH_CADA_N_PEDIDOS) != 0
 
         try:
             exito = await procesar_pedido(
@@ -489,6 +588,7 @@ async def scraper_worker(
                 resultados_queue,
                 db_path,
                 max_reintentos=max_reintentos,
+                usar_push=usar_push,
             )
         except Exception as exc:
             # AUD-M9: red de seguridad final — procesar_pedido() ya cubre su
@@ -508,18 +608,23 @@ async def scraper_worker(
                 {"id_pedido": id_pedido, "_error": True, "detalle": str(exc)}
             )
             exito = False
-        finally:
-            await page.close()
 
         if exito:
             consecutive_failures = 0
+            contador_desde_refresh += 1
         else:
             consecutive_failures += 1
+            # Un fallo deja la página en un estado desconocido (pudo haber
+            # navegado a medias, quedado en una excepción intermedia, etc.)
+            # — el siguiente pedido arranca con page.goto() completo en vez
+            # de encadenar un push sobre esa incertidumbre.
+            contador_desde_refresh = 0
 
         if consecutive_failures >= CONFIG["CIRCUIT_FAILURE_THRESHOLD"]:
             log_event(
                 "circuit_open",
                 worker_id=worker_id,
+                duracion_ms=CONFIG["CIRCUIT_COOLDOWN_S"] * 1000,
                 msg=(
                     f"{consecutive_failures} fallos consecutivos — "
                     f"cooldown {CONFIG['CIRCUIT_COOLDOWN_S']}s"

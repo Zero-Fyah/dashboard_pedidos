@@ -8,6 +8,7 @@ from inventario.ubicaciones import (
     calcular_ubicaciones,
     mapa_posiciones,
     resumen_cobertura,
+    sin_ubicacion_conocida,
 )
 
 
@@ -316,3 +317,36 @@ def test_el_mapa_sin_inventario_devuelve_todo_vacio(layout_activo):
     assert len(mapa) == 4
     assert (mapa["ocupada"] == 0).all()
     assert (mapa["unidades"] == 0).all()
+
+
+def test_sin_ubicacion_conocida_reconoce_vocabulario_si_no():
+    """DEC-122 (corrección 2026-08-22): el origen usa 'Sí'/'No', no 'Fue'/'No hay'.
+
+    `sin_ubicacion_conocida()` tenía su propio mapeo con los valores viejos,
+    aislado del fix de `vigencia_por_referencia()` — con vocabulario nuevo
+    clasificaba todo como NaN en vez de Activo/Descontinuado.
+    """
+    df_admin = pd.DataFrame(
+        [
+            {
+                "id_especificacion": "1",
+                "referencia": "PA70",
+                "nombre_comercial": "Producto A",
+                "producto_activo": "Sí",
+                "inventario": 10,
+            },
+            {
+                "id_especificacion": "2",
+                "referencia": "PB10",
+                "nombre_comercial": "Producto B",
+                "producto_activo": "No",
+                "inventario": 5,
+            },
+        ]
+    )
+    lineas = pd.DataFrame(columns=["id_especificacion"])
+
+    r = sin_ubicacion_conocida(df_admin, lineas).set_index("id_especificacion")
+
+    assert r.loc["1", "vigencia"] == "Activo"
+    assert r.loc["2", "vigencia"] == "Descontinuado"

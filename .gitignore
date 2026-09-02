@@ -79,6 +79,10 @@ Thumbs.db
 # de contexto interno (DEC-116 Bochica, checkpoint DEC-118 Arena, etc.) que
 # ya excluye .claude/skills/ arriba. Mismo criterio, misma razón (DEC-017).
 .claude/agents/
+# Memoria persistente que los subagentes escriben entre sesiones — mismo
+# criterio que .claude/agents/ arriba: guarda hallazgos de negocio internos
+# (ej. mediciones sobre traslados desde Yumbo) sin pasar por revisión.
+.claude/agent-memory/
 
 # Documentación interna de negocio — NO versionar mientras el repo sea público (DEC-017)
 docs/

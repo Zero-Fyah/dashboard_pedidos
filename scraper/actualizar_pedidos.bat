@@ -53,6 +53,22 @@ REM duplicar trabajo ni necesitar que el scheduler acierte una hora exacta.
 %PYEXE% -m scraper.cambios_inventario >> %LOGFILE% 2>&1
 if errorlevel 1 set FALLO=1
 
+REM Captura diaria de movimientos de BOCHICA (Montacargas > Movimientos):
+REM mismo patrón que TASK-001 arriba — ya_cargado() decide si "ayer" ya
+REM está cargado y termina de inmediato si sí. Además archiva el snapshot
+REM de inventario de Bochica de ese día como cierre de jornada (retención
+REM 30 días). Validado tres veces a mano contra la sesión real y auditado
+REM por un agente especializado (encontró y se corrigió una condición de
+REM carrera en la espera del resultado y falta de validación del
+REM encabezado de la tabla) — ver DEC-123. El primer ciclo automático real
+REM (2026-08-26, scheduler reactivado) ya ejecutó el gate ya_cargado() sin
+REM supervisión, pero encontró "ayer" cubierto por la carga inicial y no
+REM llegó a disparar la descarga — el primer disparo real sin supervisión
+REM sigue pendiente hasta que el reloj cruce al día siguiente del último
+REM día cargado.
+%PYEXE% -m scraper.movimientos_bochica >> %LOGFILE% 2>&1
+if errorlevel 1 set FALLO=1
+
 REM DEC-043: cruce de inventario y persistencia en pedidos.db. Va después
 REM de las dos descargas (necesita ambos Excel frescos) y con el mismo
 REM criterio de aislamiento: si falla, no bloquea el ETL. El dashboard lee

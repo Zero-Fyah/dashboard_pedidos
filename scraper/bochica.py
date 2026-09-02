@@ -136,7 +136,7 @@ async def sembrar_sesion(ruta_sesion: Path = SESION_DEFAULT) -> None:
         await browser.close()
 
 
-async def _frame_con_selector(page: Page, selector: str, timeout_ms: int) -> Frame:
+async def frame_con_selector(page: Page, selector: str, timeout_ms: int) -> Frame:
     """Busca, entre todos los frames de la página, el primero que contenga `selector`.
 
     Bochica (Google Apps Script, modo sandbox) renderiza su contenido real
@@ -145,6 +145,11 @@ async def _frame_con_selector(page: Page, selector: str, timeout_ms: int) -> Fra
     encadenar `frame_locator` por nombre resuelve al frame equivocado o
     a ninguno. Buscar por contenido en todos los `page.frames` es lo único
     que funcionó de forma confiable contra la app real.
+
+    Pública desde que `scraper.movimientos_bochica` la necesitó también
+    (mismo patrón de nesting, módulo "Movimientos" en vez de "Inventario
+    General") — segunda necesidad real, mismo criterio que justificó no
+    duplicarla.
 
     Args:
         page: Página Playwright.
@@ -180,7 +185,7 @@ async def login_app_bochica(page: Page, usuario: str, clave: str) -> None:
         usuario: Usuario de la app (BOCHICA_APP_USUARIO).
         clave: Contraseña de ese usuario (BOCHICA_APP_PASSWORD).
     """
-    frame = await _frame_con_selector(page, "#loginEmail", CONFIG["ELEM_TIMEOUT_MS"])
+    frame = await frame_con_selector(page, "#loginEmail", CONFIG["ELEM_TIMEOUT_MS"])
     await frame.locator("#loginEmail").fill(usuario)
     await frame.locator("#loginPassword").fill(clave)
     await frame.locator("#loginButton").click()
@@ -205,7 +210,7 @@ async def descargar_inventario_global(page: Page, destino: Path = DESTINO_DEFAUL
     Returns:
         La misma ruta `destino`, tras confirmar que el archivo se guardó.
     """
-    frame = await _frame_con_selector(page, "#appContent", CONFIG["ELEM_TIMEOUT_MS"])
+    frame = await frame_con_selector(page, "#appContent", CONFIG["ELEM_TIMEOUT_MS"])
 
     # El sidebar se desliza fuera del viewport con CSS (transform), no con
     # display/visibility — is_visible() no lo detecta como oculto y el click
