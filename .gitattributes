@@ -1,0 +1,13 @@
+# Normaliza fin de línea a LF en el repositorio (migración Windows → Linux
+# Mint, 2026-09). El proyecto corre en Linux Mint; los checkouts en Windows
+# siguen viendo LF en disco salvo que configuren core.autocrlf=true de su lado
+# — no se fuerza conversión aquí para no reabrir el mismo problema al revés.
+* text=auto eol=lf
+
+# Binarios explícitos, por si alguno llegara a versionarse por error — evita
+# que `text=auto` intente diffear/normalizar contenido que no es texto.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.db binary
+*.xlsx binary
