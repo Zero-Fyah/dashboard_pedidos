@@ -4,10 +4,11 @@
 # túnel lo alcanza — es el primer motivo por el que "no se ve desde afuera".
 
 [server]
-# Escucha en todas las interfaces. Quien restringe el acceso es el firewall
-# de Windows, que debe permitir el puerto ÚNICAMENTE en el adaptador de
-# Tailscale: así el dashboard queda accesible desde los equipos de la malla
-# y no desde el wifi de la casa ni desde ningún otro lado.
+# Escucha en todas las interfaces. Quien restringe el acceso es la ACL del
+# propio tailnet (ver docs/decisions.md DEC-105 y el skill de Tailscale):
+# solo los nodos autorizados en la política pueden llegar al puerto 8501,
+# así el dashboard queda accesible desde los equipos de la malla y no desde
+# el wifi de la casa ni desde ningún otro lado.
 address = "0.0.0.0"
 port = 8501
 

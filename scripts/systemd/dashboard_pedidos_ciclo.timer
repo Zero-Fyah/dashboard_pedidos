@@ -1,0 +1,19 @@
+# Timer systemd — dispara dashboard_pedidos_ciclo.service cada hora en punto
+# (equivalente Linux del disparador horario de Windows Task Scheduler).
+#
+# Si el servicio de la hora anterior sigue corriendo, systemd no arranca una
+# segunda instancia de la misma unidad — replica el "No iniciar una nueva
+# instancia" que tenía la tarea de Windows (crítico el día 1, DEC-092).
+#
+# Instalar: ver comentario en dashboard_pedidos_ciclo.service
+
+[Unit]
+Description=dashboard_pedidos - dispara el ciclo horario cada hora en punto
+
+[Timer]
+OnCalendar=*-*-* *:00:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

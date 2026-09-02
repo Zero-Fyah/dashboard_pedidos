@@ -243,32 +243,44 @@ crudas del scraper.
 
 ## Instalación
 
+Entorno de referencia: **Linux Mint / Ubuntu** (migrado desde Windows en
+2026-09, ver `docs/decisions.md`). El proyecto no depende de nada específico
+de Windows — todas las rutas usan `pathlib`, sin separadores hardcodeados.
+
 ```bash
 # 1. Clonar el repositorio
 git clone https://github.com/Zero-Fyah/dashboard_pedidos.git
 cd dashboard_pedidos
 
 # 2. Crear entorno virtual con Python 3.12 (DEC-015) e instalar dependencias
-py -3.12 -m venv .venv
-.venv\Scripts\activate
+python3.12 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 pip install -r requirements-dev.txt   # ruff, mypy, pytest-cov (desarrollo)
 pip install -e .                      # paquete en modo editable — requerido por los tests
 
-# 3. Instalar el navegador que usa Playwright
-playwright install chromium
+# 3. Instalar el navegador que usa Playwright + sus dependencias de sistema
+playwright install --with-deps chromium
 
 # 4. Configurar credenciales
-copy .env.example .env
+cp .env.example .env
 # Editar .env con usuario, contraseña y URLs reales
 
 # 5. Activar el gate de calidad pre-commit (una vez por clon, DEC-016)
 git config core.hooksPath scripts/hooks
+cp .confidencial.example .confidencial   # términos que el hook bloquea (DEC-042)
 
-# 6. (Opcional) Programar ejecución incremental automática
-# Registrar scraper/actualizar_pedidos.bat en Windows Task Scheduler
-# (el .bat invoca .venv\Scripts\python.exe — requiere el paso 2)
+# 6. (Opcional) Automatizar el ciclo horario y el arranque del dashboard
+# Unidades systemd listas en scripts/systemd/ — instrucciones de instalación
+# en el comentario de cada archivo (dashboard_pedidos.service,
+# dashboard_pedidos_ciclo.service + .timer). Reemplazan a lo que en Windows
+# era el Task Scheduler ejecutando scraper/actualizar_pedidos.bat.
 ```
+
+Nota para quien viene de la versión anterior en Windows: `scripts/*.bat` y
+`scripts/notificar_fallo_scheduler.ps1` se conservan solo como referencia
+histórica — la operación real corre por los `.sh` equivalentes y las
+unidades systemd de `scripts/systemd/`.
 
 ---
 

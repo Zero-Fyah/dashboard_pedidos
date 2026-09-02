@@ -24,11 +24,15 @@ CARPETA_CONTEOS = Path(__file__).parent.parent / "data" / "conteos"
 CARPETA_ANULADOS = CARPETA_CONTEOS / "anulados"
 
 # Respaldo a disco externo (deuda cerrada, ver docs/decisions.md): antes de
-# esto, data/conteos/ no tenía ninguna copia fuera de este equipo. E: es un
-# disco fijo dedicado a respaldo en esta máquina, no un USB intermitente —
-# aun así la copia es best-effort: si no está montado no debe romper la
-# subida, que ya dejó el archivo a salvo en CARPETA_CONTEOS (DEC-058).
-CARPETA_RESPALDO = Path("E:/dashboard_pedidos_respaldo/conteos")
+# esto, data/conteos/ no tenía ninguna copia fuera de este equipo. Es el
+# mismo disco USB dedicado a respaldo (EJPC-RESPALDO) que en Windows se veía
+# como E:; en Linux Mint el gestor de discos (udisks2) lo monta por etiqueta
+# en /media/<usuario>/EJPC-RESPALDO — aun así la copia es best-effort: si no
+# está montado no debe romper la subida, que ya dejó el archivo a salvo en
+# CARPETA_CONTEOS (DEC-058).
+CARPETA_RESPALDO = (
+    Path("/media") / Path.home().name / "EJPC-RESPALDO" / "dashboard_pedidos_respaldo" / "conteos"
+)
 
 EXTENSION = ".xlsx"
 
@@ -47,7 +51,12 @@ def nombre_seguro(nombre: str) -> str:
     Raises:
         ValueError: si no queda nada utilizable o no es un `.xlsx`.
     """
-    base = Path(str(nombre)).name
+    # El nombre lo manda el navegador del cliente, que puede correr en
+    # Windows aunque el servidor sea Linux — normalizar `\` a `/` antes de
+    # pedir `.name` para que el recorte de ruta no dependa de en qué SO
+    # corre este proceso (Path().name solo entiende `\` como separador en
+    # Windows; en Linux lo trataría como parte del nombre).
+    base = Path(str(nombre).replace("\\", "/")).name
     base = unicodedata.normalize("NFKD", base).encode("ascii", "ignore").decode()
     base = _PERMITIDOS.sub("_", base).lstrip(".")
     if not base.lower().endswith(EXTENSION):

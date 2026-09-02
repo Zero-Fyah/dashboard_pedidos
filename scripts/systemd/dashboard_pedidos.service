@@ -1,0 +1,31 @@
+# Unidad systemd — dashboard siempre activo (equivalente Linux de la tarea
+# de Windows Task Scheduler "Al iniciar el equipo", DEC-105).
+#
+# Instalar (requiere sudo):
+#   sudo cp scripts/systemd/dashboard_pedidos.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dashboard_pedidos.service
+#
+# Verificar:
+#   systemctl status dashboard_pedidos.service
+#   journalctl -u dashboard_pedidos.service -f
+#
+# Detener / reiniciar:
+#   sudo systemctl stop dashboard_pedidos.service
+#   sudo systemctl restart dashboard_pedidos.service
+
+[Unit]
+Description=dashboard_pedidos - Streamlit (DEC-105)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zero_fyah
+WorkingDirectory=/home/zero_fyah/Escritorio/Documents/dashboard_pedidos
+ExecStart=/home/zero_fyah/Escritorio/Documents/dashboard_pedidos/scripts/iniciar_dashboard.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

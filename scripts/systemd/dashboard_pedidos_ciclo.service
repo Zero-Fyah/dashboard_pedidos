@@ -1,0 +1,28 @@
+# Unidad systemd — ciclo horario del scraper/ETL (equivalente Linux de la
+# tarea de Windows Task Scheduler que corría scraper/actualizar_pedidos.bat,
+# DEC-092/105/124). Disparada por dashboard_pedidos_ciclo.timer, no por sí
+# sola.
+#
+# Instalar junto con el timer (requiere sudo):
+#   sudo cp scripts/systemd/dashboard_pedidos_ciclo.service /etc/systemd/system/
+#   sudo cp scripts/systemd/dashboard_pedidos_ciclo.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dashboard_pedidos_ciclo.timer
+#
+# Correr el ciclo a mano una vez (sin esperar al timer):
+#   sudo systemctl start dashboard_pedidos_ciclo.service
+#
+# Ver próxima corrida programada:
+#   systemctl list-timers dashboard_pedidos_ciclo.timer
+
+[Unit]
+Description=dashboard_pedidos - ciclo scraper+ETL (DEC-092/124)
+
+[Service]
+Type=oneshot
+User=zero_fyah
+WorkingDirectory=/home/zero_fyah/Escritorio/Documents/dashboard_pedidos
+ExecStart=/home/zero_fyah/Escritorio/Documents/dashboard_pedidos/scraper/actualizar_pedidos.sh
+# Sin límite de tiempo: el día 1 (pasada de mantenimiento, DEC-092) el
+# ciclo dura ~60 min en vez de ~45 — igual que en Windows, no se corta.
+TimeoutStartSec=infinity
