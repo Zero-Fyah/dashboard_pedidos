@@ -553,6 +553,27 @@ async def descargar_movimientos_bochica(page: Page, fecha: date, destino: Path) 
     filas_dom = await frame.locator("#movTbody tr").all()
     filas = [await fila.locator("td").all_inner_texts() for fila in filas_dom]
 
+    # Bochica renderiza un día sin movimientos como una única fila con una
+    # sola celda (colspan), ej. "Sin resultados para los filtros aplicados."
+    # — no es un error de la fuente, es un resultado real (confirmado en
+    # vivo 2026-09-03 contra 2026-08-30, día sin actividad de bodega:
+    # #movCount decía "0 movimientos encontrados"). Sin este chequeo,
+    # pd.DataFrame(filas, columns=_COLUMNAS_FUENTE) revienta con "N columns
+    # passed, passed data had 1 columns" y esa fecha queda sin poder
+    # registrarse nunca — ya_cargado() nunca ve una fila con esa
+    # fecha_operacion, así que el .bat reintenta cada hora y falla cada hora
+    # hasta que "ayer" avanza al día siguiente (incidente real: 19 fallos
+    # consecutivos el 2026-08-31 tratando de capturar el 2026-08-30).
+    if len(filas) == 1 and len(filas[0]) != len(_COLUMNAS_FUENTE):
+        placeholder = filas[0][0] if filas[0] else ""
+        logger.info(
+            "descargar_movimientos_bochica: %s sin movimientos (placeholder de la "
+            "fuente: %r) — se registran 0 filas, no es un error",
+            fecha_iso,
+            placeholder,
+        )
+        filas = []
+
     # Verificación cruzada contra el propio conteo de la fuente. No bloquea
     # la carga —podría ser un desfase inocuo de la UI— pero deja evidencia
     # en el log si alguna vez se pierde una fila en el render en vez de
