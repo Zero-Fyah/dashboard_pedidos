@@ -122,6 +122,11 @@ paginas: dict[str, list[st.Page]] = {
             title="Arena",
             icon=":material/scatter_plot:",
         ),
+        st.Page(
+            "pages/catalogo_no_arena.py",
+            title="Catálogo no-Arena",
+            icon=":material/label:",
+        ),
     ],
     "Operación": [
         st.Page(

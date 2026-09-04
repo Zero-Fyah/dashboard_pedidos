@@ -20,6 +20,17 @@ from comun import (
     clasificar_modalidad_arena,
 )
 
+# DEC-132: `construir_catalogo_no_arena()` es una excepción deliberada al
+# patrón habitual de este módulo (leer VIEWs/tablas ya persistidas vía SQL
+# crudo). Es una función pura de `inventario/` — sin I/O propio de esa
+# etapa, sin Playwright, sin nada que rompa AUD-M5/DEC-022 — que cruza 5
+# tablas ya persistidas por el scheduler más 2 transaccionales; replicar ese
+# cruce en SQL acá adentro habría duplicado lógica ya escrita y con 11 tests
+# (DRY). La regla de bajo acoplamiento que protege es "ninguna *página*
+# importa `inventario/` directamente" (ver `dashboard/pages/*.py`): las
+# páginas siguen leyendo solo `dashboard/db.py`, que es la capa de datos.
+from inventario.catalogo_no_arena import construir_catalogo_no_arena
+
 DB_PATH = Path(__file__).parent.parent / "data" / "pedidos.db"
 # Lista de estados de cierre lista para interpolar en IN (...) / NOT IN (...).
 # sorted() para SQL determinístico (frozenset no garantiza orden).
@@ -2235,3 +2246,21 @@ def get_pedidos_consolidado(
     finally:
         con.close()
     return df, agregados
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_catalogo_no_arena() -> pd.DataFrame:
+    """Catálogo no-Arena, una fila por ID (`id_especificacion`), con venta,
+    clasificación ABC-XYZ, inventario actual, vigencia e ingreso por
+    contenedor (DEC-132).
+
+    Wrapper delgado sobre `inventario.catalogo_no_arena.construir_catalogo_no_arena()`
+    (función pura, sin caché propia) — este es el único punto donde se abre
+    la conexión y se aplica el TTL de 600s (AUD-M12), igual que el resto de
+    `get_*` de este módulo.
+    """
+    con = _conn()
+    try:
+        return construir_catalogo_no_arena(con)
+    finally:
+        con.close()
