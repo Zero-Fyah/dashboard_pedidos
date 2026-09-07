@@ -158,3 +158,22 @@ def test_sin_id_cuenta_id_especificacion_null_no_id_producto(monkeypatch, tmp_pa
     df, agg = ddb.get_pedidos_consolidado("2026-01-01", "2026-12-31", "Todos", (), False, 100)
 
     assert agg["sin_id"] == 1
+
+
+@pytest.mark.integration
+def test_filtro_sin_resultados_no_revienta(monkeypatch, tmp_path):
+    """Regresión: un filtro que no matchea ninguna línea dejaba `SUM(...)` en
+    NULL para `sin_id`, y `int(None)` tumbaba la página con un TypeError (el
+    resto de agregados ya estaban blindados con COALESCE, este no)."""
+    ruta = _base(tmp_path)
+    con = sqlite3.connect(ruta)
+    _pedido(con, "P1", "1", "Completado")
+    con.commit()
+    con.close()
+
+    monkeypatch.setattr(ddb, "DB_PATH", ruta)
+    # Rango de fechas fuera del único pedido cargado: 0 filas.
+    df, agg = ddb.get_pedidos_consolidado("1999-01-01", "1999-01-02", "Todos", (), False, 100)
+
+    assert agg == {"lineas": 0, "pedidos": 0, "referencias": 0, "cantidad": 0.0, "sin_id": 0}
+    assert df.empty

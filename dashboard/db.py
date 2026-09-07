@@ -2211,7 +2211,7 @@ def get_pedidos_consolidado(
                        COUNT(DISTINCT p.id_pedido),
                        COUNT(DISTINCT l.referencia),
                        COALESCE(SUM(l.cantidad_comprada), 0),
-                       SUM(CASE WHEN c.id_especificacion IS NULL THEN 1 ELSE 0 END)
+                       COALESCE(SUM(CASE WHEN c.id_especificacion IS NULL THEN 1 ELSE 0 END), 0)
                 {base}""",
             params,
         ).fetchone()
