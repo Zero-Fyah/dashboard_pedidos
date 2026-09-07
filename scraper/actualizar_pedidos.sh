@@ -31,6 +31,15 @@ LOGDATE="$(date +%Y-%m-%d)"
 LOGFILE="logs/scraper_scheduler_${LOGDATE}.log"
 find logs -maxdepth 1 -name "*.log" -mtime +30 -delete 2>/dev/null || true
 
+# Auditoría de seguridad 2026-09-04, hallazgo H-10: data/debug/ (HTML de
+# debug) y data/errors/ (screenshots) pueden contener PII de pedidos y
+# clientes (ver CLAUDE.md) y el scraper las repuebla en su operación
+# normal — se habían purgado a mano una vez (05-08) pero sin retención
+# automática volvían a acumularse sin límite. Mismo criterio de 30 días
+# que logs/, mismo mecanismo (mtime, sin leer contenido — no viola la
+# restricción de CLAUDE.md sobre no leer esa carpeta sin advertencia).
+find data/debug data/errors -maxdepth 1 -type f -mtime +30 -delete 2>/dev/null || true
+
 # Notificación de fallo (deuda de mediano plazo, CLAUDE.md) — cada paso
 # abajo corre aunque el anterior falle (aislamiento a propósito, ver
 # comentarios de cada bloque); FALLO solo acumula si hubo AL MENOS uno para

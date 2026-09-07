@@ -13,6 +13,12 @@
 # Detener / reiniciar:
 #   sudo systemctl stop dashboard_pedidos.service
 #   sudo systemctl restart dashboard_pedidos.service
+#
+# Si la unidad ya estaba instalada (DEC-135 le agregó endurecimiento):
+#   sudo cp scripts/systemd/dashboard_pedidos.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl restart dashboard_pedidos.service
+#   journalctl -u dashboard_pedidos.service -n 50   # confirmar que arrancó bien
 
 [Unit]
 Description=dashboard_pedidos - Streamlit (DEC-105)
@@ -26,6 +32,27 @@ WorkingDirectory=/home/zero_fyah/Escritorio/Documents/dashboard_pedidos
 ExecStart=/home/zero_fyah/Escritorio/Documents/dashboard_pedidos/scripts/iniciar_dashboard.sh
 Restart=always
 RestartSec=5
+
+# Endurecimiento systemd (auditoría de seguridad, DEC-135, hallazgo H-15).
+# Streamlit es un proceso Python puro sin subprocesos ni sandbox propio —
+# a diferencia del ciclo scraper+ETL (Playwright/Chromium), que se dejó
+# deliberadamente sin este bloque por riesgo de romper el sandbox de
+# Chromium sin poder probarlo primero (ver DEC-135). Restringe el proceso
+# al resto de $HOME y al sistema; deja lectura/escritura solo donde el
+# dashboard de verdad la necesita.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/zero_fyah/Escritorio/Documents/dashboard_pedidos/data /home/zero_fyah/Escritorio/Documents/dashboard_pedidos/logs
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target
