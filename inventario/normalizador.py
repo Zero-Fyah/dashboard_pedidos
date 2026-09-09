@@ -149,6 +149,54 @@ def cargar_admin(path: Path) -> pd.DataFrame:
     return df[columnas]
 
 
+# Nombre canónico de producto de Arena por código de barras (unificación de
+# nomenclatura del Arquitecto en el origen, 2026-09-07): mismo nombre en
+# todas las ciudades y las tres formas de venta (Unidades, Tonelada,
+# Corporativo), con estructura fija "Referencia, Tipo de Arena, Peso, Aroma".
+#
+# Existe porque la descarga del admin no siempre refleja esa unificación —
+# confirmado contra corridas reales: qué almacén/modalidad queda desfasado
+# cambia de una corrida a otra (Corporativo Bogotá/Pereira en una, Bogotá
+# Respaldo en otra), así que no es un hueco fijo que se pueda excluir una
+# vez y olvidar. Este archivo es la fuente de verdad y no depende de que esa
+# sincronización del origen esté al día.
+#
+# Archivo de negocio (nombres y precios), no versionado — mismo criterio que
+# el resto de `data/inventario/` (DEC-039). Si no existe (clon nuevo, CI),
+# `aplicar_nombres_canonicos_arena()` no hace nada y el pipeline sigue con
+# el texto crudo del origen, como antes de esto existir.
+RUTA_NOMBRES_CANONICOS_ARENA = (
+    Path(__file__).parent.parent / "data" / "inventario" / "arena_nombres_canonicos.xlsx"
+)
+
+
+def _cargar_nombres_canonicos_arena(ruta: Path = RUTA_NOMBRES_CANONICOS_ARENA) -> dict[str, str]:
+    if not ruta.exists():
+        return {}
+    df = pd.read_excel(ruta, dtype={"Código de barras": str})
+    claves = df["Código de barras"].astype(str).str.strip()
+    return dict(zip(claves, df["Especificación"], strict=True))
+
+
+def aplicar_nombres_canonicos_arena(
+    catalogo: pd.DataFrame, ruta: Path = RUTA_NOMBRES_CANONICOS_ARENA
+) -> pd.DataFrame:
+    """Sobrescribe `especificacion` con el nombre canónico de Arena, por código de barras.
+
+    Solo toca las filas cuyo `codigo_barras` está en
+    `data/inventario/arena_nombres_canonicos.xlsx` (hoy, los SKUs de Arena) —
+    el resto del catálogo queda intacto. Sin ese archivo, es un no-op.
+    """
+    mapa = _cargar_nombres_canonicos_arena(ruta)
+    if not mapa:
+        return catalogo
+    catalogo = catalogo.copy()
+    claves = catalogo["codigo_barras"].astype(str).str.strip()
+    canonico = claves.map(mapa)
+    catalogo["especificacion"] = canonico.fillna(catalogo["especificacion"])
+    return catalogo
+
+
 def cargar_bochica(path: Path, *, excluir_placeholders: bool = True) -> pd.DataFrame:
     """Carga y normaliza el Excel de inventario global de Bochica.
 

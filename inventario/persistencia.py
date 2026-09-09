@@ -1424,7 +1424,12 @@ def main() -> int:
         clasificar_ubicaciones,
         solo_layout,
     )
-    from inventario.normalizador import cargar_admin, cargar_bochica, filtrar_alcance_admin
+    from inventario.normalizador import (
+        aplicar_nombres_canonicos_arena,
+        cargar_admin,
+        cargar_bochica,
+        filtrar_alcance_admin,
+    )
     from inventario.operacion import calcular_operacion, calcular_ventanas
     from inventario.salud import calcular_salud
     from inventario.ubicaciones import (
@@ -1439,6 +1444,12 @@ def main() -> int:
         frescura = medir_frescura(ADMIN_XLSX, BOCHICA_XLSX, RUTA_LAYOUT_DEFAULT)
 
         catalogo_completo = cargar_admin(ADMIN_XLSX)
+        # Nombre canónico de Arena por código de barras (ver docstring en
+        # `aplicar_nombres_canonicos_arena`) — antes de cualquier uso, para
+        # que el puente, Arena y los hallazgos de calidad de datos hablen
+        # todos del mismo nombre, sin depender de que la descarga del admin
+        # ya haya sincronizado la unificación hecha en el origen.
+        catalogo_completo = aplicar_nombres_canonicos_arena(catalogo_completo)
         # DEC-045: el puente usa el catálogo SIN filtrar por alcance — acá
         # interesa nombrar cualquier producto que aparezca en un pedido,
         # incluidas arenas y otros almacenes.

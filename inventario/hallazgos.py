@@ -21,6 +21,7 @@ import sqlite3
 import unicodedata
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from pathlib import Path
 
 import pandas as pd
 
@@ -184,13 +185,53 @@ def referencias_con_espacios(df_admin: pd.DataFrame) -> Hallazgo:
     )
 
 
-def especificacion_discrepante(df_admin: pd.DataFrame, con: sqlite3.Connection) -> Hallazgo:
+# Variantes históricas de especificación de Arena que ya se confirmaron como
+# el mismo producto (unificación de nomenclatura del Arquitecto, 2026-09-07):
+# `lineas_pedido.presentacion` es un registro congelado de lo que decía el
+# pedido el día que se hizo, así que muchas líneas viejas nunca van a poder
+# escribirse igual que la especificación canónica de hoy (el caso dominante:
+# el campo "Tipo de Arena" no existía antes en el texto de ningún pedido).
+# Sin esto, `especificacion_discrepante` marcaría como discrepancia activa
+# algo que en realidad es historia inmutable, no un dato mal capturado hoy.
+#
+# Documento de negocio, no versionado — mismo criterio que
+# `arena_nombres_canonicos.xlsx` en `inventario/normalizador.py` (DEC-039).
+# Es una lista acotada por construcción: el histórico no cambia, así que no
+# hace falta mantenerla salvo que aparezca un producto de Arena nuevo con
+# historial propio bajo una grafía vieja no contemplada todavía.
+RUTA_VARIANTES_HISTORICAS_ARENA = (
+    Path(__file__).parent.parent / "data" / "inventario" / "arena_variantes_historicas.xlsx"
+)
+
+
+def _variantes_historicas_aceptadas_arena(
+    ruta: Path = RUTA_VARIANTES_HISTORICAS_ARENA,
+) -> dict[tuple[str, str], set[str]]:
+    if not ruta.exists():
+        return {}
+    df = pd.read_excel(ruta, dtype=str)
+    df["ref"] = df["Referencia"].astype(str).str.strip()
+    df["cb"] = df["Código de barras"].astype(str).str.strip()
+    df["k"] = df["Variante histórica"].map(_norm_especificacion)
+    agrupado = df.groupby(["ref", "cb"])["k"].apply(set)
+    return dict(agrupado.items())
+
+
+def especificacion_discrepante(
+    df_admin: pd.DataFrame,
+    con: sqlite3.Connection,
+    ruta_variantes_historicas: Path = RUTA_VARIANTES_HISTORICAS_ARENA,
+) -> Hallazgo:
     """Productos cuya especificación se escribe distinto en cada sistema.
 
     Solo cuenta pares que **existen en ambos** sistemas: si el texto
     difiere ahí, es una discrepancia real y no una ausencia. Es lo que hoy
     impide usar la especificación como llave de producto, que sería la más
     precisa (DEC-045).
+
+    Para Arena, una variante que ya está en
+    `arena_variantes_historicas.xlsx` no cuenta como discrepancia — ver
+    docstring de `_variantes_historicas_aceptadas_arena`.
     """
     admin = df_admin.copy()
     admin["ref"] = admin["referencia"].astype(str).str.strip()
@@ -209,7 +250,15 @@ def especificacion_discrepante(df_admin: pd.DataFrame, con: sqlite3.Connection) 
     pedidos["k"] = pedidos["presentacion"].map(_norm_especificacion)
 
     cruce = pedidos.merge(por_par.reset_index(), on=["ref", "cb"], how="inner")
-    discrepan = cruce[[k not in v for k, v in zip(cruce["k"], cruce["variantes"], strict=True)]]
+    aceptadas_arena = _variantes_historicas_aceptadas_arena(ruta_variantes_historicas)
+    discrepan = cruce[
+        [
+            k not in v and k not in aceptadas_arena.get((ref, cb), set())
+            for k, v, ref, cb in zip(
+                cruce["k"], cruce["variantes"], cruce["ref"], cruce["cb"], strict=True
+            )
+        ]
+    ]
 
     columnas = {
         "ref": "Referencia",
