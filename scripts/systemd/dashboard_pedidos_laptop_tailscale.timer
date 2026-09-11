@@ -1,0 +1,18 @@
+# Timer systemd — dispara dashboard_pedidos_laptop_tailscale.service cada
+# 5 minutos. Más frecuente que el ciclo horario del scraper (DEC-092) a
+# propósito: conectividad de un dispositivo cambia en minutos, no en horas,
+# y el propósito es capturar la ventana real en la que la laptop estuvo
+# online, no solo saberlo "aproximadamente".
+#
+# Instalar: ver comentario en dashboard_pedidos_laptop_tailscale.service
+
+[Unit]
+Description=dashboard_pedidos - dispara el chequeo de conectividad de la laptop cada 5 min
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=false
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
