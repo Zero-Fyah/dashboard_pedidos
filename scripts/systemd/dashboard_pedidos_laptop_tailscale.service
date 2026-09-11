@@ -1,0 +1,31 @@
+# Unidad systemd — registra conexión/desconexión de la laptop del trabajo
+# en Tailscale (scripts/monitor_laptop_tailscale.py). Disparada por
+# dashboard_pedidos_laptop_tailscale.timer, no por sí sola.
+#
+# Por qué existe: el acceso end-to-end de la laptop contra el dashboard
+# sigue sin poder probarse porque no hay forma de saber, sin mirar en el
+# momento exacto, cuándo estuvo conectada (ver docs/decisions.md y memoria
+# de proyecto sobre la migración a Linux). Esto solo deja el registro —
+# la prueba de acceso en sí sigue siendo manual.
+#
+# Instalar (requiere sudo):
+#   sudo cp scripts/systemd/dashboard_pedidos_laptop_tailscale.service /etc/systemd/system/
+#   sudo cp scripts/systemd/dashboard_pedidos_laptop_tailscale.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dashboard_pedidos_laptop_tailscale.timer
+#
+# Ver el registro:
+#   tail -f logs/laptop_tailscale.log
+#
+# Correrlo a mano una vez (sin esperar al timer):
+#   sudo systemctl start dashboard_pedidos_laptop_tailscale.service
+
+[Unit]
+Description=dashboard_pedidos - registra conexión de la laptop del trabajo en Tailscale
+
+[Service]
+Type=oneshot
+User=zero_fyah
+WorkingDirectory=/home/zero_fyah/Escritorio/Documents/dashboard_pedidos
+ExecStart=/home/zero_fyah/Escritorio/Documents/dashboard_pedidos/.venv/bin/python /home/zero_fyah/Escritorio/Documents/dashboard_pedidos/scripts/monitor_laptop_tailscale.py
+TimeoutStartSec=30
