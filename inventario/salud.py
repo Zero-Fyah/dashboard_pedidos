@@ -212,7 +212,11 @@ def calcular_salud(
         int((df["vigencia"] == VIGENCIA_DESCONTINUADO).sum()),
         int((vigente["estado"] == ESTADO_QUIEBRE).sum()),
         int((vigente["estado"] == ESTADO_RIESGO).sum()),
-        int((vigente["dias_sin_salida"] > SIN_MOVIMIENTO_D).sum()),
+        int(
+            (
+                vigente["dias_sin_salida"].isna() | (vigente["dias_sin_salida"] > SIN_MOVIMIENTO_D)
+            ).sum()
+        ),
         SIN_MOVIMIENTO_D,
     )
     return df[

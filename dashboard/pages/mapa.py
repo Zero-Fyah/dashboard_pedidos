@@ -90,9 +90,17 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Posiciones activas", f"{total:,}".replace(",", "."))
 c2.metric("Ocupadas", f"{ocupadas:,}".replace(",", "."), delta=f"{ocupadas / total * 100:.1f}%")
 c3.metric("Vacías", f"{total - ocupadas:,}".replace(",", "."))
+# Con decimal, un simple .replace(",", ".") deja dos separadores
+# idénticos (miles y decimal) indistinguibles — ej. "$26.694.7 M", que se
+# lee como 26,7 en vez de 26.694,7 (hallazgo de la auditoría independiente
+# 2026-09-14). Swap explícito: coma real → punto (miles), punto real →
+# coma (decimal).
+_valor_m_txt = (
+    f"{vista['valor'].sum() / 1e6:,.1f}".replace(",", "@").replace(".", ",").replace("@", ".")
+)
 c4.metric(
     "Valor almacenado",
-    f"${vista['valor'].sum() / 1e6:,.1f} M".replace(",", "."),
+    f"${_valor_m_txt} M",
     help=f"${vista['valor'].sum():,.0f}".replace(",", ".") + " exactos.",
 )
 

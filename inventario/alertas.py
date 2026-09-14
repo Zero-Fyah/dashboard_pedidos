@@ -219,24 +219,42 @@ def _cobertura_de_conteo(ubicaciones: pd.DataFrame, conteos: pd.DataFrame) -> li
 
 
 def _inmovilizado(salud: pd.DataFrame) -> list[dict]:
-    """Stock que lleva medio año sin salir. Capital quieto, y ocupa posición."""
+    """Stock que lleva medio año sin salir. Capital quieto, y ocupa posición.
+
+    NaN en `dias_sin_salida` cuenta como "más de 180 días": una referencia
+    que nunca tuvo ni una salida no es menos quieta que una que dejó de
+    moverse hace 200 días — pandas evalúa `NaN > 180` como `False`, así
+    que sin el `isna()` quedaban afuera del propio criterio de la alerta
+    (auditoría independiente 2026-09-14: 43 referencias / $477 M excluidas
+    en silencio, el mismo bug ya corregido en `dashboard/pages/salud.py`
+    pero no propagado hasta acá, que es lo que de verdad alimenta el
+    Centro de Alertas).
+    """
     if salud.empty or "dias_sin_salida" not in salud.columns:
         return []
-    quieto = salud[(salud["dias_sin_salida"] > DIAS_SIN_MOVIMIENTO) & (salud["disponible"] > 0)]
-    return [
-        _fila(
-            f"inmovilizado:{r.referencia}",
-            "Sin movimiento",
-            MEDIA,
-            r.referencia,
-            f"{r.disponible:,.0f} unidades · {r.dias_sin_salida:,.0f} días sin salida".replace(
-                ",", "."
-            ),
-            r.disponible,
-            "Salud",
-        )
-        for r in quieto.itertuples(index=False)
+    quieto = salud[
+        (salud["dias_sin_salida"].isna() | (salud["dias_sin_salida"] > DIAS_SIN_MOVIMIENTO))
+        & (salud["disponible"] > 0)
     ]
+    filas = []
+    for r in quieto.itertuples(index=False):
+        detalle_dias = (
+            "sin ninguna venta registrada"
+            if pd.isna(r.dias_sin_salida)
+            else f"{r.dias_sin_salida:,.0f} días sin salida"
+        )
+        filas.append(
+            _fila(
+                f"inmovilizado:{r.referencia}",
+                "Sin movimiento",
+                MEDIA,
+                r.referencia,
+                f"{r.disponible:,.0f} unidades · {detalle_dias}".replace(",", "."),
+                r.disponible,
+                "Salud",
+            )
+        )
+    return filas
 
 
 def _frescura(frescura: dict) -> list[dict]:
