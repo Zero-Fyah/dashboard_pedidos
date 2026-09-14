@@ -113,9 +113,12 @@ def construir_puente_especificaciones(df_admin: pd.DataFrame) -> pd.DataFrame:
 
     Igual que `catalogo_productos` (DEC-045), **solo se conservan los pares
     inequívocos**: si un par resolviera a dos ID, el join duplicaría la
-    línea de pedido e inflaría el consumo. Medido: 89,4% de los pares son
-    inequívocos y cubren el **80,8% de las líneas** — el resto queda sin
-    atribuir a propósito, y la vista lo informa.
+    línea de pedido e inflaría el consumo. Medido en 2026-07: 89,4% de los
+    pares eran inequívocos y cubrían el 80,8% de las líneas; remedido en la
+    auditoría 2026-09-13 (DEC-136) sobre la ventana de 6 meses vigente hoy
+    dio 96,0% — la cobertura mejora con el tiempo a medida que el catálogo
+    se depura, así que esta cifra es un punto histórico, no una constante.
+    El resto queda sin atribuir a propósito, y la vista lo informa.
 
     Args:
         df_admin: Catálogo del admin ya filtrado por alcance.

@@ -47,7 +47,7 @@ from theme import (
 # lectura, y la página lo dice para que nadie lo tome por una meta.
 DIAS_ESTANCADO = 15
 
-st.markdown('<p class="dp-breadcrumb">Dashboard / Pedidos</p>', unsafe_allow_html=True)
+st.markdown('<p class="dp-breadcrumb">Dashboard / Fuera del alcance</p>', unsafe_allow_html=True)
 st.title("🔄 Ciclo de vida del pedido")
 # DEC-104: esta página vive en «Fuera del alcance», que NO quiere decir fuera
 # del proyecto. El dashboard tiene dos propósitos y esta sirve al segundo:

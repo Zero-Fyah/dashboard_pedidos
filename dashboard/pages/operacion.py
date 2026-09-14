@@ -15,12 +15,13 @@ queda para cuando se registre qué familia tomó cada alistador.
 **Cumplimiento de despacho (DEC-065/069):** la cuarta pestaña mide el *fill
 rate* —qué proporción de pedidos salió con todo lo pedido—. Es la mitad *in
 full* de E.1; la mitad *on time* la construyó DEC-095 y vive en
-**Operación → Cumplimiento de entrega**.
+**Fuera del alcance → Cumplimiento de entrega** (DEC-104 la movió ahí).
 
 **Alcance (DEC-100).** Esta página tenía seis pestañas y 1.447 líneas, y
 cuatro de ellas no hablaban de bodega sino de plata: auditoría de pago,
 comprobantes, saldo a favor, crédito y cancelaciones por impago. Todo eso se
-mudó a **Comercial → Cobranza y cartera**. Un supervisor de almacén y un
+mudó a **Fuera del alcance → Cobranza y cartera** (DEC-104 la movió ahí). Un
+supervisor de almacén y un
 analista de cartera no tienen por qué compartir pantalla, y la página cargaba
 **14 consultas antes de dibujar la primera pestaña** — la mitad para datos
 que ese supervisor nunca mira.

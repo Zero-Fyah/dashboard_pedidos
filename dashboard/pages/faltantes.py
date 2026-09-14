@@ -81,11 +81,22 @@ ETIQUETA = {
     "Interno": "Relleno de monto mínimo",
     "Monetario": "Diferencia monetaria",
 }
+AYUDA = {
+    "Real": "Faltante real de mercancía: lo que el pedido pidió y no se alistó.",
+    "Interno": (
+        "Líneas «Interno Acc/Are/Ali» para completar el monto mínimo de envío — "
+        "no hay faltante real detrás (DEC-115)."
+    ),
+    "Monetario": (
+        "Diferencia puramente monetaria en gestion_diferencias, sin faltante "
+        "físico de mercancía asociado."
+    ),
+}
 
 # ── Resumen ──────────────────────────────────────────────────────────────
 c1, c2, c3 = st.columns(3)
 for columna, grupo in zip((c1, c2, c3), ORDEN, strict=True):
-    columna.metric(ETIQUETA[grupo], int((vista["grupo"] == grupo).sum()))
+    columna.metric(ETIQUETA[grupo], int((vista["grupo"] == grupo).sum()), help=AYUDA[grupo])
 
 _sin_atribuir = int((~vista["atribuible"]).sum())
 st.caption(

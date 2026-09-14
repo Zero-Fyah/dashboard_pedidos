@@ -32,7 +32,12 @@ st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_
 st.title("🏷️ Catálogo no-Arena")
 
 try:
-    df = get_catalogo_no_arena()
+    # Con el caché frío tarda ~7 s (la página más pesada del dashboard,
+    # auditoría 2026-09-13) — el resto de dashboard/db.py usa
+    # show_spinner=False a propósito para operaciones rápidas, pero acá
+    # esa convención deja ~7 s de pantalla en blanco sin ningún indicador.
+    with st.spinner("Calculando catálogo no-Arena..."):
+        df = get_catalogo_no_arena()
 except sqlite3.OperationalError as e:
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()

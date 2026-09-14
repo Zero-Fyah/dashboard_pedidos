@@ -172,7 +172,11 @@ if not alertas.empty:
     ab_pendientes = int(cob.iloc[0]["valor"]) if len(cob) else 0
 
 d1, d2, d3, d4 = st.columns(4)
-quiebres_alertados = int((alertas["tipo"] == "Quiebre de stock").sum()) if not alertas.empty else 0
+quiebres_alertados = (
+    int(((alertas["tipo"] == "Quiebre de stock") & (alertas["activa"] == 1)).sum())
+    if not alertas.empty
+    else 0
+)
 d1.metric(
     "Referencias en quiebre",
     f"{quiebres:,}".replace(",", "."),
@@ -214,7 +218,8 @@ else:
     p1.metric(
         "Pedidos abiertos",
         f"{int(tarjeta['pedidos_abiertos']):,}".replace(",", "."),
-        help="Con al menos un subpedido sin cerrar. Detalle en Pedidos → Ciclo de vida.",
+        help="Con al menos un subpedido sin cerrar. Detalle en Fuera del alcance → "
+        "Ciclo de vida del pedido.",
     )
     p2.metric(
         "Valor retenido",
@@ -238,8 +243,8 @@ else:
         "⚠️ **Las entregas a tiempo dependen de una definición que el negocio no cerró.** "
         "Si «Hora de entrega» es un compromiso con el cliente, esta cifra es el indicador "
         "de servicio del área; si es una franja de programación interna, mide otra cosa "
-        "(DEC-094). El detalle y la advertencia completa están en **Operación → "
-        "Cumplimiento de entrega**."
+        "(DEC-094). El detalle y la advertencia completa están en **Fuera del "
+        "alcance → Cumplimiento de entrega**."
     )
 
 

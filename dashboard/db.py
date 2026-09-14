@@ -1385,7 +1385,7 @@ def get_pedidos_impagos() -> pd.DataFrame:
     con = _conn()
     try:
         return pd.read_sql(
-            """WITH montos AS (
+            f"""WITH montos AS (
                    SELECT id_pedido,
                           MAX(CASE WHEN concepto_base =
                                 'Total a pagar / Total final a pagar'
@@ -1399,8 +1399,7 @@ def get_pedidos_impagos() -> pd.DataFrame:
                    SELECT id_pedido
                      FROM subpedidos
                  GROUP BY id_pedido
-                   HAVING SUM(CASE WHEN LOWER(estado) NOT IN
-                            ('completado', 'cancelado', 'comentado')
+                   HAVING SUM(CASE WHEN LOWER(estado) NOT IN ({_cerr})
                           THEN 1 ELSE 0 END) > 0
                ),
                base AS (

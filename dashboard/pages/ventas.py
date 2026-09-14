@@ -52,7 +52,7 @@ def _pesos(valor: float) -> str:
     return f"${valor:,.0f}".replace(",", ".")
 
 
-st.markdown('<p class="dp-breadcrumb">Dashboard / Comercial</p>', unsafe_allow_html=True)
+st.markdown('<p class="dp-breadcrumb">Dashboard / Fuera del alcance</p>', unsafe_allow_html=True)
 st.title("💰 Ventas y descuentos")
 # DEC-104: esta página vive en «Fuera del alcance», que NO quiere decir fuera
 # del proyecto. El dashboard tiene dos propósitos y esta sirve al segundo:

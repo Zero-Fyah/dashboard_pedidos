@@ -43,7 +43,7 @@ from db import (
 )
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
 
-st.markdown('<p class="dp-breadcrumb">Dashboard / Comercial</p>', unsafe_allow_html=True)
+st.markdown('<p class="dp-breadcrumb">Dashboard / Fuera del alcance</p>', unsafe_allow_html=True)
 st.title("💳 Cobranza y cartera")
 # DEC-104: esta página vive en «Fuera del alcance», que NO quiere decir fuera
 # del proyecto. El dashboard tiene dos propósitos y esta sirve al segundo:
@@ -634,6 +634,10 @@ if tab_pago.open:
         # ── Maduración de crédito (DEC-086) ────────────────────────────────────
         st.divider()
         st.subheader("Crédito abierto y su vencimiento")
+        st.caption(
+            "📌 No depende del rango de fechas de arriba: es el estado vivo de "
+            "hoy (DEC-085/086), no una foto del período filtrado."
+        )
         if credito.empty:
             st.info("No hay pedidos a crédito con vencimiento registrado.")
         else:
@@ -869,6 +873,10 @@ if tab_cancel.open:
 
             # ── Lo accionable: los que van camino a cancelarse ─────────────────
             st.subheader("Pedidos camino a cancelarse")
+            st.caption(
+                "📌 No depende del rango de fechas de arriba: es el estado vivo "
+                "de hoy (DEC-085/086), no una foto del período filtrado."
+            )
             if impagos.empty:
                 st.info("No hay pedidos vivos con saldo pendiente.")
             else:

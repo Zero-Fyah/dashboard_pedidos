@@ -200,6 +200,10 @@ st.dataframe(
 # igual que los impagos de DEC-085.
 st.divider()
 st.subheader("Mercancía comprometida en pedidos abiertos")
+st.caption(
+    "📌 Esta sección no depende del rango de fechas de arriba: es el estado "
+    "vivo de hoy (DEC-098), no una foto del período filtrado."
+)
 
 try:
     comp = get_comprometido()

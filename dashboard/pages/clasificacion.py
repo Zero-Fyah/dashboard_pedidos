@@ -275,7 +275,8 @@ if nivel_3.open:
 
         st.caption(
             f"Se clasificaron {len(ids):,} ID. La atribución de una venta a un ID usa el par "
-            "referencia/código de barras: **el 80,8% de las líneas resuelve a un ID único**, "
-            "el resto queda sin atribuir porque su par apunta a más de una especificación. "
+            "referencia/código de barras: la mayoría de las líneas resuelve a un ID único, "
+            "el resto queda sin atribuir porque su par apunta a más de una especificación "
+            "(ver `inventario/clasificacion.py` para la cobertura medida). "
             "Esa ambigüedad es una de las tareas de calidad de datos pendientes."
         )

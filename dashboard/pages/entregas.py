@@ -47,7 +47,7 @@ from theme import (
     TEXT_SECONDARY,
 )
 
-st.markdown('<p class="dp-breadcrumb">Dashboard / Operación</p>', unsafe_allow_html=True)
+st.markdown('<p class="dp-breadcrumb">Dashboard / Fuera del alcance</p>', unsafe_allow_html=True)
 st.title("🚚 Cumplimiento de entrega")
 # DEC-104: esta página vive en «Fuera del alcance», que NO quiere decir fuera
 # del proyecto. El dashboard tiene dos propósitos y esta sirve al segundo:

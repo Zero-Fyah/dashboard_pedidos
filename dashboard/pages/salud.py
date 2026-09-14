@@ -78,7 +78,12 @@ if df.empty:
 con_stock = df[df["disponible"] > 0]
 quiebre = df[df["estado"] == "Quiebre"]
 riesgo = df[df["estado"] == "Riesgo de quiebre"]
-detenido = df[df["dias_sin_salida"] > 180]
+# NaN cuenta como "más de 180 días": una referencia que nunca tuvo ni una
+# salida no es menos "detenida" que una que dejó de moverse hace 200 días
+# — pandas evalúa NaN > 180 como False, así que sin este OR quedaban
+# afuera del propio criterio que el help= de abajo promete (auditoría
+# 2026-09-13: 21 referencias vigentes / $33,8 M excluidas en silencio).
+detenido = df[df["dias_sin_salida"].isna() | (df["dias_sin_salida"] > 180)]
 
 # ── Lo accionable primero ──────────────────────────────────────────────────────
 k1, k2, k3, k4 = st.columns(4)

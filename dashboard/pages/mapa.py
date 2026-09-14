@@ -90,7 +90,11 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Posiciones activas", f"{total:,}".replace(",", "."))
 c2.metric("Ocupadas", f"{ocupadas:,}".replace(",", "."), delta=f"{ocupadas / total * 100:.1f}%")
 c3.metric("Vacías", f"{total - ocupadas:,}".replace(",", "."))
-c4.metric("Valor almacenado", f"${vista['valor'].sum():,.0f}".replace(",", "."))
+c4.metric(
+    "Valor almacenado",
+    f"${vista['valor'].sum() / 1e6:,.1f} M".replace(",", "."),
+    help=f"${vista['valor'].sum():,.0f}".replace(",", ".") + " exactos.",
+)
 
 
 # ─────────────────────────────────────────────
