@@ -2018,6 +2018,29 @@ def get_inventario_ubicaciones() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_catalogo_productos() -> pd.DataFrame:
+    """Puente `id_especificacion` → código de barras / ID de producto (DEC-045).
+
+    Una fila por `id_especificacion` cuando el par `(referencia, código de
+    barras)` resolvió sin ambigüedad — mismo puente que usa
+    `inventario.catalogo_no_arena`. Sirve para desglosar una referencia
+    agregada en sus ID concretos en cualquier página que ya tenga
+    `id_especificacion` (DEC-048, adición 2026-09-12).
+    """
+    if not _objeto_existe("catalogo_productos"):
+        return pd.DataFrame()
+    con = _conn()
+    try:
+        return pd.read_sql(
+            "SELECT id_especificacion, id_producto, codigo_barras "
+            "FROM catalogo_productos WHERE id_especificacion IS NOT NULL",
+            con,
+        )
+    finally:
+        con.close()
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
 def get_inventario_anomalias() -> pd.DataFrame:
     """Stock ubicado donde el layout dice que no debería haber (DEC-041)."""
     if not _objeto_existe("v_inventario_anomalias", "view"):

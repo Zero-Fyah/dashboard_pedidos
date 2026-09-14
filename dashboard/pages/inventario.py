@@ -27,10 +27,12 @@ from tz import a_hora_colombia
 
 from db import (
     get_cancelaciones,
+    get_catalogo_productos,
     get_inventario_anomalias,
     get_inventario_comparacion,
     get_inventario_corrida,
     get_inventario_tendencia,
+    get_inventario_ubicaciones,
 )
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
 
@@ -89,7 +91,7 @@ k3.metric(
 )
 k4.metric("Referencias", f"{len(df):,}")
 
-d1, d2, d3 = st.columns(3)
+d1, d2, d3, d4 = st.columns(4)
 d1.metric(
     "Altura (confiable)",
     f"{df['bochica_altura'].sum():,.0f}",
@@ -104,6 +106,16 @@ d3.metric(
     "Paso de montacarga",
     f"{df['bochica_paso'].sum():,.0f}",
     help="No es posición de almacenamiento: queda fuera de la fórmula.",
+)
+d4.metric(
+    "Picking estimado (aprox.)",
+    f"{df.loc[df['picking_estimado'] > 0, 'picking_estimado'].sum():,.0f}",
+    help=(
+        "Teórico − altura, solo donde da positivo: lo que debería haber físicamente "
+        "en picking según el sistema administrativo. Negativo no es 'falta picking', "
+        "es sobrante en altura — esa parte ya está en 'Sobrante físico confirmado' "
+        "de abajo, para no contar la misma referencia en los dos sentidos."
+    ),
 )
 
 # ── Sobrante físico confirmado ─────────────────────────────────────────────────
@@ -333,6 +345,7 @@ else:
                 "bochica_total",
                 "diferencia",
                 "sobrante_altura",
+                "picking_estimado",
             ]
         ],
         hide_index=True,
@@ -350,6 +363,14 @@ else:
             "bochica_total": st.column_config.NumberColumn("Bochica total", format="%.0f"),
             "diferencia": st.column_config.NumberColumn("Diferencia", format="%.0f"),
             "sobrante_altura": st.column_config.NumberColumn("Sobrante en altura", format="%.0f"),
+            "picking_estimado": st.column_config.NumberColumn(
+                "Picking estimado",
+                format="%.0f",
+                help=(
+                    "Teórico − altura. Válido como estimación solo cuando es ≥ 0; "
+                    "en negativo lee 'Sobrante en altura' en su lugar."
+                ),
+            ),
         },
     )
     st.download_button(
@@ -358,6 +379,107 @@ else:
         file_name="inventario_comparacion.csv",
         mime="text/csv",
     )
+
+    # ── Desglose de una referencia por ID/código de barras (DEC-048, adición 2026-09-12) ──
+    # Todo lo de arriba está agregado por referencia porque `lineas_pedido` no
+    # tiene `id_especificacion` (DEC-041): `disponible_venta` y
+    # `vendido_no_alistado` no se pueden partir por ID sin cambiar qué se
+    # persiste. Lo que SÍ tiene `id_especificacion` es Bochica
+    # (`inventario_ubicaciones`) — este desglose es solo esa mitad, mismo
+    # puente a código de barras que ya usa Catálogo no-Arena (DEC-132).
+    referencia_desglose = st.selectbox(
+        "Desglosar una referencia por ID de especificación y código de barras",
+        sorted(vista["referencia"].dropna().unique()),
+        index=None,
+        placeholder="Elegir una referencia de la tabla de arriba...",
+        help=(
+            "Solo desglosa las columnas de Bochica (altura/picking/total). "
+            "Disponible venta y vendido sin alistar quedan a nivel referencia: "
+            "el origen no permite partirlos por ID."
+        ),
+    )
+    if referencia_desglose:
+        ubicaciones = get_inventario_ubicaciones()
+        # .strip() en ambos lados: el Excel del admin (origen de `vista`/`referencia_desglose`)
+        # y el de Bochica (origen de `ubicaciones`) no siempre coinciden en espacios
+        # finales para la misma referencia nominal — comparar sin normalizar deja
+        # ~14% de las referencias con stock real como si no tuvieran nada (hallazgo
+        # de auditoría 2026-09-13, cruzado por data-quality-auditor e inventory-analyst).
+        detalle_id = ubicaciones[
+            (ubicaciones["referencia"].str.strip() == referencia_desglose.strip())
+            & (ubicaciones["en_catalogo"] == 1)
+        ]
+        if detalle_id.empty:
+            st.info(
+                "Sin líneas en el layout de bodega para esta referencia con ese ID "
+                "reconocido por el catálogo admin (DEC-072)."
+            )
+        else:
+            pivote = (
+                detalle_id.pivot_table(
+                    index="id_especificacion",
+                    columns="tipo",
+                    values="cantidad",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                .reset_index()
+                .rename_axis(None, axis=1)
+            )
+            for tipo_col in ("Altura", "Picking", "Paso Montacarga"):
+                if tipo_col not in pivote.columns:
+                    pivote[tipo_col] = 0.0
+            pivote = pivote.rename(
+                columns={
+                    "Altura": "bochica_altura",
+                    "Picking": "bochica_picking",
+                    "Paso Montacarga": "bochica_paso",
+                }
+            )
+            pivote["bochica_total"] = pivote["bochica_altura"] + pivote["bochica_picking"]
+
+            puente = get_catalogo_productos()
+            pivote["id_especificacion"] = pivote["id_especificacion"].astype(str)
+            if not puente.empty:
+                puente = puente.copy()
+                puente["id_especificacion"] = puente["id_especificacion"].astype(str)
+                pivote = pivote.merge(puente, on="id_especificacion", how="left")
+            for columna in ("codigo_barras", "id_producto"):
+                if columna not in pivote.columns:
+                    pivote[columna] = pd.NA
+                pivote[columna] = pivote[columna].fillna("—")
+
+            st.caption(
+                f"{len(pivote):,} ID de especificación bajo `{referencia_desglose}` "
+                "· ordenados por altura descendente."
+            )
+            st.dataframe(
+                pivote.sort_values("bochica_altura", ascending=False)[
+                    [
+                        "id_especificacion",
+                        "codigo_barras",
+                        "id_producto",
+                        "bochica_altura",
+                        "bochica_picking",
+                        "bochica_paso",
+                        "bochica_total",
+                    ]
+                ],
+                hide_index=True,
+                column_config={
+                    "id_especificacion": st.column_config.TextColumn(
+                        "ID especificación", width="medium"
+                    ),
+                    "codigo_barras": st.column_config.TextColumn(
+                        "Código de barras", width="medium"
+                    ),
+                    "id_producto": st.column_config.TextColumn("ID producto", width="medium"),
+                    "bochica_altura": st.column_config.NumberColumn("Altura", format="%.0f"),
+                    "bochica_picking": st.column_config.NumberColumn("Picking", format="%.0f"),
+                    "bochica_paso": st.column_config.NumberColumn("Paso montacarga", format="%.0f"),
+                    "bochica_total": st.column_config.NumberColumn("Bochica total", format="%.0f"),
+                },
+            )
 
 st.divider()
 

@@ -192,8 +192,9 @@ else:
     ].copy()
 
     # Nulos explícitos como "—": nunca 0/vacío engañoso (id_producto y
-    # codigo_barras tienen 11,3% de huecos reales por ambigüedad de
-    # referencia+código, DEC-045/DEC-111 — no un error de esta página).
+    # codigo_barras tienen huecos reales por ambigüedad de referencia+código,
+    # DEC-045/DEC-111 — no un error de esta página; la cobertura exacta varía
+    # con cada corrida del scheduler, ver `inventario/catalogo_no_arena.py`).
     for columna in [
         "id_producto",
         "codigo_barras",
@@ -250,11 +251,12 @@ else:
         mime="text/csv",
     )
 
+_n_sin_ubicacion_fmt = f"{int((df['fuente_vigencia'] == 'id').sum()):,}".replace(",", ".")
 st.caption(
     "Alcance: catálogo no-Arena reconocido por el sistema administrativo "
     "(`en_catalogo=1`, DEC-072), almacén Bogotá — heredado del resto del "
     "cruce de inventario, no una limitación propia de esta vista. "
-    "«Fuente de vigencia» distingue precisión por ID (444 ID sin ubicación) "
-    "de precisión por referencia (el resto, con ubicación conocida) — no "
-    "mezclarlas en la lectura (DEC-132)."
+    f"«Fuente de vigencia» distingue precisión por ID ({_n_sin_ubicacion_fmt} ID sin "
+    "ubicación, hoy) de precisión por referencia (el resto, con ubicación "
+    "conocida) — no mezclarlas en la lectura (DEC-132)."
 )
