@@ -593,7 +593,16 @@ async def main(args: argparse.Namespace) -> int:
         # morían por circuit breaker (deadlock del orquestador). Los IDs son
         # strings: la cota no protegía nada real.
         pedidos_queue: asyncio.Queue = asyncio.Queue()
-        resultados_queue: asyncio.Queue = asyncio.Queue()
+        # A diferencia de pedidos_queue (FIX C-1: sin cota a propósito, son
+        # solo IDs), acá cada item es el dict completo extraído de un pedido
+        # (subpedidos, líneas, timeline...) — con 6 workers productores y un
+        # solo consumidor (persistencia_worker), un stall de escritura a
+        # disco dejaría crecer esta cola sin límite, reteniendo objetos
+        # pesados en RAM. Cota defensiva (auditoría de memoria 2026-09-14):
+        # persistencia_worker siempre drena mientras haya productores vivos,
+        # así que un maxsize no puede reproducir el deadlock de C-1 — solo
+        # aplica backpressure natural en put() si la escritura se atrasa.
+        resultados_queue: asyncio.Queue = asyncio.Queue(maxsize=300)
 
         # FIX N-1: resultado final por pedido de ESTE run. Compartido entre
         # la persistencia principal y los pases dead-letter: un pedido que

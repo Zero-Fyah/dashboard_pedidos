@@ -14,6 +14,12 @@
 #
 # Ver próxima corrida programada:
 #   systemctl list-timers dashboard_pedidos_ciclo.timer
+#
+# Si la unidad ya estaba instalada (OOMScoreAdjust agregado 2026-09-14):
+#   sudo cp scripts/systemd/dashboard_pedidos_ciclo.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+# No hace falta reiniciar nada más: el próximo disparo del timer ya toma
+# el valor nuevo (la unidad no corre de forma continua).
 
 [Unit]
 Description=dashboard_pedidos - ciclo scraper+ETL (DEC-092/124)
@@ -26,3 +32,11 @@ ExecStart=/home/zero_fyah/Escritorio/Documents/dashboard_pedidos/scraper/actuali
 # Sin límite de tiempo: el día 1 (pasada de mantenimiento, DEC-092) el
 # ciclo dura ~60 min en vez de ~45 — igual que en Windows, no se corta.
 TimeoutStartSec=infinity
+
+# Auditoría de memoria 2026-09-14: el ciclo (6 Chromium concurrentes,
+# DEC-030) llega a picos de ~4,6 GB, y un OOM real mató este proceso en
+# vez de otra cosa en la máquina (ej. el navegador de escritorio). Sin
+# esto, el kernel elige la víctima por heurística propia — con esto, el
+# ciclo de producción queda protegido: el kernel preferirá matar algo
+# menos negativo (-1000..1000, más negativo = más protegido) antes.
+OOMScoreAdjust=-500
