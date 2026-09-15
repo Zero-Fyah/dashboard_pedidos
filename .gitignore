@@ -8,6 +8,10 @@ data/inventario/
 # Cookies de sesión de Bochica (DEC-116) — equivalente a una credencial.
 data/sesiones/
 
+# Clave JSON de la cuenta de servicio de Google (integraciones/, 2026-09-14)
+# — una credencial real, nunca debe llegar al repo.
+data/credenciales/
+
 # Excel de inventario descargados manualmente (DEC-039) — catálogo y
 # precios son datos de negocio, no deben llegar al repo público
 *.xlsx

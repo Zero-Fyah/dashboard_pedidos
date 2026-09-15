@@ -39,6 +39,26 @@ import pandas as pd
 from comun import ARENA_MODALIDADES_NUCLEO, VENTANA_DEMANDA_D, clasificar_modalidad_arena
 from comun.reposicion import calcular_reposicion
 
+# Ciudades del pool nacional que únicamente almacenan Arena — lista dada
+# por el Arquitecto (2026-09-14), no derivada de un patrón (una ciudad
+# nueva no aparecería sola). Verificado contra `lineas_pedido.almacen`/
+# `arena_inventario.almacen`: son exactamente los 11 valores de esas
+# columnas que no son "Bogotá". Ortografía tal como la persiste el origen
+# (sin tildes: "Cucuta", "Ibague", "Medellin", "Popayan").
+CIUDADES_SOLO_ARENA: tuple[str, ...] = (
+    "Barranquilla",
+    "Bucaramanga",
+    "Cali",
+    "Cucuta",
+    "Ibague",
+    "Medellin",
+    "Pasto",
+    "Pereira",
+    "Popayan",
+    "Villavicencio",
+    "Yumbo",
+)
+
 # Colombia, UTC-5 sin horario de verano. Duplicado deliberado de 2 líneas:
 # comun/ no puede depender de inventario/ (sería un ciclo) y dashboard/ no
 # puede importar inventario/ (DEC-022) — no hay un lugar común más alto

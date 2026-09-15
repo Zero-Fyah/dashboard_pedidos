@@ -81,6 +81,14 @@ FALLO=0
 # lo advierte en vez de mostrar un número que parece fresco.
 "$PYEXE" -m inventario.persistencia >> "$LOGFILE" 2>&1 || FALLO=1
 
+# Exporta a Google Sheets el inventario Arena disponible y los pedidos
+# previos a picking, por ciudad — las 11 que solo almacenan Arena (pedido
+# del Arquitecto, 2026-09-14). Va después de inventario.persistencia
+# (arena_inventario recién recalculada) y no depende del ETL (no usa
+# columnas _num). Aislado igual que el resto: si Sheets no responde, no
+# bloquea nada del ciclo.
+"$PYEXE" -m integraciones.sheets_cliente >> "$LOGFILE" 2>&1 || FALLO=1
+
 # DEC-092: pasada mensual de mantenimiento — el día 1, una sola vez.
 #
 # Va DENTRO de este script y no como unidad aparte por una razón medida: el
