@@ -255,6 +255,9 @@ async def init_db(db_path: str) -> None:
             "ALTER TABLE pedidos ADD COLUMN pago_pagado          TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN pago_saldo           TEXT    DEFAULT NULL",
             "ALTER TABLE pedidos ADD COLUMN pago_progreso        TEXT    DEFAULT NULL",
+            # DEC-140: el origen separó el peso en «Peso pedido» (lo que
+            # `peso_total` siempre guardó) y «Peso entregado».
+            "ALTER TABLE lineas_pedido ADD COLUMN peso_entregado TEXT DEFAULT NULL",
         ):
             # AUD-B8: el único error esperado aquí es que la columna ya
             # exista (migración ya aplicada). Cualquier otro

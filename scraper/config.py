@@ -140,6 +140,11 @@ CONFIG: ConfigDict = {
     # contención con NUM_WORKERS reducido sin editar código. Default 5
     # preserva el comportamiento histórico.
     "NUM_WORKERS": _env_int("SCRAPER_NUM_WORKERS", 5),
+    # DEC-140: pedidos que cada ciclo incremental re-extrae para completar
+    # `peso_entregado` y `observaciones` del histórico, por tandas y dentro
+    # del mismo ciclo (sin segundo proceso sobre el lock ni RAM extra,
+    # DEC-139). 500 ≈ +6-7 min por ciclo al ritmo de DEC-124. 0 lo apaga.
+    "REEXTRACCION_POR_CICLO": _env_int("SCRAPER_REEXTRACCION_POR_CICLO", 500),
     # FIX C-1 (auditoría 2026-07-01): timeout global del run como red de
     # seguridad de última instancia. Debe superar el peor caso legítimo:
     # la carga histórica más larga registrada tomó ~5.5h (DEC-010) y el

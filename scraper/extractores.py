@@ -531,7 +531,10 @@ async def _saltar_a_pagina(page: Page, num_pagina: int) -> None:
     await campo.fill(str(num_pagina))
     await campo.press("Enter")
     await _esperar_cambio_primer_id(
-        page, anterior, "paginador_salto_timeout", f"tras saltar a la página {num_pagina}"
+        page,
+        anterior,
+        "paginador_salto_timeout",
+        f"tras saltar a la página {num_pagina}",
     )
 
 
@@ -1331,6 +1334,56 @@ async def extraer_registro_operaciones(page: Page, id_pedido: str) -> list[dict]
     return resultado
 
 
+# DEC-140: las columnas de la tabla de productos se leen POR ENCABEZADO.
+# Hasta el 2026-08-18 se leían por posición y el origen insertó «Peso
+# entregado» entre «Peso pedido» y «Observaciones»: durante cinco semanas
+# `observaciones` guardó el peso entregado (254.961 líneas) sin que nada
+# avisara. Misma lección que DEC-023 en la tarjeta de entrega.
+#
+# Encabezado del origen → campo de la línea. Dict explícito, igual que
+# `_ETIQUETAS_ENTREGA`/`_ETIQUETAS_PAGO`: un encabezado renombrado deja el
+# campo vacío y dispara WARNING, nunca se mapea por parecido.
+_COLUMNAS_LINEA: dict[str, str] = {
+    "Número de caja": "numero_caja",
+    "Información de productos": "info",
+    "Almacén": "almacen",
+    "Cantidad comprada": "cantidad_comprada",
+    "Cantidad entregada": "cantidad_entregada",
+    "Tipo": "tipo",
+    "Precio unitario": "precio_unitario",
+    "Descuento": "descuento",
+    "Precio con descuento": "precio_descuento",
+    "Monto a pagar del pedido": "monto_pagar",
+    "Monto final a pagar": "monto_final",
+    "IVA": "iva",
+    # Confirmado por el Arquitecto contra pedidos guardados antes del
+    # cambio: «Peso pedido» es lo que `peso_total` siempre guardó.
+    "Peso pedido": "peso_total",
+    "Peso entregado": "peso_entregado",
+    "Observaciones": "observaciones",
+}
+
+# Sin estas columnas la línea no tiene identidad ni cantidades: persistirla
+# pisaría una línea buena con una vacía (DELETE + INSERT del modo completo).
+_COLUMNAS_LINEA_OBLIGATORIAS: frozenset[str] = frozenset(
+    {"info", "cantidad_comprada", "cantidad_entregada"}
+)
+
+
+def _validar_encabezados_linea(encabezados: list[str]) -> tuple[list[str], list[str]]:
+    """Compara los encabezados de la tabla de productos contra `_COLUMNAS_LINEA`.
+
+    Returns:
+        (desconocidos, obligatorios_faltantes). Los desconocidos son
+        encabezados del origen sin campo asignado; los faltantes, campos
+        obligatorios que ningún encabezado provee.
+    """
+    desconocidos = [h for h in encabezados if h and h not in _COLUMNAS_LINEA]
+    presentes = {_COLUMNAS_LINEA[h] for h in encabezados if h in _COLUMNAS_LINEA}
+    faltantes = sorted(_COLUMNAS_LINEA_OBLIGATORIAS - presentes)
+    return desconocidos, faltantes
+
+
 # DEC-030 Fase 3 (híbrido): la lectura de filas + líneas de producto se
 # colapsa a un solo evaluate — antes era el mayor contribuyente de
 # round-trips del scraper (hasta 15-20 llamadas por línea de producto).
@@ -1341,8 +1394,10 @@ async def extraer_registro_operaciones(page: Page, id_pedido: str) -> list[dict]
 # verdad que usan leer_celda_descuento()/leer_presentacion() y sus tests
 # (DEC-022, DRY). cantidad_comprada/entregada se quedan como texto crudo:
 # to_num() y el WARNING de "no numérica" siguen en Python, sin cambios.
+# Recibe `_COLUMNAS_LINEA` como argumento (DEC-140): el mapeo vive una
+# sola vez, en Python.
 _JS_SUBPEDIDOS = """
-() => {
+(columnas) => {
     const filas = Array.from(document.querySelectorAll(
         'div.el-scrollbar__wrap--hidden-default table tbody tr'
     ));
@@ -1373,6 +1428,16 @@ _JS_SUBPEDIDOS = """
                 lineas: [],
             });
         } else if (fila.querySelector('td.el-table__expanded-cell') && subpedidos.length > 0) {
+            // DEC-140: índice de cada campo según el encabezado de ESTA tabla.
+            const encabezados = Array.from(
+                fila.querySelectorAll('.goods-table-header .goods-col')
+            ).map((c) => c.textContent.trim());
+            const idx = {};
+            encabezados.forEach((h, i) => {
+                const campo = columnas[h];
+                if (campo && !(campo in idx)) idx[campo] = i;
+            });
+            subpedidos[subpedidos.length - 1].encabezados = encabezados;
             // La fila de resumen ('Total', clase adicional 'summary-row') matchea
             // el mismo selector de clase que las filas de producto — sin este
             // filtro se cuela como una línea fantasma con cantidad_comprada
@@ -1383,8 +1448,14 @@ _JS_SUBPEDIDOS = """
                 .filter((r) => !r.classList.contains('summary-row'));
             for (const prodRow of prodRows) {
                 const cols = Array.from(prodRow.querySelectorAll('div.goods-col'));
-                const colTxt = (i) => (i < cols.length ? cols[i].textContent.trim() : '');
-                const infoCol = cols.length > 1 ? cols[1] : null;
+                const col = (campo) => (
+                    campo in idx && idx[campo] < cols.length ? cols[idx[campo]] : null
+                );
+                const colTxt = (campo) => {
+                    const c = col(campo);
+                    return c ? c.textContent.trim() : '';
+                };
+                const infoCol = col('info');
                 let nombre = '', referencia = '', codRaw = '', specs = [];
                 if (infoCol) {
                     const n = infoCol.querySelector('.goods-name');
@@ -1396,14 +1467,15 @@ _JS_SUBPEDIDOS = """
                     specs = Array.from(infoCol.querySelectorAll('.goods-specs span'))
                         .map((s) => s.textContent.trim());
                 }
-                let tipoVal = colTxt(5);
-                if (cols.length > 5) {
-                    const tEl = cols[5].querySelector('.el-tag__content');
+                let tipoVal = colTxt('tipo');
+                const tipoCol = col('tipo');
+                if (tipoCol) {
+                    const tEl = tipoCol.querySelector('.el-tag__content');
                     if (tEl) tipoVal = tEl.textContent.trim();
                 }
                 let dtoEtiquetas = [], dtoMontoCrudo = '', dtoTextoCompleto = '';
-                if (cols.length > 7) {
-                    const celdaDto = cols[7];
+                const celdaDto = col('descuento');
+                if (celdaDto) {
                     dtoEtiquetas = Array.from(celdaDto.querySelectorAll('.el-tag__content'))
                         .map((t) => t.textContent.trim());
                     for (const span of celdaDto.querySelectorAll('span')) {
@@ -1415,25 +1487,26 @@ _JS_SUBPEDIDOS = """
                     dtoTextoCompleto = celdaDto.textContent.trim();
                 }
                 subpedidos[subpedidos.length - 1].lineas.push({
-                    numero_caja: colTxt(0),
+                    numero_caja: colTxt('numero_caja'),
                     nombre_producto: nombre,
                     referencia: referencia,
                     codigo_barras_raw: codRaw,
                     presentacion_specs: specs,
-                    almacen: colTxt(2),
-                    cantidad_comprada_raw: colTxt(3),
-                    cantidad_entregada_raw: colTxt(4),
+                    almacen: colTxt('almacen'),
+                    cantidad_comprada_raw: colTxt('cantidad_comprada'),
+                    cantidad_entregada_raw: colTxt('cantidad_entregada'),
                     tipo: tipoVal,
-                    precio_unitario: colTxt(6),
+                    precio_unitario: colTxt('precio_unitario'),
                     descuento_etiquetas: dtoEtiquetas,
                     descuento_monto_crudo: dtoMontoCrudo,
                     descuento_texto_completo: dtoTextoCompleto,
-                    precio_descuento: colTxt(8),
-                    monto_pagar: colTxt(9),
-                    monto_final: colTxt(10),
-                    iva: colTxt(11),
-                    peso_total: colTxt(12),
-                    observaciones: colTxt(13),
+                    precio_descuento: colTxt('precio_descuento'),
+                    monto_pagar: colTxt('monto_pagar'),
+                    monto_final: colTxt('monto_final'),
+                    iva: colTxt('iva'),
+                    peso_total: colTxt('peso_total'),
+                    peso_entregado: colTxt('peso_entregado'),
+                    observaciones: colTxt('observaciones'),
                 });
             }
         }
@@ -1723,10 +1796,30 @@ async def extraer_subpedidos(page: Page) -> list[dict]:
             await asyncio.sleep(0.5)
 
     # 2 — Leer filas DESPUÉS de haber expandido todo (DEC-030 Fase 3)
-    crudo = await page.evaluate(_JS_SUBPEDIDOS)
+    crudo = await page.evaluate(_JS_SUBPEDIDOS, _COLUMNAS_LINEA)
 
     subpedidos: list[dict] = []
     for sp in crudo:
+        # DEC-140: sin `encabezados` el subpedido no expandió (ya avisado en
+        # el paso 1) y no hay nada que validar.
+        if "encabezados" in sp:
+            desconocidos, faltantes = _validar_encabezados_linea(sp["encabezados"])
+            if faltantes:
+                # Falla fuerte a propósito: persistir obligaría a borrar las
+                # líneas buenas del pedido y reemplazarlas por vacías.
+                raise ValueError(
+                    f"Tabla de productos sin columnas obligatorias {faltantes} — "
+                    f"encabezados del origen: {sp['encabezados']} (DEC-140)"
+                )
+            if desconocidos:
+                log_event(
+                    "lineas_columna_desconocida",
+                    level="WARNING",
+                    msg=(
+                        "Columnas nuevas en la tabla de productos — campo no "
+                        f"capturado (DEC-140): {sorted(set(desconocidos))}"
+                    ),
+                )
         raw = sp["raw_child_order_id"]
         if " + " in raw:
             partes = raw.split(" + ", 1)
@@ -1786,6 +1879,7 @@ async def extraer_subpedidos(page: Page) -> list[dict]:
                     "monto_final": ln["monto_final"],
                     "iva": ln["iva"],
                     "peso_total": ln["peso_total"],
+                    "peso_entregado": ln.get("peso_entregado", ""),
                     "observaciones": ln["observaciones"],
                 }
             )

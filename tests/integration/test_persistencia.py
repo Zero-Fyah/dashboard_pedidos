@@ -750,3 +750,57 @@ async def test_fk_on_revienta_escritura_huerfana(db_path, pedido_sin_diferencias
     # ROLLBACK total: ni el pedido ni el timeline huérfano quedaron.
     assert row is None
     assert huerfanos[0] == 0
+
+
+# ── DEC-140: peso entregado ─────────────────────────────────────────────────
+
+
+async def _leer_linea(db_path: str) -> tuple:
+    async with aiosqlite.connect(db_path) as db:
+        return await (
+            await db.execute(
+                "SELECT peso_total, peso_entregado, observaciones FROM lineas_pedido "
+                "WHERE id_pedido = 'TEST-001'"
+            )
+        ).fetchone()
+
+
+def _sub_con_peso(peso_entregado: str) -> dict:
+    return {
+        "numero_subpedido": "SUB-001",
+        "estado": "completado",
+        "lineas": [
+            {
+                "codigo_barras": "7700000000001",
+                "cantidad_entregada": 4.0,
+                "peso_entregado": peso_entregado,
+            }
+        ],
+    }
+
+
+@pytest.mark.integration
+async def test_completo_persiste_peso_entregado(db_path, pedido_sin_diferencias):
+    p = copy.deepcopy(pedido_sin_diferencias)
+    p["subpedidos"][0]["lineas"][0].update(peso_total="10000g", peso_entregado="4000g")
+    p["subpedidos"][0]["lineas"][0]["observaciones"] = "-"
+    await persistir_uno(p, db_path)
+    assert await _leer_linea(db_path) == ("10000g", "4000g", "-")
+
+
+@pytest.mark.integration
+async def test_con_cantidades_actualiza_peso_entregado(db_path, pedido_sin_diferencias):
+    p = copy.deepcopy(pedido_sin_diferencias)
+    p["subpedidos"][0]["lineas"][0].update(peso_total="10000g", peso_entregado="10000g")
+    await persistir_uno(p, db_path)
+    await persistir_uno(_resultado_con_cantidades([_sub_con_peso("4000g")]), db_path)
+    assert (await _leer_linea(db_path))[1] == "4000g"
+
+
+@pytest.mark.integration
+async def test_con_cantidades_peso_vacio_no_pisa_valor_bueno(db_path, pedido_sin_diferencias):
+    p = copy.deepcopy(pedido_sin_diferencias)
+    p["subpedidos"][0]["lineas"][0].update(peso_total="10000g", peso_entregado="4000g")
+    await persistir_uno(p, db_path)
+    await persistir_uno(_resultado_con_cantidades([_sub_con_peso("")]), db_path)
+    assert (await _leer_linea(db_path))[1] == "4000g"

@@ -276,6 +276,52 @@ async def obtener_ids_para_recuperar(
     return [r[0] for r in rows]
 
 
+async def obtener_ids_reextraccion(db_path: str, limite: int) -> list[str]:
+    """Tanda de pedidos a re-extraer para completar el histórico (DEC-140).
+
+    Un pedido entra si alguna de sus líneas no tiene `peso_entregado` (se
+    capturó antes de que existiera la columna) o tiene `observaciones` en
+    NULL (la reparación de DEC-140 la vació porque guardaba el peso). La
+    re-extracción en modo completo reescribe las dos, así que el pedido sale
+    solo del selector: **el carril se apaga solo** cuando termina el
+    histórico, sin tabla de estado.
+
+    No filtra por `scraping_completo`: un pedido marcado en un ciclo que
+    murió antes de procesarlo vuelve a salir en el siguiente.
+
+    El orden es aleatorio a propósito: un pedido cuya extracción vuelve
+    vacía (el guard de FIX C-2 no reescribe sus líneas) seguiría
+    seleccionado, y con un orden fijo ocuparía su lugar en todas las
+    tandas.
+
+    Args:
+        db_path: Ruta a la base de datos SQLite.
+        limite: Tamaño máximo de la tanda; 0 o menos devuelve lista vacía.
+
+    Returns:
+        Lista de id_pedido, a lo sumo `limite`.
+    """
+    if limite <= 0:
+        return []
+    async with aiosqlite.connect(db_path) as db:
+        rows = await (
+            await db.execute(
+                """
+                SELECT p.id_pedido
+                  FROM pedidos p
+                 WHERE EXISTS (SELECT 1 FROM lineas_pedido l
+                                WHERE l.id_pedido = p.id_pedido
+                                  AND (l.peso_entregado IS NULL
+                                       OR l.observaciones IS NULL))
+              ORDER BY RANDOM()
+                 LIMIT ?
+                """,
+                (limite,),
+            )
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
 async def marcar_para_recuperacion(db_path: str, ids: list[str]) -> None:
     """Pone `scraping_completo = 0` para que determinar_modo() mande a completo.
 
@@ -349,7 +395,7 @@ def construir_resumen(
         t_min: Duración del run en minutos.
         modo: Modo de ejecución ("completo" o "incremental").
         carriles: Conteos por carril incremental ("activos", "errores",
-                  "nuevos"), o None si el modo no tiene carriles (HAL-005).
+                  "nuevos" y, desde DEC-140, "reextraccion"), o None si el modo no tiene carriles (HAL-005).
 
     Returns:
         Dict serializable a JSON con las métricas del run. Los campos de
@@ -368,6 +414,8 @@ def construir_resumen(
         "pedidos_activos": carriles["activos"] if carriles is not None else None,
         "pedidos_error_reintentos": carriles["errores"] if carriles is not None else None,
         "pedidos_nuevos": carriles["nuevos"] if carriles is not None else None,
+        # DEC-140: .get() — el carril es opcional para los llamadores viejos.
+        "pedidos_reextraccion": carriles.get("reextraccion") if carriles is not None else None,
     }
 
 
@@ -378,6 +426,7 @@ async def main(args: argparse.Namespace) -> int:
         1. Pedidos activos  — lee DB: scraping_completo=1 con subpedidos abiertos.
         2. Pedidos con error — lee DB: ids en errores que no están completos/cerrados.
         3. Pedidos nuevos   — consulta servidor desde el watermark y descarta los ya en DB.
+        4. Re-extracción    — tanda del histórico sin `peso_entregado` (DEC-140).
     Flujo completo: recorre todas las páginas del rango dado (sin cambios).
 
     Args:
@@ -472,13 +521,27 @@ async def main(args: argparse.Namespace) -> int:
             ids_en_db = {r[0] for r in rows}
             ids_nuevos = [i for i in ids_nuevos_servidor if i not in ids_en_db]
 
+            # Proceso 4 — Re-extracción del histórico por tandas (DEC-140).
+            # Se excluyen los que ya van por otro carril: re-extraerlos dos
+            # veces en el mismo ciclo no aporta nada.
+            _ya_en_cola = set(ids_activos) | set(ids_error) | set(ids_nuevos)
+            ids_reextraccion = [
+                i
+                for i in await obtener_ids_reextraccion(db_path, CONFIG["REEXTRACCION_POR_CICLO"])
+                if i not in _ya_en_cola
+            ]
+            await marcar_para_recuperacion(db_path, ids_reextraccion)
+
             # Unión final sin duplicados
-            ids_pendientes: list[str] = list(dict.fromkeys(ids_activos + ids_error + ids_nuevos))
+            ids_pendientes: list[str] = list(
+                dict.fromkeys(ids_activos + ids_error + ids_nuevos + ids_reextraccion)
+            )
             # HAL-005: desglose por carril para el resumen JSON final.
             carriles: dict[str, int] | None = {
                 "activos": len(ids_activos),
                 "errores": len(ids_error),
                 "nuevos": len(ids_nuevos),
+                "reextraccion": len(ids_reextraccion),
             }
             log_event(
                 "ids_filtrados",
@@ -486,6 +549,7 @@ async def main(args: argparse.Namespace) -> int:
                     f"Activos: {len(ids_activos)} | "
                     f"Errores: {len(ids_error)} | "
                     f"Nuevos: {len(ids_nuevos)} | "
+                    f"Re-extracción DEC-140: {len(ids_reextraccion)} | "
                     f"Ventana nuevos: {fecha_desde_nuevos}..{fecha_hoy} | "
                     f"Total: {len(ids_pendientes)}"
                 ),

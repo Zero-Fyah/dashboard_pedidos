@@ -1461,10 +1461,14 @@ def get_estado_pago(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
     difieren la tarjeta no produce **ningún** ratio pagado/total mayor a 2
     contra los 4 —de hasta 39,8×— del campo viejo.
 
-    **No sirve para el saldo a favor:** `pago_saldo` nunca es negativo, mide
-    lo que falta por cobrar topado en cero. De los 172 pedidos con
-    `pagado > total`, los 172 tienen saldo 0. Esa pregunta la sigue
-    respondiendo `get_saldo_a_favor()` sobre `gestion_diferencias`.
+    **No sirve (todavía) para el saldo a favor:** hasta el 2026-09-11 el
+    origen topaba `pago_saldo` en cero (los 194 pedidos con `pagado > total`
+    tenían saldo 0). Desde entonces lo publica negativo —"se debe
+    reembolsar al cliente"—, pero con 5 casos y 4 coincidencias con
+    `gestion_diferencias` no alcanza para reemplazarla; el criterio de
+    cambio está fijado en DEC-140. Mientras tanto la pregunta la sigue
+    respondiendo `get_saldo_a_favor()` sobre `gestion_diferencias`. Este
+    listado filtra `saldo > 1`, así que los negativos no entran.
 
     **Cobertura:** solo pedidos desde el 2026-07-16; DEC-087 verificó que el
     origen no renderiza la tarjeta para los anteriores (0 de 24 en una prueba

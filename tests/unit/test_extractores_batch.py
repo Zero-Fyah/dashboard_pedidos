@@ -558,3 +558,83 @@ async def test_detalle_dif_fila_invalida_en_bulk_se_omite():
     card = _FakeCardDD([fila])
     res = await extraer_detalle_diferencias(_FakePageDD(card, [None]), "TEST-14")
     assert res == []
+
+
+# ── DEC-140: columnas de la tabla de productos por encabezado ───────────────
+
+_ENCABEZADOS_15 = [
+    "Número de caja",
+    "Información de productos",
+    "Almacén",
+    "Cantidad comprada",
+    "Cantidad entregada",
+    "Tipo",
+    "Precio unitario",
+    "Descuento",
+    "Precio con descuento",
+    "Monto a pagar del pedido",
+    "Monto final a pagar",
+    "IVA",
+    "Peso pedido",
+    "Peso entregado",
+    "Observaciones",
+]
+
+
+@pytest.mark.unit
+def test_encabezados_15_columnas_reales_sin_desconocidos_ni_faltantes():
+    assert sp._validar_encabezados_linea(_ENCABEZADOS_15) == ([], [])
+
+
+@pytest.mark.unit
+def test_encabezado_nuevo_se_reporta_como_desconocido():
+    desconocidos, faltantes = sp._validar_encabezados_linea(_ENCABEZADOS_15 + ["Lote"])
+    assert desconocidos == ["Lote"]
+    assert faltantes == []
+
+
+@pytest.mark.unit
+def test_encabezado_obligatorio_renombrado_se_reporta_faltante():
+    renombrado = [h if h != "Cantidad comprada" else "Cant. comprada" for h in _ENCABEZADOS_15]
+    desconocidos, faltantes = sp._validar_encabezados_linea(renombrado)
+    assert desconocidos == ["Cant. comprada"]
+    assert faltantes == ["cantidad_comprada"]
+
+
+def _crudo_con_encabezados(encabezados: list[str]) -> list[dict]:
+    linea = dict(_CRUDO_SUBPEDIDO_SIMPLE[0]["lineas"][0], peso_entregado="3000g")
+    return [dict(_CRUDO_SUBPEDIDO_SIMPLE[0], encabezados=encabezados, lineas=[linea])]
+
+
+@pytest.mark.unit
+async def test_subpedidos_propaga_peso_entregado():
+    res = await extraer_subpedidos(_FakePageSubpedidos(_crudo_con_encabezados(_ENCABEZADOS_15)))
+    linea = res[0]["lineas"][0]
+    assert linea["peso_total"] == "4500g"
+    assert linea["peso_entregado"] == "3000g"
+    assert linea["observaciones"] == "-"
+
+
+@pytest.mark.unit
+async def test_subpedidos_sin_peso_entregado_en_crudo_queda_vacio():
+    """Un crudo sin la clave (p. ej. subpedido sin expandir) no rompe."""
+    res = await extraer_subpedidos(_FakePageSubpedidos(_CRUDO_SUBPEDIDO_SIMPLE))
+    assert res[0]["lineas"][0]["peso_entregado"] == ""
+
+
+@pytest.mark.unit
+async def test_subpedidos_columna_desconocida_emite_warning(monkeypatch):
+    eventos = []
+    monkeypatch.setattr(sp, "log_event", lambda evento, **kw: eventos.append((evento, kw)))
+    await extraer_subpedidos(
+        _FakePageSubpedidos(_crudo_con_encabezados(_ENCABEZADOS_15 + ["Lote"]))
+    )
+    assert any(e[0] == "lineas_columna_desconocida" for e in eventos)
+
+
+@pytest.mark.unit
+async def test_subpedidos_sin_columna_obligatoria_falla_en_vez_de_persistir():
+    """Persistir obligaría a borrar las líneas buenas y dejar vacías."""
+    sin_info = [h for h in _ENCABEZADOS_15 if h != "Información de productos"]
+    with pytest.raises(ValueError, match="obligatorias"):
+        await extraer_subpedidos(_FakePageSubpedidos(_crudo_con_encabezados(sin_info)))

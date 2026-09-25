@@ -22,6 +22,7 @@ import aiosqlite
 # carga el scraper (ni Playwright, ni sus efectos secundarios de import).
 from comun import (
     COLUMNAS_GUION_ES_CERO,
+    COLUMNAS_PESO,
     DDL_ERROR_COLUMNA_DUPLICADA,
     ESTADOS_CONOCIDOS,
     ejecutar_ddl_idempotente,
@@ -108,6 +109,17 @@ def _log_event(
         logger.info(line)
 
 
+# DEC-140: columnas con `_num` que el scraper actualiza en el lugar. Las
+# demás tablas se reemplazan con DELETE + INSERT y nacen con `_num` NULL.
+#   lineas_pedido.peso_entregado — UPDATE del modo con_cantidades.
+#   pedidos.pago_* — UPDATE de la tarjeta «Operación de pago» en cada
+#   re-extracción completa (DEC-087).
+_COLUMNAS_EN_EL_LUGAR: dict[str, tuple[str, ...]] = {
+    "lineas_pedido": ("peso_entregado",),
+    "pedidos": ("pago_total", "pago_pagado", "pago_saldo"),
+}
+
+
 async def normalizar_montos(db: aiosqlite.Connection) -> None:
     """Agrega columnas _num REAL y las puebla con to_num().
 
@@ -138,6 +150,7 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
             "monto_final": "monto_final_num",
             "iva": "iva_num",
             "peso_total": "peso_total_num",
+            "peso_entregado": "peso_entregado_num",  # DEC-140
         },
         "estadisticas_monto": {
             "monto_pagar": "monto_pagar_num",
@@ -210,6 +223,26 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
                 db, f"ALTER TABLE {tabla} ADD COLUMN {col_num} REAL", DDL_ERROR_COLUMNA_DUPLICADA
             )
 
+        # DEC-140: el ETL solo convierte filas con `_num` NULL, pero el
+        # scraper reescribe algunas columnas EN EL LUGAR (UPDATE, no
+        # DELETE + INSERT). Sin estos triggers el valor convertido queda con
+        # la primera captura: medido 2026-09-23, 2.865 de 11.754 pedidos con
+        # `pago_saldo_num` desfasado y «Por cobrar» inflado en ~$7.000 M.
+        for col_src in _COLUMNAS_EN_EL_LUGAR.get(tabla, ()):
+            col_num = columnas[col_src]
+            await db.execute(
+                f"CREATE TRIGGER IF NOT EXISTS trg_{tabla}_{col_num} "
+                f"AFTER UPDATE OF {col_src} ON {tabla} "
+                f"WHEN NEW.{col_src} IS NOT OLD.{col_src} "
+                f"BEGIN "
+                f"UPDATE {tabla} SET {col_num} = NULL WHERE rowid = NEW.rowid; "
+                f"END"
+            )
+        # Nombre de la primera versión (DEC-140, mismo día); la reemplaza
+        # la genérica de arriba.
+        await db.execute("DROP TRIGGER IF EXISTS trg_lineas_peso_entregado_num")
+        await db.commit()
+
         # Paso 2: poblar en batches de 500 filas.
         # Filtra por col_num IS NULL para procesar únicamente
         # las filas que aún no tienen valor convertido.
@@ -218,6 +251,8 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
         for col_src, col_num in columnas.items():
             # DEC-025: el guion solo significa cero en columnas concretas.
             guion_es_cero = col_src in COLUMNAS_GUION_ES_CERO
+            # DEC-140: el peso se lleva a gramos, no a "número suelto".
+            es_peso = tabla == "lineas_pedido" and col_src in COLUMNAS_PESO
             clave = clave_por_tabla.get(tabla, "id")
             # El centinela tiene que ser del mismo tipo que la clave: con
             # `id_pedido` TEXT, un 0 entero compara mal en SQLite (los
@@ -290,7 +325,9 @@ async def normalizar_montos(db: aiosqlite.Connection) -> None:
                     break
                 for row_id, val in rows:
                     # val nunca es None: el SELECT filtra col_src IS NOT NULL
-                    valor_num = normalizar_numerico(val, guion_es_cero=guion_es_cero)
+                    valor_num = normalizar_numerico(
+                        val, guion_es_cero=guion_es_cero, es_peso=es_peso
+                    )
                     if valor_num is None:
                         # DEC-020: sin UPDATE — la fila queda _num NULL y
                         # se reintenta en la próxima corrida (auto-repara
@@ -509,6 +546,7 @@ async def crear_views(db: aiosqlite.Connection) -> None:
                 l.monto_final_num       AS monto_final,
                 l.iva_num               AS iva,
                 l.peso_total_num        AS peso_total,
+                l.peso_entregado_num    AS peso_entregado,
                 l.observaciones,
                 l.numero_caja,
                 l.tipo

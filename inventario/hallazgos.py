@@ -958,6 +958,62 @@ def cobertura_de_campos_cayendo(con: sqlite3.Connection) -> Hallazgo:
     )
 
 
+def peso_en_observaciones_de_linea(con: sqlite3.Connection) -> Hallazgo:
+    """Líneas cuya `observaciones` guarda un peso (DEC-140).
+
+    Vigila **contenido fuera de lugar**, el hueco que dejan los otros dos
+    detectores del origen: `vocabulario_nuevo_en_origen` mira valores que
+    aparecen y `cobertura_de_campos_cayendo` columnas que se vacían. Cuando
+    el origen insertó «Peso entregado» en la tabla de productos, la
+    columna siguió llena —con el peso— y ninguno de los dos lo vio durante
+    cinco semanas.
+
+    Una observación real con forma de peso no existe en los datos: antes
+    del corrimiento hubo 0 en 1,1 M de líneas. Todo caso es corrimiento.
+    """
+    if not _tabla_existe(con, "lineas_pedido"):
+        return Hallazgo(
+            clave="peso_en_observaciones_de_linea",
+            titulo="Peso guardado como observación de línea",
+            explicacion="",
+            categoria="Cambios del sistema origen",
+            prioridad="Alta",
+            origen="DEC-140",
+            unidad="líneas",
+            cantidad=0,
+            filas=pd.DataFrame(),
+        )
+    filas = pd.read_sql(
+        """SELECT substr(p.fecha, 1, 7) AS Mes,
+                  COUNT(*) AS Líneas,
+                  COUNT(DISTINCT l.id_pedido) AS Pedidos
+           FROM lineas_pedido l
+           JOIN pedidos p ON p.id_pedido = l.id_pedido
+           WHERE l.observaciones GLOB '*[0-9]g'
+              OR l.observaciones GLOB '*[0-9]KG'
+           GROUP BY Mes
+           ORDER BY Mes""",
+        con,
+    )
+    return Hallazgo(
+        clave="peso_en_observaciones_de_linea",
+        titulo="Peso guardado como observación de línea",
+        explicacion=(
+            "La columna de observaciones de las líneas de producto tiene pesos "
+            "(«500g», «4.5KG»). Es señal de que el origen movió las columnas de "
+            "la tabla de productos y el scraper las está leyendo corridas. "
+            "Revisar el WARNING `lineas_columna_desconocida` y `_COLUMNAS_LINEA` "
+            "en `scraper/extractores.py`."
+        ),
+        categoria="Cambios del sistema origen",
+        prioridad="Alta",
+        origen="DEC-140",
+        unidad="líneas",
+        cantidad=int(filas["Líneas"].sum()) if not filas.empty else 0,
+        filas=filas,
+    )
+
+
 def arena_referencias_no_reconocidas(df_admin: pd.DataFrame) -> Hallazgo:
     """Referencias de la categoría Arena que ningún grupo de modalidad reconoce (DEC-118).
 
@@ -1038,6 +1094,7 @@ def detectar_todos(df_admin: pd.DataFrame, con: sqlite3.Connection) -> list[Hall
         lambda: sku_en_bodega_fuera_de_catalogo(df_admin, con),
         lambda: vocabulario_nuevo_en_origen(con),
         lambda: cobertura_de_campos_cayendo(con),
+        lambda: peso_en_observaciones_de_linea(con),
         lambda: arena_referencias_no_reconocidas(df_admin),
     ]
 

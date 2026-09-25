@@ -15,6 +15,7 @@ desde estas constantes, el ETL genera los literales SQL de sus VIEWs desde
 ellas y el dashboard deriva sus filtros de las mismas.
 """
 
+import re
 import sqlite3
 from pathlib import Path
 from typing import Protocol
@@ -397,6 +398,38 @@ PLACEHOLDER_SIN_DATO: frozenset[str] = frozenset({"", "g"})
 # negocio 2026-07-18). En las demás, NULL.
 COLUMNAS_GUION_ES_CERO: frozenset[str] = frozenset({"descuento"})
 
+# DEC-140: columnas de peso de `lineas_pedido`. Se normalizan con
+# `a_gramos()`, no con `to_num()`: el origen escribe gramos enteros ("500g")
+# o kilos con punto DECIMAL ("4.5KG"), y `to_num` lee ese punto como
+# separador de miles (4.5KG → 45).
+COLUMNAS_PESO: frozenset[str] = frozenset({"peso_total", "peso_entregado"})
+
+# Gramos solo enteros: un "1.234g" sería ambiguo (¿miles o decimal?) y no
+# aparece en 1,1 M de líneas medidas; si aparece, falla y el ETL lo reporta.
+_PATRON_PESO = re.compile(r"^(\d+)\s*g$|^(\d+(?:\.\d+)?)\s*kg$", re.IGNORECASE)
+
+
+def a_gramos(val: str | None) -> float | None:
+    """Convierte un peso del origen a gramos (DEC-140).
+
+    Formatos medidos en `lineas_pedido`: "500g" (1.108.425 líneas) y
+    "4.5KG"/"135KG" (27.500). Cualquier otro formato devuelve None.
+
+    Args:
+        val: Texto crudo, ej. "14460g", "0.1KG".
+
+    Returns:
+        Peso en gramos, o None si el formato no se reconoce.
+    """
+    if val is None:
+        return None
+    m = _PATRON_PESO.match(str(val).strip())
+    if not m:
+        return None
+    if m.group(1) is not None:
+        return float(m.group(1))
+    return float(m.group(2)) * 1000
+
 
 def es_placeholder(val: str | None) -> bool:
     """Indica si el texto es un placeholder conocido del sistema origen.
@@ -416,7 +449,9 @@ def es_placeholder(val: str | None) -> bool:
     return texto in PLACEHOLDER_GUION or texto in PLACEHOLDER_SIN_DATO
 
 
-def normalizar_numerico(val: str | None, *, guion_es_cero: bool = False) -> float | None:
+def normalizar_numerico(
+    val: str | None, *, guion_es_cero: bool = False, es_peso: bool = False
+) -> float | None:
     """Convierte a float aplicando la semántica de placeholders (DEC-025).
 
     Se distingue de `to_num()` en que aplica **reglas de negocio**, no
@@ -427,6 +462,8 @@ def normalizar_numerico(val: str | None, *, guion_es_cero: bool = False) -> floa
         val: Texto a convertir.
         guion_es_cero: True solo para las columnas de
             `COLUMNAS_GUION_ES_CERO`, donde '-' significa cero.
+        es_peso: True para las columnas de `COLUMNAS_PESO`; convierte a
+            gramos con `a_gramos()` (DEC-140).
 
     Returns:
         Valor float, 0.0 si el guion representa cero en esa columna, o
@@ -439,6 +476,8 @@ def normalizar_numerico(val: str | None, *, guion_es_cero: bool = False) -> floa
         return 0.0 if guion_es_cero else None
     if texto in PLACEHOLDER_SIN_DATO:
         return None
+    if es_peso:
+        return a_gramos(texto)
     return to_num(texto)
 
 

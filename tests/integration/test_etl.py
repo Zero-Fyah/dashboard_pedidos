@@ -27,7 +27,11 @@ _SONDA = "v_diferencias_resumen"
 
 @pytest.mark.integration
 async def test_columnas_num_creadas(db_path):
-    """Las 23 columnas _num existen tras normalizar."""
+    """Las columnas _num de las 4 tablas de montos existen tras normalizar.
+
+    Las de `pedidos` (tarjeta de pago) y `registros_pago` se verifican en
+    `test_columnas_num_de_pago_y_peso_entregado` (DEC-089/140).
+    """
     async with aiosqlite.connect(db_path) as db:
         await normalizar_montos(db)
         cols_lp = {
@@ -54,6 +58,7 @@ async def test_columnas_num_creadas(db_path):
         "monto_final_num",
         "iva_num",
         "peso_total_num",
+        "peso_entregado_num",  # DEC-140
     ]:
         assert col in cols_lp, f"{col} falta en lineas_pedido"
 
@@ -85,10 +90,34 @@ async def test_columnas_num_creadas(db_path):
 
 @pytest.mark.integration
 async def test_normalizacion_es_idempotente(db_path):
-    """Ejecutar normalizar_montos dos veces no genera errores."""
+    """Ejecutar normalizar_montos dos veces no falla ni cambia nada: mismo
+    esquema, mismos triggers y los valores ya convertidos quedan iguales."""
+
+    async def _foto(db):
+        esquema = await (
+            await db.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+        ).fetchall()
+        valores = await (
+            await db.execute("SELECT id, precio_unitario_num, peso_total_num FROM lineas_pedido")
+        ).fetchall()
+        return esquema, valores
+
     async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO pedidos (id_pedido, fecha) VALUES ('TEST-IDEM', '2026-09-24')"
+        )
+        await db.execute(
+            "INSERT INTO lineas_pedido (id_pedido, numero_subpedido, precio_unitario, peso_total)"
+            " VALUES ('TEST-IDEM', 'S1', 'COP 33.900', '4.5KG')"
+        )
+        await db.commit()
         await normalizar_montos(db)
+        primera = await _foto(db)
         await normalizar_montos(db)
+        segunda = await _foto(db)
+
+    assert primera == segunda
+    assert primera[1][0][1:] == (33900.0, 4500.0)
 
 
 @pytest.mark.integration
@@ -552,6 +581,12 @@ async def test_normalizar_montos_columna_duplicada_no_propaga(db_path):
         await db.execute("ALTER TABLE lineas_pedido ADD COLUMN precio_unitario_num REAL")
         await db.commit()
         await normalizar_montos(db)
+        cols = [
+            c[1] for c in await (await db.execute("PRAGMA table_info(lineas_pedido)")).fetchall()
+        ]
+
+    assert cols.count("precio_unitario_num") == 1  # no se duplicó
+    assert "monto_final_num" in cols  # y siguió con el resto
 
 
 # ── VIEW de descuentos (deriva de DEC-024) ─────────────────────────────────────
@@ -723,3 +758,142 @@ async def test_las_tablas_con_id_surrogate_no_cambiaron(db_path):
 
     assert n == 600
     assert suma == 600 * 1250
+
+
+# ── DEC-140: peso en gramos y recálculo del peso entregado ─────────────────
+
+
+async def _insertar_linea(db, peso_total: str, peso_entregado: str) -> int:
+    await db.execute(
+        "INSERT OR IGNORE INTO pedidos (id_pedido, fecha) VALUES ('P-PESO', '2026-09-23')"
+    )
+    cur = await db.execute(
+        "INSERT INTO lineas_pedido (id_pedido, numero_subpedido, peso_total, peso_entregado) "
+        "VALUES ('P-PESO', 'S1', ?, ?)",
+        (peso_total, peso_entregado),
+    )
+    await db.commit()
+    return cur.lastrowid
+
+
+@pytest.mark.integration
+async def test_peso_se_normaliza_a_gramos(db_path):
+    async with aiosqlite.connect(db_path) as db:
+        id_kg = await _insertar_linea(db, "13.5KG", "4.5KG")
+        id_g = await _insertar_linea(db, "14460g", "0g")
+        await normalizar_montos(db)
+        filas = {
+            r[0]: (r[1], r[2])
+            for r in await (
+                await db.execute(
+                    "SELECT id, peso_total_num, peso_entregado_num FROM lineas_pedido "
+                    "WHERE id IN (?, ?)",
+                    (id_kg, id_g),
+                )
+            ).fetchall()
+        }
+    assert filas[id_kg] == (13500.0, 4500.0)
+    assert filas[id_g] == (14460.0, 0.0)
+
+
+@pytest.mark.integration
+async def test_cambio_de_peso_entregado_se_reconvierte(db_path):
+    """El scraper actualiza `peso_entregado` en el lugar (con_cantidades);
+    el trigger anula el `_num` para que la próxima corrida lo recalcule."""
+    async with aiosqlite.connect(db_path) as db:
+        id_linea = await _insertar_linea(db, "10000g", "10000g")
+        await normalizar_montos(db)
+        await db.execute(
+            "UPDATE lineas_pedido SET peso_entregado = '4000g' WHERE id = ?", (id_linea,)
+        )
+        await db.commit()
+        antes = (
+            await (
+                await db.execute(
+                    "SELECT peso_entregado_num FROM lineas_pedido WHERE id = ?", (id_linea,)
+                )
+            ).fetchone()
+        )[0]
+        await normalizar_montos(db)
+        despues = (
+            await (
+                await db.execute(
+                    "SELECT peso_entregado_num FROM lineas_pedido WHERE id = ?", (id_linea,)
+                )
+            ).fetchone()
+        )[0]
+    assert antes is None
+    assert despues == 4000.0
+
+
+@pytest.mark.integration
+async def test_cambio_de_saldo_del_origen_se_reconvierte(db_path):
+    """El scraper reescribe la tarjeta de pago en cada re-extracción; sin el
+    trigger `pago_saldo_num` quedaba con la primera captura (DEC-140)."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO pedidos (id_pedido, fecha, pago_saldo) "
+            "VALUES ('P-SALDO', '2026-09-23', 'COP 2.218.426')"
+        )
+        await db.commit()
+        await normalizar_montos(db)
+        await db.execute("UPDATE pedidos SET pago_saldo = 'COP 0' WHERE id_pedido = 'P-SALDO'")
+        await db.commit()
+        await normalizar_montos(db)
+        saldo = (
+            await (
+                await db.execute("SELECT pago_saldo_num FROM pedidos WHERE id_pedido = 'P-SALDO'")
+            ).fetchone()
+        )[0]
+    assert saldo == 0.0
+
+
+@pytest.mark.integration
+async def test_trigger_no_se_dispara_si_el_valor_no_cambia(db_path):
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO pedidos (id_pedido, fecha, pago_saldo) "
+            "VALUES ('P-IGUAL', '2026-09-23', 'COP 100')"
+        )
+        await db.commit()
+        await normalizar_montos(db)
+        await db.execute("UPDATE pedidos SET pago_saldo = 'COP 100' WHERE id_pedido = 'P-IGUAL'")
+        await db.commit()
+        saldo = (
+            await (
+                await db.execute("SELECT pago_saldo_num FROM pedidos WHERE id_pedido = 'P-IGUAL'")
+            ).fetchone()
+        )[0]
+    assert saldo == 100.0
+
+
+@pytest.mark.integration
+async def test_columnas_num_de_pago_y_peso_entregado(db_path):
+    """Columnas _num que no cubría `test_columnas_num_creadas`: la tarjeta de
+    pago (DEC-089), los comprobantes (DEC-087) y el peso entregado (DEC-140),
+    más los triggers que las reconvierten cuando el scraper las reescribe."""
+    async with aiosqlite.connect(db_path) as db:
+        await normalizar_montos(db)
+
+        async def _cols(tabla):
+            return {
+                c[1] for c in await (await db.execute(f"PRAGMA table_info({tabla})")).fetchall()
+            }
+
+        cols_p = await _cols("pedidos")
+        cols_rp = await _cols("registros_pago")
+        triggers = {
+            r[0]
+            for r in await (
+                await db.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+            ).fetchall()
+        }
+
+    assert {"pago_total_num", "pago_pagado_num", "pago_saldo_num"} <= cols_p
+    assert {"monto_comprobante_num", "monto_pago_num"} <= cols_rp
+    assert {
+        "trg_lineas_pedido_peso_entregado_num",
+        "trg_pedidos_pago_total_num",
+        "trg_pedidos_pago_pagado_num",
+        "trg_pedidos_pago_saldo_num",
+    } <= triggers

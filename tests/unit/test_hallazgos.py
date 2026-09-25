@@ -22,6 +22,7 @@ from inventario.hallazgos import (
     estados_sin_clasificar,
     lineas_sin_id_producto,
     personal_duplicado,
+    peso_en_observaciones_de_linea,
     productos_en_bodega_sin_precio,
     referencias_con_espacios,
     sku_en_bodega_fuera_de_catalogo,
@@ -499,3 +500,36 @@ def test_arena_excluidas_conocidas_no_cuentan_como_no_reconocidas():
     admin = _admin_arena([{"referencia": "PB008"}, {"referencia": "PRA-T01"}])
 
     assert arena_referencias_no_reconocidas(admin).cantidad == 0
+
+
+# ─────────────────────────────────────────────
+# Peso en observaciones de línea (DEC-140)
+# ─────────────────────────────────────────────
+
+
+def _con_lineas_obs(valores):
+    c = sqlite3.connect(":memory:")
+    c.execute("CREATE TABLE pedidos (id_pedido TEXT, fecha TEXT)")
+    c.execute("CREATE TABLE lineas_pedido (id_pedido TEXT, observaciones TEXT)")
+    c.execute("INSERT INTO pedidos VALUES ('P1', '2026-08-20 10:00:00')")
+    c.execute("INSERT INTO pedidos VALUES ('P2', '2026-09-01 10:00:00')")
+    for id_pedido, obs in valores:
+        c.execute("INSERT INTO lineas_pedido VALUES (?, ?)", (id_pedido, obs))
+    return c
+
+
+def test_peso_en_observaciones_se_detecta_por_mes():
+    c = _con_lineas_obs([("P1", "500g"), ("P1", "4.5KG"), ("P2", "0g"), ("P2", "-")])
+    h = peso_en_observaciones_de_linea(c)
+    assert h.cantidad == 3
+    assert h.filas["Mes"].tolist() == ["2026-08", "2026-09"]
+    assert h.filas["Líneas"].tolist() == [2, 1]
+
+
+def test_observaciones_reales_no_se_detectan():
+    c = _con_lineas_obs([("P1", "-"), ("P1", "Entregar en portería"), ("P2", "测试订单")])
+    assert peso_en_observaciones_de_linea(c).cantidad == 0
+
+
+def test_peso_en_observaciones_sin_tabla_no_falla():
+    assert peso_en_observaciones_de_linea(sqlite3.connect(":memory:")).cantidad == 0

@@ -339,6 +339,7 @@ async def persistencia_worker(
                                 "monto_final": linea["monto_final"],
                                 "iva": linea["iva"],
                                 "peso_total": linea["peso_total"],
+                                "peso_entregado": linea.get("peso_entregado", ""),
                                 "observaciones": linea["observaciones"],
                                 "numero_caja": linea["numero_caja"],
                                 "tipo": linea["tipo"],
@@ -453,7 +454,7 @@ async def persistencia_worker(
                                     almacen, cantidad_comprada, cantidad_entregada,
                                     precio_unitario, descuento, descuento_tipo,
                                     precio_descuento,
-                                    monto_pagar, monto_final, iva, peso_total, observaciones,
+                                    monto_pagar, monto_final, iva, peso_total, peso_entregado, observaciones,
                                     numero_caja, tipo
                                 ) VALUES (
                                     :id_pedido, :numero_subpedido, :tipo_subpedido,
@@ -461,7 +462,7 @@ async def persistencia_worker(
                                     :almacen, :cantidad_comprada, :cantidad_entregada,
                                     :precio_unitario, :descuento, :descuento_tipo,
                                     :precio_descuento,
-                                    :monto_pagar, :monto_final, :iva, :peso_total, :observaciones,
+                                    :monto_pagar, :monto_final, :iva, :peso_total, :peso_entregado, :observaciones,
                                     :numero_caja, :tipo
                                 )
                                 """,
@@ -658,12 +659,17 @@ async def persistencia_worker(
                     for sp in resultado["subpedidos"]:
                         num_sub = sp["numero_subpedido"]
                         for linea in sp["lineas"]:
+                            # DEC-140: el peso entregado se mueve con la
+                            # cantidad entregada; se actualizan juntos, sin
+                            # pisar un valor bueno con uno vacío.
                             cursor = await db.execute(
-                                "UPDATE lineas_pedido SET cantidad_entregada = ? "
+                                "UPDATE lineas_pedido SET cantidad_entregada = ?, "
+                                "peso_entregado = COALESCE(NULLIF(?, ''), peso_entregado) "
                                 "WHERE id_pedido = ? AND numero_subpedido = ? "
                                 "AND codigo_barras = ?",
                                 (
                                     linea["cantidad_entregada"],
+                                    linea.get("peso_entregado", ""),
                                     id_pedido,
                                     num_sub,
                                     linea["codigo_barras"],
