@@ -22,7 +22,9 @@ demanda** por (código de barras, ciudad) — decisión del Arquitecto: no hay
 reserva formal que impida vender el inventario de una modalidad bajo otra,
 así que sumarlas da la disponibilidad real. Respaldo y el hub de Yumbo NO
 entran (no son modalidad de venta, mismo criterio que ya separa la tabla
-núcleo del resto en `dashboard/pages/arena.py`).
+núcleo del resto en `dashboard/pages/arena.py`). Tampoco la tonelada de
+Yumbo (`YUMBO TONELADA`, DEC-143): se muestra como Tonelada pero abastece
+los traslados nacionales, no la venta de Yumbo.
 
 **`CV_DEFECTO` (de `comun/reposicion.py`) puede no ser representativo de
 Arena**: es la mediana del catálogo general con clasificación ABC-XYZ, y
@@ -36,7 +38,12 @@ import datetime as dt
 
 import pandas as pd
 
-from comun import ARENA_MODALIDADES_NUCLEO, VENTANA_DEMANDA_D, clasificar_modalidad_arena
+from comun import (
+    ARENA_MODALIDADES_NUCLEO,
+    ARENA_REFERENCIA_TONELADA_YUMBO,
+    VENTANA_DEMANDA_D,
+    clasificar_modalidad_arena,
+)
 from comun.reposicion import calcular_reposicion
 
 # Ciudades del pool nacional que únicamente almacenan Arena — lista dada
@@ -98,6 +105,10 @@ def demanda_arena_por_ciudad(
     m["cantidad_comprada"] = pd.to_numeric(m["cantidad_comprada"], errors="coerce")
     m["modalidad"] = m["referencia"].map(clasificar_modalidad_arena)
     m = m[m["modalidad"].isin(ARENA_MODALIDADES_NUCLEO)]
+    # DEC-143: mismo recorte que el inventario de alertas_quiebre_arena — la
+    # tonelada de Yumbo no es disponible de venta de Yumbo, así que su venta
+    # (hoy 0 líneas en toda la historia) tampoco cuenta como demanda.
+    m = m[m["referencia"] != ARENA_REFERENCIA_TONELADA_YUMBO]
     # Una venta cancelada no es demanda real (mismo criterio que
     # inventario/salud.py::_demanda_por_referencia).
     m = m[m["estado"].str.lower() != "cancelado"]
@@ -162,6 +173,13 @@ def alertas_quiebre_arena(
         return pd.DataFrame(columns=columnas_salida)
 
     inv = inventario[inventario["modalidad"].isin(ARENA_MODALIDADES_NUCLEO)].copy()
+    # DEC-143: la tonelada de Yumbo se muestra como Tonelada pero no cuenta
+    # como disponible de Yumbo: es también el stock desde el que se trasladan
+    # toneladas a las demás ciudades (DEC-118). Sumarla haría ver cubierto a
+    # Yumbo con inventario comprometido para el resto del país y ocultaría un
+    # quiebre de su Corporativo. Las alertas quedan como antes de DEC-143.
+    if "referencia" in inv.columns:
+        inv = inv[inv["referencia"] != ARENA_REFERENCIA_TONELADA_YUMBO]
     if inv.empty:
         return pd.DataFrame(columns=columnas_salida)
 

@@ -6,7 +6,9 @@ ciudad, listos para exportar a Google Sheets (pedido del Arquitecto,
 Las 11 ciudades de `comun.arena.CIUDADES_SOLO_ARENA` solo almacenan Arena
 (a diferencia de Bogotá). Los asistentes de inventario cruzan estos dos
 números — inventario disponible y pedidos aún no alistados — para calcular
-el inventario teórico antes del conteo físico.
+el inventario teórico antes del conteo físico. Desde DEC-143 los dos Sheets
+incluyen también Bogotá, para el seguimiento nacional (en pedidos, solo
+las líneas de Arena: Bogotá también despacha accesorios).
 
 Solo las consultas SQL viven acá; escribir a Google Sheets es
 `integraciones/sheets_cliente.py`. Separado a propósito: esta parte se
@@ -22,8 +24,12 @@ import sqlite3
 
 import pandas as pd
 
-from comun import ARENA_MODALIDADES_NUCLEO, ESTADOS_PREVIOS_PICKING
-from comun.arena import CIUDADES_SOLO_ARENA
+from comun import ARENA_CIUDADES, ARENA_MODALIDADES_NUCLEO, ESTADOS_PREVIOS_PICKING
+
+# DEC-143: los dos Sheets se comparten para las 12 ciudades (seguimiento
+# nacional). Bogotá entra aparte de `CIUDADES_SOLO_ARENA` a propósito: esa
+# constante significa "ciudades que solo almacenan Arena", y Bogotá no lo es.
+CIUDADES_SHEETS: tuple[str, ...] = ARENA_CIUDADES
 
 COLUMNAS_INVENTARIO = [
     "Ciudad",
@@ -63,15 +69,20 @@ def inventario_disponible_arena(con: sqlite3.Connection) -> pd.DataFrame:
     `arena_inventario` verificado el 2026-09-14, no es un hueco de esta
     consulta.
 
+    Ciudades: `CIUDADES_SHEETS` — las 12, Bogotá incluida
+    (DEC-143). Una fila por referencia, así que en cada ciudad Unidades
+    (`PRA13`…), Tonelada (`PRA ARENA TONELADA`; en Yumbo `YUMBO TONELADA`)
+    y Corporativo salen por separado.
+
     Args:
         con: Conexión abierta a `pedidos.db`.
 
     Returns:
-        Una fila por (ciudad, código de barras), columnas
+        Una fila por (ciudad, código de barras, referencia), columnas
         `COLUMNAS_INVENTARIO`. Vacío si `arena_inventario` no tiene filas
-        para las ciudades de `CIUDADES_SOLO_ARENA`.
+        para esas ciudades.
     """
-    ciudades = ",".join(f"'{c}'" for c in CIUDADES_SOLO_ARENA)
+    ciudades = ",".join(f"'{c}'" for c in CIUDADES_SHEETS)
     modalidades = ",".join(f"'{m}'" for m in ARENA_MODALIDADES_NUCLEO)
     return pd.read_sql(
         f"""
@@ -108,7 +119,15 @@ def pedidos_previos_picking_arena(con: sqlite3.Connection) -> pd.DataFrame:
     asistente de inventario necesita ver, no uno para recortar.
 
     Arena se identifica por `codigo_barras` presente en `arena_inventario`
-    — mismo criterio que `dashboard.db.get_arena_movimiento()`.
+    — mismo criterio que `dashboard.db.get_arena_movimiento()`. En Bogotá
+    es lo que separa las arenas de los accesorios (DEC-143), y se midió
+    antes de incluirla: de las 11.061 líneas previas a picking de Bogotá,
+    las 10.678 de accesorios quedan fuera (0 códigos compartidos con Arena)
+    y entran las 380 de Arena. Las 3 restantes son `PRA AVERIA` («Lona de 1
+    tonelada - Reserva con tu SAC»), una reserva sin inventario en bodega,
+    que ya se excluía igual en las demás ciudades.
+
+    Ciudades: `CIUDADES_SHEETS` — las 12, Bogotá incluida (DEC-143).
 
     Args:
         con: Conexión abierta a `pedidos.db`.
@@ -116,7 +135,7 @@ def pedidos_previos_picking_arena(con: sqlite3.Connection) -> pd.DataFrame:
     Returns:
         Una fila por línea de pedido, columnas `COLUMNAS_PEDIDOS`.
     """
-    ciudades = ",".join(f"'{c}'" for c in CIUDADES_SOLO_ARENA)
+    ciudades = ",".join(f"'{c}'" for c in CIUDADES_SHEETS)
     estados = ",".join(f"'{e}'" for e in ESTADOS_PREVIOS_PICKING)
     return pd.read_sql(
         f"""

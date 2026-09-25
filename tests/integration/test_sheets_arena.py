@@ -57,7 +57,7 @@ def test_inventario_suma_modalidades_nucleo_por_ciudad_y_codigo(tmp_path):
         " referencia, almacen, inventario, modalidad) VALUES"
         " ('111', 'PRA13, 10KG', 'Arena X', 'PRA13', 'Cali', 9999, 'Respaldo')"
     )
-    # Ciudad fuera del alcance (Bogotá no es "solo arena"): no debe aparecer.
+    # DEC-143: Bogotá entra al inventario (seguimiento nacional).
     con.execute(
         "INSERT INTO arena_inventario (codigo_barras, especificacion, nombre_comercial,"
         " referencia, almacen, inventario, modalidad) VALUES"
@@ -71,10 +71,10 @@ def test_inventario_suma_modalidades_nucleo_por_ciudad_y_codigo(tmp_path):
     con.close()
 
     assert list(df.columns) == COLUMNAS_INVENTARIO
-    assert len(df) == 1
-    fila = df.iloc[0]
-    assert fila["Ciudad"] == "Cali"
+    assert len(df) == 2
+    fila = df[df["Ciudad"] == "Cali"].iloc[0]
     assert fila["Disponible para venta"] == 150  # 100 + 50, sin el Respaldo
+    assert df[df["Ciudad"] == "Bogotá"].iloc[0]["Disponible para venta"] == 30
 
 
 @pytest.mark.integration
@@ -146,3 +146,73 @@ def test_ambas_devuelven_vacio_sin_datos(tmp_path):
     assert inventario_disponible_arena(con).empty
     assert pedidos_previos_picking_arena(con).empty
     con.close()
+
+
+def _fila_inv(con, codigo, referencia, ciudad, inventario, modalidad):
+    con.execute(
+        "INSERT INTO arena_inventario (codigo_barras, especificacion, nombre_comercial,"
+        " referencia, almacen, inventario, modalidad) VALUES (?, 'E', 'N', ?, ?, ?, ?)",
+        (codigo, referencia, ciudad, inventario, modalidad),
+    )
+
+
+@pytest.mark.integration
+def test_bogota_y_yumbo_con_sus_modalidades_de_venta(tmp_path):
+    """DEC-143: Bogotá sale con Unidades, Tonelada y Corporativo en filas
+    separadas (una por referencia, igual que las demás ciudades); Yumbo
+    suma su tonelada (`YUMBO TONELADA`); Respaldo y el hub siguen fuera."""
+    con = sqlite3.connect(tmp_path / "arena.db")
+    _base(con)
+    _fila_inv(con, "111", "PRA13", "Bogotá", 10, "Unidades")
+    _fila_inv(con, "111", "PRA ARENA TONELADA", "Bogotá", 20, "Tonelada")
+    _fila_inv(con, "111", "ARENA TONELADA CORPORATIVO BOGOTA", "Bogotá", 30, "Corporativo")
+    _fila_inv(con, "111", "ARENA AVERIA BOGOTA", "Bogotá", 999, "Respaldo")
+    _fila_inv(con, "111", "YUMBO EN TRANSITO", "Bogotá", 999, "Yumbo (hub)")
+    _fila_inv(con, "111", "YUMBO TONELADA", "Yumbo", 40, "Tonelada")
+    _fila_inv(con, "111", "ARENA TONELADA CORPORATIVO YUMBO", "Yumbo", 5, "Corporativo")
+    con.commit()
+
+    df = inventario_disponible_arena(con)
+    con.close()
+
+    bogota = df[df["Ciudad"] == "Bogotá"].set_index("Referencia")["Disponible para venta"]
+    assert bogota.to_dict() == {
+        "ARENA TONELADA CORPORATIVO BOGOTA": 30,
+        "PRA ARENA TONELADA": 20,
+        "PRA13": 10,
+    }
+    yumbo = df[df["Ciudad"] == "Yumbo"].set_index("Referencia")["Disponible para venta"]
+    assert yumbo.to_dict() == {"ARENA TONELADA CORPORATIVO YUMBO": 5, "YUMBO TONELADA": 40}
+
+
+@pytest.mark.integration
+def test_pedidos_previos_de_bogota_solo_arena(tmp_path):
+    """DEC-143: Bogotá entra al Sheet de pedidos, pero solo con sus líneas de
+    Arena — en Bogotá conviven con accesorios, que no deben llegar."""
+    con = sqlite3.connect(tmp_path / "arena.db")
+    _base(con)
+    _fila_inv(con, "111", "PRA13", "Bogotá", 10, "Unidades")
+    lineas = (
+        ("P1", "S1", "Arena", "PRA13", "111", "Bogotá"),
+        ("P2", "S1", "Accesorios", "PP116", "999", "Bogotá"),  # accesorio: fuera
+        ("P3", "S1", "Arena", "PRA13", "111", "Cali"),
+    )
+    for pid, sub, tipo, ref, cb, ciudad in lineas:
+        con.execute("INSERT OR IGNORE INTO pedidos VALUES (?, '2026-09-24', '10:00')", (pid,))
+        con.execute(
+            "INSERT INTO subpedidos (id_pedido, numero_subpedido, tipo_subpedido, estado,"
+            " inicio_inspeccion) VALUES (?, ?, ?, 'Pendiente de recolección', '-')",
+            (pid, sub, tipo),
+        )
+        con.execute(
+            "INSERT INTO lineas_pedido (id_pedido, numero_subpedido, referencia, codigo_barras,"
+            " presentacion, almacen, cantidad_comprada) VALUES (?, ?, ?, ?, 'x', ?, 3)",
+            (pid, sub, ref, cb, ciudad),
+        )
+    con.commit()
+    df = pedidos_previos_picking_arena(con)
+    con.close()
+    assert sorted(zip(df["Pedido padre"], df["Ciudad"], strict=True)) == [
+        ("P1", "Bogotá"),
+        ("P3", "Cali"),
+    ]

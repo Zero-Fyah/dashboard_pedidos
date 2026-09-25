@@ -54,10 +54,13 @@ def test_demanda_excluye_cancelados():
     assert d.loc[("111", "Bogotá"), "demanda_diaria"] == pytest.approx(100 / 90)
 
 
-def test_demanda_excluye_respaldo_y_yumbo_hub():
+def test_demanda_excluye_respaldo_hub_y_tonelada_de_yumbo():
+    """DEC-143: `YUMBO TONELADA` ya es Tonelada, pero como no cuenta como
+    disponible de Yumbo en las alertas, su venta tampoco cuenta como demanda."""
     mov = _mov(
         [
             ("ARENA AVERIA BOGOTA", "222", "Bogotá", 500, "2026-08-01", "completado"),
+            ("YUMBO EN TRANSITO", "333", "Yumbo", 500, "2026-08-01", "completado"),
             ("YUMBO TONELADA", "333", "Yumbo", 500, "2026-08-01", "completado"),
         ]
     )
@@ -187,3 +190,35 @@ def test_inventario_o_demanda_vacios_no_explota():
     assert alertas_quiebre_arena(
         inv, pd.DataFrame(), lead_time_dias=60, dias_cobertura_objetivo=30, hoy=HOY
     ).empty
+
+
+def test_tonelada_de_yumbo_no_cuenta_como_disponible_de_yumbo():
+    """DEC-143: `YUMBO TONELADA` es Tonelada en la tabla y en el Sheet, pero
+    abastece los traslados nacionales — las alertas de Yumbo siguen midiendo
+    solo lo que Yumbo vende (Corporativo), igual que antes de DEC-143."""
+    inv = pd.DataFrame(
+        [
+            {
+                "codigo_barras": "333",
+                "almacen": "Yumbo",
+                "especificacion": "E",
+                "nombre_comercial": "E",
+                "referencia": "ARENA TONELADA CORPORATIVO YUMBO",
+                "inventario": 100,
+                "modalidad": "Corporativo",
+            },
+            {
+                "codigo_barras": "333",
+                "almacen": "Yumbo",
+                "especificacion": "E",
+                "nombre_comercial": "E",
+                "referencia": "YUMBO TONELADA",
+                "inventario": 90000,
+                "modalidad": "Tonelada",
+            },
+        ]
+    )
+    dem = pd.DataFrame([{"codigo_barras": "333", "almacen": "Yumbo", "demanda_diaria": 5.0}])
+    r = _alertas(inv, dem)
+
+    assert r.loc[("333", "Yumbo"), "disponible"] == 100

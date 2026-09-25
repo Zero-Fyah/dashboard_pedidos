@@ -186,11 +186,18 @@ ARENA_REFERENCIAS_RESPALDO: tuple[str, ...] = (
     "ARENA AVERIA BOGOTA",
     "ARENA AVERIA MEDELLIN",
 )
-# Buckets operativos del hub de Yumbo, no SKU de venta directa. YUMBO EN
-# TRANSITO (nombre comercial real: "Yumbo traslados nacionales") está en 0
-# en toda la historia disponible — el concepto existe en el origen pero sin
-# dato usable todavía.
-ARENA_REFERENCIAS_YUMBO_HUB: tuple[str, ...] = ("YUMBO TONELADA", "YUMBO EN TRANSITO")
+# DEC-143: la tonelada de Yumbo. Las demás ciudades venden tonelada como
+# `PRA ARENA TONELADA`; Yumbo la maneja como `YUMBO TONELADA` (confirmado por
+# el Arquitecto, 2026-09-24). DEC-118 la había clasificado como hub: de ahí
+# salen también los traslados manuales hacia el `PRA ARENA TONELADA` de otras
+# ciudades — por eso NO entra al pool de las alertas de quiebre de Yumbo
+# (ver `comun.arena.alertas_quiebre_arena`), que siguen midiendo lo que Yumbo
+# vende. Nunca apareció en una línea de venta: no cambia demanda ni balance.
+ARENA_REFERENCIA_TONELADA_YUMBO = "YUMBO TONELADA"
+# Bucket operativo del hub de Yumbo, no SKU de venta directa: "Yumbo
+# traslados nacionales", en 0 en toda la historia disponible — el concepto
+# existe en el origen pero sin dato usable todavía.
+ARENA_REFERENCIAS_YUMBO_HUB: tuple[str, ...] = ("YUMBO EN TRANSITO",)
 # Las 12 ciudades donde el admin registra inventario de Arena (columna
 # `almacen`), verificadas contra `admin_inventario.xlsx` — DEC-118.
 ARENA_CIUDADES: tuple[str, ...] = (
@@ -244,7 +251,7 @@ def clasificar_modalidad_arena(referencia: str | None) -> str | None:
         return None
     if ref in ARENA_REFERENCIAS_UNIDADES:
         return MODALIDAD_UNIDADES
-    if ref == ARENA_REFERENCIA_TONELADA_NACIONAL:
+    if ref in (ARENA_REFERENCIA_TONELADA_NACIONAL, ARENA_REFERENCIA_TONELADA_YUMBO):
         return MODALIDAD_TONELADA
     if ref in ARENA_REFERENCIAS_RESPALDO:
         return MODALIDAD_RESPALDO
