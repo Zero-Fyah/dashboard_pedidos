@@ -111,8 +111,28 @@ async def test_error_de_db_en_determinar_modo_no_revienta_devuelve_error(tmp_pat
 @pytest.mark.integration
 async def test_init_db_es_reejecutable(db_path):
     """Segunda corrida sobre la misma DB: los ALTER de columnas ya
-    aplicadas se omiten sin explotar y sin enmascarar otros errores."""
-    await init_db(db_path)  # el fixture ya corrió la primera
+    aplicadas se omiten sin explotar y sin enmascarar otros errores.
+    Tampoco puede tocar el esquema ni los datos que ya había."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO pedidos (id_pedido, fecha) VALUES ('TEST-REINIT', '2026-09-24')"
+        )
+        await db.commit()
+        antes = await (
+            await db.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+        ).fetchall()
+
+    await init_db(db_path)
+
+    async with aiosqlite.connect(db_path) as db:
+        despues = await (
+            await db.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+        ).fetchall()
+        fila = await (
+            await db.execute("SELECT id_pedido FROM pedidos WHERE id_pedido = 'TEST-REINIT'")
+        ).fetchone()
+    assert antes == despues
+    assert fila == ("TEST-REINIT",)  # el fixture ya corrió la primera
 
 
 # ── BUG-004: timeline es a nivel de pedido, numero_subpedido eliminada ──────

@@ -118,8 +118,13 @@ def test_init_schema_es_idempotente(db):
     """Corre en cada corrida del scheduler: no puede fallar la segunda vez."""
     con = sqlite3.connect(db)
     init_schema(con)
+    antes = con.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall()
     init_schema(con)
+    despues = con.execute(
+        "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+    ).fetchall()
     con.close()
+    assert antes and antes == despues
 
 
 def test_las_views_exponen_lo_que_consume_el_dashboard(db):
@@ -260,7 +265,8 @@ def test_frescura_marca_ok_con_fuentes_recientes(tmp_path):
 
 
 def test_frescura_detecta_descarga_fallida(tmp_path):
-    """Sin `&&` en el .bat, una descarga caída deja el Excel viejo en su sitio."""
+    """Los pasos de `actualizar_pedidos.sh` corren aislados (sin `&&`): una descarga
+    caída deja el Excel viejo en su sitio y la frescura tiene que detectarlo."""
     ahora = dt.datetime.now(tz=dt.timezone.utc)
     admin = _tocar(tmp_path / "a.xlsx", 0.5, ahora)
     bochica = _tocar(tmp_path / "b.xlsx", UMBRAL_DESACTUALIZADO_H + 2, ahora)

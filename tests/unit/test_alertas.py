@@ -6,6 +6,8 @@ import pytest
 from comun import VIGENCIA_ACTIVO, VIGENCIA_DESCONTINUADO
 from inventario.alertas import ALTA, CRITICA, MEDIA, generar_alertas
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def salud():

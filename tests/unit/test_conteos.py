@@ -54,6 +54,7 @@ def _conteo(ubicacion, id_esp, cantidad, fecha="2026-07-27", quien="ANA"):
     }
 
 
+@pytest.mark.unit
 def test_conteo_exacto_es_exacto(ubicaciones):
     crudo = pd.DataFrame([_conteo("A_1_5", "1", 100)])
     r = evaluar_conteos(crudo, ubicaciones)
@@ -63,6 +64,7 @@ def test_conteo_exacto_es_exacto(ubicaciones):
     assert r.iloc[0]["hallazgo"] == "Coincide"
 
 
+@pytest.mark.unit
 def test_la_tolerancia_depende_de_la_clase(ubicaciones):
     """La misma desviación del 3% pasa en clase C (±5%) y falla en A (±1%)."""
     crudo = pd.DataFrame([_conteo("A_1_5", "1", 103), _conteo("A_1_5", "2", 103)])
@@ -72,6 +74,7 @@ def test_la_tolerancia_depende_de_la_clase(ubicaciones):
     assert r.loc["2", "exacta"] == 1  # clase C
 
 
+@pytest.mark.unit
 def test_faltante_y_sobrante_se_distinguen(ubicaciones):
     """El plan los separa porque tienen causas distintas."""
     crudo = pd.DataFrame([_conteo("A_1_5", "1", 50), _conteo("A_2_6", "3", 200)])
@@ -81,6 +84,7 @@ def test_faltante_y_sobrante_se_distinguen(ubicaciones):
     assert r.loc["3", "hallazgo"] == "Sobrante"
 
 
+@pytest.mark.unit
 def test_contar_algo_que_el_sistema_no_tiene_es_sobrante(ubicaciones):
     """Producto en una posición donde el sistema no lo registra: esperado cero."""
     crudo = pd.DataFrame([_conteo("A_9_9", "99", 25)])
@@ -91,6 +95,7 @@ def test_contar_algo_que_el_sistema_no_tiene_es_sobrante(ubicaciones):
     assert r.iloc[0]["exacta"] == 0
 
 
+@pytest.mark.unit
 def test_cero_contra_cero_no_es_discrepancia(ubicaciones):
     """Posición vacía confirmada vacía. Sin esto, la división daría NaN y
     el `fillna(False)` la marcaría como error."""
@@ -100,6 +105,7 @@ def test_cero_contra_cero_no_es_discrepancia(ubicaciones):
     assert r.iloc[0]["exacta"] == 1
 
 
+@pytest.mark.unit
 def test_filas_ilegibles_se_descartan_sin_tumbar_el_resto(ubicaciones):
     crudo = pd.DataFrame(
         [
@@ -113,6 +119,7 @@ def test_filas_ilegibles_se_descartan_sin_tumbar_el_resto(ubicaciones):
     assert len(r) == 1
 
 
+@pytest.mark.unit
 def test_recuento_del_mismo_dia_y_persona_gana_el_ultimo(ubicaciones):
     """Corregir una hoja mal llenada no puede dejar las dos versiones."""
     crudo = pd.DataFrame([_conteo("A_1_5", "1", 50), _conteo("A_1_5", "1", 100)])
@@ -122,6 +129,7 @@ def test_recuento_del_mismo_dia_y_persona_gana_el_ultimo(ubicaciones):
     assert r.iloc[0]["cantidad_contada"] == 100
 
 
+@pytest.mark.unit
 def test_dos_personas_el_mismo_dia_son_dos_conteos(ubicaciones):
     """La doble verificación del plan exige que ambos conteos sobrevivan."""
     crudo = pd.DataFrame(
@@ -132,6 +140,7 @@ def test_dos_personas_el_mismo_dia_son_dos_conteos(ubicaciones):
     assert len(r) == 2
 
 
+@pytest.mark.unit
 def test_ira_agrupa_las_clases_heredadas_con_su_base(ubicaciones):
     """`A (por referencia)` es clase A para efectos de exactitud."""
     ubic = ubicaciones.copy()
@@ -141,6 +150,7 @@ def test_ira_agrupa_las_clases_heredadas_con_su_base(ubicaciones):
     assert set(r["clase"]) == {"A", "Global"}
 
 
+@pytest.mark.unit
 def test_ira_no_confunde_sin_rotacion_con_clase(ubicaciones):
     """Agrupar por la inicial mandaría 'Sin rotación' a una clase 'S'."""
     ubic = ubicaciones.copy()
@@ -151,6 +161,7 @@ def test_ira_no_confunde_sin_rotacion_con_clase(ubicaciones):
     assert "S" not in set(r["clase"])
 
 
+@pytest.mark.unit
 def test_ira_es_exactas_sobre_contadas(ubicaciones):
     crudo = pd.DataFrame(
         [_conteo("A_1_5", "1", 100), _conteo("A_2_6", "3", 200), _conteo("A_1_5", "2", 100)]
@@ -162,15 +173,18 @@ def test_ira_es_exactas_sobre_contadas(ubicaciones):
     assert r.loc["Global", "ira"] == pytest.approx(66.7, abs=0.1)
 
 
+@pytest.mark.unit
 def test_sin_conteos_no_explota(ubicaciones):
     assert evaluar_conteos(pd.DataFrame(), ubicaciones).empty
     assert calcular_ira(pd.DataFrame()).empty
 
 
+@pytest.mark.integration
 def test_carpeta_inexistente_devuelve_vacio(tmp_path):
     assert cargar_conteos(tmp_path / "no_existe").empty
 
 
+@pytest.mark.integration
 def test_archivo_sin_las_columnas_del_contrato_se_ignora(tmp_path):
     """Se rechaza el archivo entero, no se ingiere medio conteo."""
     pd.DataFrame([{"cualquier_cosa": 1}]).to_excel(tmp_path / "malo.xlsx", index=False)
@@ -182,6 +196,7 @@ def test_archivo_sin_las_columnas_del_contrato_se_ignora(tmp_path):
     assert r.iloc[0]["archivo"] == "bueno.xlsx"
 
 
+@pytest.mark.unit
 def test_la_hoja_emitida_cumple_el_contrato_de_ingesta():
     """El generador (dashboard) y el lector (pipeline) comparten `comun/`.
 
@@ -191,6 +206,7 @@ def test_la_hoja_emitida_cumple_el_contrato_de_ingesta():
     assert set(COLUMNAS_CONTEO_REQUERIDAS) <= set(COLUMNAS_HOJA_CONTEO)
 
 
+@pytest.mark.unit
 def test_la_hoja_no_revela_la_cantidad_del_sistema():
     """Conteo ciego: si la hoja mostrara lo esperado, se confirma en vez de contar."""
     assert not {"cantidad", "cantidad_sistema", "existencia"} & set(COLUMNAS_HOJA_CONTEO)
@@ -201,6 +217,7 @@ def test_la_hoja_no_revela_la_cantidad_del_sistema():
 # ─────────────────────────────────────────────
 
 
+@pytest.mark.unit
 def test_la_causa_solo_sobrevive_donde_hubo_diferencia(ubicaciones):
     """Una causa en un conteo que coincide ensuciaría el Pareto con causas de nada."""
     crudo = pd.DataFrame(
@@ -215,6 +232,7 @@ def test_la_causa_solo_sobrevive_donde_hubo_diferencia(ubicaciones):
     assert r.loc["2", "causa"] == "Mal ubicado"
 
 
+@pytest.mark.unit
 def test_el_conteo_arrastra_el_tipo_de_ubicacion(ubicaciones):
     """Sin `tipo` no se puede separar la conformidad de picking de la de altura."""
     crudo = pd.DataFrame([_conteo("A_1_5", "1", 100), _conteo("A_2_6", "3", 50)])
@@ -224,6 +242,7 @@ def test_el_conteo_arrastra_el_tipo_de_ubicacion(ubicaciones):
     assert r.loc["A_2_6", "tipo"] == "Picking"
 
 
+@pytest.mark.unit
 def test_ira_por_periodo_agrupa_por_mes(ubicaciones):
     crudo = pd.DataFrame(
         [
@@ -240,10 +259,12 @@ def test_ira_por_periodo_agrupa_por_mes(ubicaciones):
     assert global_.loc["2026-07", "ira"] == 50.0
 
 
+@pytest.mark.unit
 def test_ira_por_periodo_sin_conteos_no_explota():
     assert ira_por_periodo(pd.DataFrame()).empty
 
 
+@pytest.mark.unit
 def test_la_conformidad_se_mide_por_posicion_no_por_linea(ubicaciones):
     """Una posición con dos líneas y una mal es NO conforme, no «50% conforme».
 
@@ -263,6 +284,7 @@ def test_la_conformidad_se_mide_por_posicion_no_por_linea(ubicaciones):
     assert r.loc["Altura", "conformidad"] == 0.0
 
 
+@pytest.mark.unit
 def test_la_conformidad_separa_picking_de_altura(ubicaciones):
     """Son dos gobernanzas distintas: picking se le reporta a Bodega."""
     crudo = pd.DataFrame(
@@ -277,10 +299,12 @@ def test_la_conformidad_separa_picking_de_altura(ubicaciones):
     assert r.loc["Picking", "conformidad"] == 0.0
 
 
+@pytest.mark.unit
 def test_conformidad_sin_conteos_no_explota():
     assert conformidad_por_tipo(pd.DataFrame()).empty
 
 
+@pytest.mark.unit
 def test_las_causas_son_un_vocabulario_cerrado():
     """En texto libre, tres formas de escribir lo mismo son tres causas
     distintas para el Pareto y el análisis mensual no agrupa nada."""

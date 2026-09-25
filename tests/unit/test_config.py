@@ -5,6 +5,7 @@ log_event se testea con niveles inválidos (N-4: nunca debe perder el
 evento por un AttributeError del nivel).
 """
 
+import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
 
@@ -101,10 +102,13 @@ def test_usuario_clave_vienen_de_config():
 
 @pytest.mark.unit
 @pytest.mark.parametrize("nivel", ["NOEXISTE", "warning", ""])
-def test_log_event_nivel_invalido_no_revienta(nivel):
+def test_log_event_nivel_invalido_no_revienta(nivel, capsys):
     """Nivel desconocido (o en minúsculas, donde getattr devolvería la
     función logging.warning) cae a INFO sin perder el evento."""
     log_event("evento_test", level=nivel, msg="no debe lanzar")
+    linea = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert linea["event"] == "evento_test"
+    assert linea["msg"] == "no debe lanzar"
 
 
 @pytest.mark.unit

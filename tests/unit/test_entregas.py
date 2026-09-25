@@ -27,6 +27,8 @@ from comun.entregas import (
     parsear_compromiso,
 )
 
+pytestmark = pytest.mark.unit
+
 # ── Parseo de los tres formatos ────────────────────────────────────────────────
 
 

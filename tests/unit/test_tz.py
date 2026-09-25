@@ -4,7 +4,11 @@ Colombia no tiene horario de verano desde 1993: un offset fijo de -5 h es
 correcto todo el año, mismo criterio que `dashboard/db.py:_HOY_CO` (AUD-B6).
 """
 
+import pytest
+
 from dashboard.tz import a_hora_colombia
+
+pytestmark = pytest.mark.unit
 
 
 def test_convierte_utc_explicito_a_hora_colombia():

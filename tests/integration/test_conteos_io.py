@@ -9,6 +9,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "dashboard"))
 
 import conteos_io  # noqa: E402
 
+# Escribe y borra archivos reales (fixture autouse en tmp_path): integration.
+pytestmark = pytest.mark.integration
+
 
 @pytest.fixture(autouse=True)
 def carpeta_temporal(tmp_path, monkeypatch):

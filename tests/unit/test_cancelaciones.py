@@ -7,6 +7,8 @@ import pytest
 
 from inventario.cancelaciones import calcular_cancelaciones
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def con():

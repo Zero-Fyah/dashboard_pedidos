@@ -7,10 +7,9 @@ por alistador no invente producción donde el trabajo fue compartido.
 
 import sqlite3
 
-import pandas as pd
 import pytest
 
-from inventario.operacion import calcular_operacion, productividad_por_alistador
+from inventario.operacion import calcular_operacion
 
 pytestmark = pytest.mark.unit
 
@@ -108,96 +107,6 @@ def test_cuenta_los_alistadores_de_un_subpedido(con):
         alistador="ANA,BETO,CARLA",
     )
     assert calcular_operacion(con).iloc[0]["n_alistadores"] == 3
-
-
-def test_participaciones_cuenta_a_todos_los_que_intervinieron(con):
-    _sub(
-        con,
-        "P1",
-        "2026-03-01 08:00:00",
-        "2026-03-01 12:00:00",
-        "2026-03-01 14:00:00",
-        alistador="ANA,BETO",
-    )
-    prod = productividad_por_alistador(calcular_operacion(con)).set_index("alistador")
-    assert prod.loc["ANA", "participaciones"] == 1
-    assert prod.loc["BETO", "participaciones"] == 1
-
-
-def test_lo_compartido_no_se_atribuye_a_nadie(con):
-    """Sumarlo a cada participante inflaría el total; repartirlo en partes
-    iguales asumiría algo que el dato no dice."""
-    _sub(
-        con,
-        "P1",
-        "2026-03-01 08:00:00",
-        "2026-03-01 12:00:00",
-        "2026-03-01 14:00:00",
-        alistador="ANA,BETO",
-        lineas=4,
-        unidades=10,
-    )
-    prod = productividad_por_alistador(calcular_operacion(con)).set_index("alistador")
-    assert prod.loc["ANA", "exclusivos"] == 0
-    assert prod.loc["ANA", "lineas"] == 0
-    assert prod.loc["BETO", "lineas"] == 0
-
-
-def test_lo_exclusivo_si_se_atribuye(con):
-    _sub(
-        con,
-        "P1",
-        "2026-03-01 08:00:00",
-        "2026-03-01 12:00:00",
-        "2026-03-01 14:00:00",
-        alistador="ANA",
-        lineas=4,
-        unidades=10,
-    )
-    prod = productividad_por_alistador(calcular_operacion(con)).set_index("alistador")
-    assert prod.loc["ANA", "exclusivos"] == 1
-    assert prod.loc["ANA", "lineas"] == 4
-    assert prod.loc["ANA", "unidades"] == 40
-
-
-def test_espacios_alrededor_del_nombre_no_duplican_al_operario(con):
-    _sub(
-        con,
-        "P1",
-        "2026-03-01 08:00:00",
-        "2026-03-01 12:00:00",
-        "2026-03-01 14:00:00",
-        alistador="ANA, BETO",
-    )
-    _sub(
-        con,
-        "P2",
-        "2026-03-02 08:00:00",
-        "2026-03-02 12:00:00",
-        "2026-03-02 14:00:00",
-        alistador="BETO,ANA",
-    )
-    prod = productividad_por_alistador(calcular_operacion(con)).set_index("alistador")
-    assert len(prod) == 2
-    assert prod.loc["BETO", "participaciones"] == 2
-
-
-def test_sin_alistador_no_rompe(con):
-    _sub(
-        con,
-        "P1",
-        "2026-03-01 08:00:00",
-        "2026-03-01 12:00:00",
-        "2026-03-01 14:00:00",
-        alistador="-",
-    )
-    assert productividad_por_alistador(calcular_operacion(con)).empty
-
-
-def test_sin_datos_devuelve_vacio_con_las_columnas(con):
-    prod = productividad_por_alistador(pd.DataFrame(columns=["alistador"]))
-    assert prod.empty
-    assert "participaciones" in prod.columns
 
 
 # ─────────────────────────────────────────────

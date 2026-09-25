@@ -131,67 +131,6 @@ def calcular_operacion(con: sqlite3.Connection) -> pd.DataFrame:
     return df[_COLUMNAS]
 
 
-def productividad_por_alistador(df: pd.DataFrame) -> pd.DataFrame:
-    """Carga de trabajo por alistador, separando participación de atribución.
-
-    **La mitad de los subpedidos tiene más de un alistador** (medido: solo
-    el 50,9% tiene uno solo). Eso obliga a distinguir dos cosas que suelen
-    confundirse:
-
-    - `participaciones`: en cuántos subpedidos intervino, contando también
-      los compartidos. Mide carga de trabajo, no producción exclusiva.
-    - `exclusivos` / `lineas` / `unidades`: solo los subpedidos donde fue el
-      **único** alistador. Es lo único que se le puede atribuir sin
-      inventar un reparto.
-
-    Sumar líneas de subpedidos compartidos a cada participante inflaría el
-    total; repartirlas en partes iguales asumiría algo que el dato no dice.
-
-    Args:
-        df: Resultado de `calcular_operacion()`.
-
-    Returns:
-        DataFrame por alistador, ordenado por participaciones.
-    """
-    con_alistador = df[df["alistador"].notna()].copy()
-    if con_alistador.empty:
-        return pd.DataFrame(
-            columns=[
-                "alistador",
-                "participaciones",
-                "exclusivos",
-                "lineas",
-                "unidades",
-                "mediana_ciclo_h",
-            ]
-        )
-
-    # Un subpedido con tres alistadores produce tres filas: una por persona.
-    expandido = con_alistador.assign(persona=con_alistador["alistador"].str.split(",")).explode(
-        "persona"
-    )
-    expandido["persona"] = expandido["persona"].str.strip()
-    expandido = expandido[expandido["persona"] != ""]
-
-    participaciones = expandido.groupby("persona").size().rename("participaciones").reset_index()
-
-    solos = con_alistador[con_alistador["n_alistadores"] == 1].copy()
-    solos["persona"] = solos["alistador"].str.strip()
-    exclusivos = solos.groupby("persona", as_index=False).agg(
-        exclusivos=("id_pedido", "size"),
-        lineas=("lineas", "sum"),
-        unidades=("unidades", "sum"),
-        mediana_ciclo_h=("ciclo_total_h", "median"),
-    )
-
-    resultado = participaciones.merge(exclusivos, on="persona", how="left").rename(
-        columns={"persona": "alistador"}
-    )
-    for columna in ("exclusivos", "lineas", "unidades"):
-        resultado[columna] = resultado[columna].fillna(0)
-    return resultado.sort_values("participaciones", ascending=False)
-
-
 # ─────────────────────────────────────────────
 # Ventana activa — capacidad del equipo (DEC-055)
 # ─────────────────────────────────────────────

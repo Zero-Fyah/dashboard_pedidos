@@ -126,32 +126,11 @@ async def leer_celda_descuento(celda) -> tuple[str, str]:
 def _unir_presentacion(specs: list[str]) -> str:
     """Lógica pura de DEC-026 — une textos no vacíos con " | ".
 
-    Extraída de `leer_presentacion()` (DRY, DEC-022) por el mismo motivo
-    que `_reclasificar_descuento()`.
+    Es la única implementación: la versión por ElementHandle
+    (`leer_presentacion()`) quedó sin uso con el batch de DEC-030 Fase 3 y
+    se retiró en la auditoría de tests del 2026-09-24.
     """
     return " | ".join(t for t in specs if t)
-
-
-async def leer_presentacion(info_col) -> str:
-    """Une todos los <span> de .goods-specs — DEC-026.
-
-    Un producto puede traer varios atributos (Tamaño, Color,
-    Presentación...) en spans separados dentro de .goods-specs. Antes se
-    leía con `query_selector` (singular) y se perdía todo menos el
-    primer span.
-
-    Args:
-        info_col: Columna .goods-info-col del producto (puede ser None).
-
-    Returns:
-        Los textos no vacíos unidos con " | " (mismo separador que
-        descuento_tipo, DEC-024), o "" si no hay info_col ni specs.
-    """
-    if not info_col:
-        return ""
-    spans = await info_col.query_selector_all(".goods-specs span")
-    textos = [(await span.inner_text()).strip() for span in spans]
-    return _unir_presentacion(textos)
 
 
 # ─────────────────────────────────────────────
@@ -627,10 +606,7 @@ async def _saltar_a_pagina(page: Page, num_pagina: int) -> None:
     await campo.fill(str(num_pagina))
     await campo.press("Enter")
     await _esperar_cambio_primer_id(
-        page,
-        anterior,
-        "paginador_salto_timeout",
-        f"tras saltar a la página {num_pagina}",
+        page, anterior, "paginador_salto_timeout", f"tras saltar a la página {num_pagina}"
     )
 
 
@@ -1487,7 +1463,7 @@ def _validar_encabezados_linea(encabezados: list[str]) -> tuple[list[str], list[
 # recolecta las piezas crudas (etiquetas, candidato a monto, texto
 # completo / lista de specs) y Python las procesa con
 # _reclasificar_descuento()/_unir_presentacion() — el mismo origen de
-# verdad que usan leer_celda_descuento()/leer_presentacion() y sus tests
+# verdad que usa leer_celda_descuento() y sus tests
 # (DEC-022, DRY). cantidad_comprada/entregada se quedan como texto crudo:
 # to_num() y el WARNING de "no numérica" siguen en Python, sin cambios.
 # Recibe `_COLUMNAS_LINEA` como argumento (DEC-140): el mapeo vive una

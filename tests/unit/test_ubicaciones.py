@@ -7,9 +7,10 @@ from inventario.ubicaciones import (
     SIN_ROTACION,
     calcular_ubicaciones,
     mapa_posiciones,
-    resumen_cobertura,
     sin_ubicacion_conocida,
 )
+
+pytestmark = pytest.mark.unit
 
 
 @pytest.fixture
@@ -181,32 +182,6 @@ def test_bochica_vacio_devuelve_estructura(abc, admin, salud):
 
     assert r.empty
     assert "prioridad" in r.columns
-
-
-def test_resumen_no_cuenta_las_posiciones_vacias(bochica, abc, admin, salud):
-    """El error de dimensionamiento que corrige DEC-057.
-
-    El layout declara 3 posiciones de altura activas pero solo 2 tienen
-    inventario. Estimar el trabajo como posiciones × densidad contaría la
-    vacía.
-    """
-    layout = pd.DataFrame(
-        [
-            {"ubicacion": "A_1_5", "tipo": "Altura", "activa": "SI"},
-            {"ubicacion": "A_2_6", "tipo": "Altura", "activa": "SI"},
-            {"ubicacion": "A_3_7", "tipo": "Altura", "activa": "SI"},
-            {"ubicacion": "B_1_1", "tipo": "Picking", "activa": "SI"},
-            {"ubicacion": "Z_9_9", "tipo": "Altura", "activa": "NO"},
-        ]
-    )
-    r = calcular_ubicaciones(bochica, abc, admin, salud)
-    res = resumen_cobertura(r, layout).set_index("tipo")
-
-    assert res.loc["Altura", "posiciones_activas"] == 3
-    assert res.loc["Altura", "posiciones_ocupadas"] == 2
-    assert res.loc["Altura", "posiciones_vacias"] == 1
-    assert res.loc["Altura", "lineas"] == 3
-    assert res.loc["Altura", "lineas_por_ocupada"] == 1.5
 
 
 # ─────────────────────────────────────────────

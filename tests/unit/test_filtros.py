@@ -17,6 +17,8 @@ import pytest
 
 from dashboard.filtros import Filtros, aplicar, recortar
 
+pytestmark = pytest.mark.unit
+
 TODOS = Filtros("2026-01-01", "2026-08-03", (), (), (), ())
 
 

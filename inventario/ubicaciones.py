@@ -275,41 +275,6 @@ def calcular_ubicaciones(
     return lineas[_COLUMNAS]
 
 
-def resumen_cobertura(lineas: pd.DataFrame, layout: pd.DataFrame) -> pd.DataFrame:
-    """Universo de posiciones contra lo que realmente tiene inventario.
-
-    Es la verificación que corrige el error de dimensionamiento más caro
-    del plan: estimar el trabajo como *posiciones totales × densidad media*
-    cuenta las posiciones vacías como si hubiera que contarlas.
-
-    Args:
-        lineas: Resultado de `calcular_ubicaciones()`.
-        layout: Resultado de `layout.cargar_layout()`.
-
-    Returns:
-        Una fila por tipo de ubicación, con posiciones del layout, cuántas
-        están ocupadas y cuántas líneas SKU-posición hay realmente.
-    """
-    activas = layout[layout["activa"].astype(str).str.strip().str.upper().isin({"SI", "SÍ"})]
-    filas = []
-    for tipo in (TIPO_ALTURA, TIPO_PICKING):
-        del_tipo = lineas[lineas["tipo"] == tipo]
-        ocupadas = del_tipo["ubicacion"].nunique()
-        posiciones = int((activas["tipo"] == tipo).sum())
-        filas.append(
-            {
-                "tipo": tipo,
-                "posiciones_activas": posiciones,
-                "posiciones_ocupadas": ocupadas,
-                "posiciones_vacias": posiciones - ocupadas,
-                "lineas": len(del_tipo),
-                "lineas_por_ocupada": round(len(del_tipo) / ocupadas, 2) if ocupadas else 0.0,
-                "valor": float(del_tipo["valor_linea"].sum()),
-            }
-        )
-    return pd.DataFrame(filas)
-
-
 def _orden_recorrido(lineas: pd.DataFrame) -> pd.Series:
     """Orden de visita física, derivado de la geometría del plano (DEC-078).
 
