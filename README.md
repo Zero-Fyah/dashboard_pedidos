@@ -39,10 +39,10 @@ y la publica en un dashboard. Corre desatendido cada hora.
 ## Arquitectura técnica
 
 ```
-Windows Task Scheduler
+systemd timer (dashboard_pedidos_ciclo.timer, cada hora)
         │
         ▼
-scraper/actualizar_pedidos.bat
+scraper/actualizar_pedidos.sh
         │
         ▼
 scraper/scraper_principal.py
@@ -52,6 +52,8 @@ scraper/scraper_principal.py
    │  1. Activos en DB   →  ids_activos[]           │
    │  2. Con errores     →  ids_error[]             │
    │  3. Nuevos (watermark) → ids_nuevos[]          │
+   │  4. Re-extracción del histórico por tandas     │
+   │     (modo completo forzado en memoria)         │
    └────┬───────────────────────────────────────────┘
         │  ids_pendientes[] (unión sin duplicados)
         ▼
@@ -62,7 +64,10 @@ scraper/scraper_principal.py
      │      │       │         │        │
    W-0    W-1     W-2       W-3      W-4    W-5   ← 6 workers
      │      │       │         │        │      BrowserContext independiente
-     ┴──────┴───────┴─────────┴────────┘      circuit breaker + re-login
+     ┴──────┴───────┴─────────┴────────┘      circuit breaker + re-login;
+                                              un worker que no logra
+                                              loguearse se descarta sin
+                                              tumbar el ciclo
                 │
                 ▼
         resultados_queue
@@ -156,6 +161,10 @@ dashboard_pedidos/
 │   ├── alertas.py            # Centro de excepciones
 │   ├── arena.py              # Inventario del módulo Arena por ciudad (DEC-117)
 │   └── persistencia.py       # Esquema, VIEWs y escritura transaccional
+├── integraciones/            # Consumidores externos de pedidos.db
+│   ├── sheets_arena.py       # Consultas del inventario Arena y pedidos previos
+│   │                         # a picking, por ciudad (12, Bogotá incluida)
+│   └── sheets_cliente.py     # Escritura a Google Sheets (cuenta de servicio)
 ├── docs/                     # Contexto persistente del proyecto
 │   ├── integral.md           # Visión, problema y objetivo de negocio
 │   ├── structure.md          # Arquitectura técnica y esquema de datos
@@ -175,12 +184,14 @@ dashboard_pedidos/
 │   │   ├── separar_descuento_tipo.py
 │   │   ├── backfill_cambios_inventario.py
 │   │   ├── cargar_inicial_movimientos_bochica.py
-│   │   └── borrar_lineas_fantasma_total.py
-│   ├── actualizar_pedidos.bat
+│   │   ├── borrar_lineas_fantasma_total.py
+│   │   └── mover_peso_entregado.py  # repara `observaciones` corrida por «Peso entregado»
+│   ├── actualizar_pedidos.sh # ciclo horario (systemd); el .bat es referencia histórica
 │   ├── config.py             # CONFIG, credenciales, locks, rate limit, logging JSONL
 │   ├── db.py                 # esquema SQLite, migraciones y watermark
-│   ├── extractores.py        # login, listado de pedidos, extractores del detalle,
-│   │                         # navegación interna vía Vue Router (DEC-124)
+│   ├── extractores.py        # login (espera el formulario definitivo de Cognito),
+│   │                         # listado, extractores del detalle leídos por
+│   │                         # etiqueta/encabezado, navegación vía Vue Router
 │   ├── persistencia.py       # persistencia_worker + helpers transaccionales
 │   ├── workers.py            # selección de modo, scraping por pedido, circuit breaker
 │   ├── orquestador.py        # main(): carriles, dead-letter, resumen y CLI
@@ -348,8 +359,9 @@ en una sola pasada de workers paralelos.
 | Módulo de inventario (cruce bodega ↔ sistema + ciclo de conteo) | ✅ Construido |
 | Módulo Arena (inventario por ciudad) | ✅ Construido — alcance ampliado bajo checkpoint de autorización (DEC-118) |
 
-El pipeline corre desatendido cada hora en Windows Task Scheduler y la suite
-tiene **987 tests** (987 passed + 2 skipped, medido 2026-08-26).
+El pipeline corre desatendido cada hora con un timer de systemd (Linux) y la
+suite tiene **1.068 tests** (1.059 passed + 9 e2e que requieren `--e2e`, medido
+2026-09-24), todos marcados `unit`, `integration` o `e2e`.
 
 El dashboard tiene dos propósitos: el trabajo diario del área de inventarios
 —el principal— y la consulta y el análisis general para las demás áreas, que
