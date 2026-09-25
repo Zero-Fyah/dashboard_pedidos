@@ -108,13 +108,63 @@ async def _preparar_contexto_worker(browser: Browser, wid: int) -> BrowserContex
         locale="es-CO",
     )
     await _bloquear_recursos_pesados(ctx)
-    p = await ctx.new_page()
-    await login(p, USUARIO, CLAVE)
-    await p.close()
+    try:
+        p = await ctx.new_page()
+        await login(p, USUARIO, CLAVE)
+        await p.close()
+    except BaseException:
+        # DEC-142: el llamador sigue sin este worker; el contexto no debe
+        # quedar abierto el resto del run.
+        await ctx.close()
+        raise
     return ctx
 
 
 # get_db_path() vive en comun/ (AUD-M5) y se importa arriba.
+
+
+async def _autenticar_workers(browser: Browser) -> list[tuple[int, BrowserContext]]:
+    """Autentica los `NUM_WORKERS` en paralelo y devuelve los que entraron.
+
+    DEC-142: un worker que no logra loguearse ya no tumba el ciclo. Con
+    `gather` sin `return_exceptions`, una sola excepción abortaba todo
+    aunque los demás hubieran entrado: 27 ciclos caídos entre el 2026-08-27
+    y el 2026-09-24. El ciclo sigue con los que entraron (más lento, pero
+    completo) y solo se aborta si no entra ninguno.
+
+    Returns:
+        Pares (worker_id, contexto autenticado), en orden de worker_id.
+
+    Raises:
+        RuntimeError: si ningún worker pudo iniciar sesión.
+    """
+    t_logins_ini = time.monotonic()
+    resultados_login = await asyncio.gather(
+        *[_preparar_contexto_worker(browser, wid) for wid in range(CONFIG["NUM_WORKERS"])],
+        return_exceptions=True,
+    )
+    workers: list[tuple[int, BrowserContext]] = []
+    for wid, res_login in enumerate(resultados_login):
+        if isinstance(res_login, BaseException):
+            log_event(
+                "worker_login_fallido",
+                level="ERROR",
+                worker_id=wid,
+                msg=f"Worker descartado para este run: {res_login!r} (DEC-142)",
+            )
+        else:
+            workers.append((wid, res_login))
+    if not workers:
+        raise RuntimeError(
+            f"Ningún worker pudo iniciar sesión (0/{CONFIG['NUM_WORKERS']}) — run abortado"
+        )
+    log_event(
+        "workers_login_completado",
+        level="INFO" if len(workers) == CONFIG["NUM_WORKERS"] else "WARNING",
+        duracion_ms=int((time.monotonic() - t_logins_ini) * 1000),
+        msg=f"{len(workers)}/{CONFIG['NUM_WORKERS']} workers autenticados en paralelo",
+    )
+    return workers
 
 
 async def obtener_ids_activos(db_path: str) -> list[str]:
@@ -286,8 +336,9 @@ async def obtener_ids_reextraccion(db_path: str, limite: int) -> list[str]:
     solo del selector: **el carril se apaga solo** cuando termina el
     histórico, sin tabla de estado.
 
-    No filtra por `scraping_completo`: un pedido marcado en un ciclo que
-    murió antes de procesarlo vuelve a salir en el siguiente.
+    El modo completo se fuerza en memoria (DEC-142), sin marcar la base: si
+    el ciclo muere antes de procesar la tanda, no queda nada a medio hacer y
+    los pedidos simplemente siguen en el selector.
 
     El orden es aleatorio a propósito: un pedido cuya extracción vuelve
     vacía (el guard de FIX C-2 no reescribe sus líneas) seguiría
@@ -320,23 +371,6 @@ async def obtener_ids_reextraccion(db_path: str, limite: int) -> list[str]:
             )
         ).fetchall()
     return [r[0] for r in rows]
-
-
-async def marcar_para_recuperacion(db_path: str, ids: list[str]) -> None:
-    """Pone `scraping_completo = 0` para que determinar_modo() mande a completo.
-
-    Es el mismo mecanismo que usó el backfill de DEC-027; no se inventa una
-    vía nueva para forzar el modo.
-    """
-    if not ids:
-        return
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute("PRAGMA foreign_keys = ON")
-        await db.executemany(
-            "UPDATE pedidos SET scraping_completo = 0 WHERE id_pedido = ?",
-            [(i,) for i in ids],
-        )
-        await db.commit()
 
 
 def calcular_desde_nuevos(
@@ -458,6 +492,9 @@ async def main(args: argparse.Namespace) -> int:
         )
 
         # ── Obtener lista de IDs ──────────────────────────────────────────
+        # DEC-142: pedidos que van a `completo` sin importar lo que diga la
+        # base — re-extracción (DEC-140) y mantenimiento (DEC-092).
+        ids_forzar_completo: frozenset[str] = frozenset()
         if args.modo == "incremental":
             # AUD-M8 (auditoría 2026-07-01): estados cerrados parametrizados
             # desde la constante del módulo común — sin literales inline.
@@ -530,7 +567,8 @@ async def main(args: argparse.Namespace) -> int:
                 for i in await obtener_ids_reextraccion(db_path, CONFIG["REEXTRACCION_POR_CICLO"])
                 if i not in _ya_en_cola
             ]
-            await marcar_para_recuperacion(db_path, ids_reextraccion)
+            # DEC-142: se fuerza en memoria (ids_forzar_completo), no en la base.
+            ids_forzar_completo = frozenset(ids_reextraccion)
 
             # Unión final sin duplicados
             ids_pendientes: list[str] = list(
@@ -558,11 +596,12 @@ async def main(args: argparse.Namespace) -> int:
         elif args.modo == "mantenimiento":
             # DEC-092: no recorre el listado. Los IDs salen de la base —los
             # pedidos entregados a los que les falta la información de
-            # entrega— y se marcan para que determinar_modo() los mande a
-            # `completo`. Recuperar febrero a mano costó encolar 808 pedidos
+            # entrega— y se fuerzan a `completo` en memoria (DEC-142; antes
+            # se marcaban en la base). Recuperar febrero a mano costó encolar 808 pedidos
             # para arreglar 248; esto encola exactamente los que hacen falta.
             ids_pendientes = await obtener_ids_para_recuperar(db_path)
-            await marcar_para_recuperacion(db_path, ids_pendientes)
+            # DEC-142: forzado en memoria, igual que la re-extracción.
+            ids_forzar_completo = frozenset(ids_pendientes)
             carriles = None
             # La pasada no escanea el listado del servidor, así que NO tiene
             # nada que decir sobre la cobertura de pedidos nuevos: mover el
@@ -637,19 +676,10 @@ async def main(args: argparse.Namespace) -> int:
         # Paralelizado (auditoría de rendimiento 2026-08-26): cada login es
         # independiente (contexto propio, sin estado compartido), así que
         # asyncio.gather en vez del for secuencial no cambia el resultado
-        # — solo el tiempo de pared. list() preserva el orden por índice:
-        # contexts[wid] sigue siendo el contexto del worker wid.
-        t_logins_ini = time.monotonic()
-        contexts: list[BrowserContext] = list(
-            await asyncio.gather(
-                *[_preparar_contexto_worker(browser, wid) for wid in range(CONFIG["NUM_WORKERS"])]
-            )
-        )
-        log_event(
-            "workers_login_completado",
-            duracion_ms=int((time.monotonic() - t_logins_ini) * 1000),
-            msg=f"{CONFIG['NUM_WORKERS']} workers autenticados en paralelo",
-        )
+        # — solo el tiempo de pared. DEC-142: los que no logran entrar se
+        # descartan y el run sigue con el resto (`workers` lleva el wid).
+        workers = await _autenticar_workers(browser)
+        contexts: list[BrowserContext] = [ctx for _, ctx in workers]
 
         # — Paso 4: colas y tasks —
         # FIX C-1 (auditoría 2026-07-01): pedidos_queue sin maxsize. Con cota,
@@ -681,20 +711,21 @@ async def main(args: argparse.Namespace) -> int:
             asyncio.create_task(
                 scraper_worker(
                     wid,
-                    contexts[wid],
+                    ctx,
                     pedidos_queue,
                     resultados_queue,
                     db_path,
+                    ids_forzar_completo=ids_forzar_completo,
                 )
             )
-            for wid in range(CONFIG["NUM_WORKERS"])
+            for wid, ctx in workers
         ]
 
         # — Paso 5: llenar la cola concurrentemente con los workers —
         async def _fill() -> None:
             for pid in ids_pendientes:
                 await pedidos_queue.put(pid)
-            for _ in range(CONFIG["NUM_WORKERS"]):
+            for _ in workers:  # un centinela por worker VIVO (DEC-142)
                 await pedidos_queue.put(None)
 
         fill_task = asyncio.create_task(_fill())
@@ -718,7 +749,7 @@ async def main(args: argparse.Namespace) -> int:
             # wait_for ya canceló el gather; re-esperar las tasks recoge
             # los CancelledError sin relanzarlos.
             results = await asyncio.gather(fill_task, *worker_tasks, return_exceptions=True)
-        for wid, res in enumerate(results[1:], start=0):  # [0] es fill_task
+        for (wid, _), res in zip(workers, results[1:], strict=True):  # [0] es fill_task
             if isinstance(res, BaseException):
                 log_event(
                     "worker_exception",
@@ -787,9 +818,20 @@ async def main(args: argparse.Namespace) -> int:
                 locale="es-CO",
             )
             await _bloquear_recursos_pesados(ctx_dl)
-            _p_dl = await ctx_dl.new_page()
-            await login(_p_dl, USUARIO, CLAVE)
-            await _p_dl.close()
+            try:
+                _p_dl = await ctx_dl.new_page()
+                await login(_p_dl, USUARIO, CLAVE)
+                await _p_dl.close()
+            except Exception as exc:
+                # DEC-142: los pedidos siguen en `errores` y los toma el
+                # próximo run; no vale perder el resumen de este por eso.
+                log_event(
+                    "dead_letter_login_fallido",
+                    level="ERROR",
+                    msg=f"Pase {_dl_pass} omitido: {exc!r} (DEC-142)",
+                )
+                await ctx_dl.close()
+                break
 
             dl_pedidos_queue = asyncio.Queue()
             dl_resultados_queue = asyncio.Queue()

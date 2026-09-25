@@ -101,7 +101,9 @@ async def test_circuito_abre_y_termina_tras_max_reaperturas(monkeypatch, circuit
     abre el circuito dos veces y termina sin consumir el resto de la cola."""
     llamadas = {"n": 0}
 
-    async def _siempre_falla(worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False):
+    async def _siempre_falla(
+        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+    ):
         llamadas["n"] += 1
         return False
 
@@ -120,7 +122,9 @@ async def test_exito_resetea_fallos_consecutivos(monkeypatch, circuito_corto, sl
     """Un éxito antes del umbral reinicia el contador: F,S,F,S,... nunca abre."""
     llamadas = {"n": 0}
 
-    async def _alterna(worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False):
+    async def _alterna(
+        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+    ):
         llamadas["n"] += 1
         return llamadas["n"] % 2 == 0  # falla impares, acierta pares
 
@@ -139,7 +143,7 @@ async def test_circuito_cerrado_reanuda_tras_cooldown(monkeypatch, circuito_cort
     llamadas = {"n": 0}
 
     async def _falla_dos_luego_ok(
-        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False
+        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
     ):
         llamadas["n"] += 1
         return llamadas["n"] > 2
@@ -166,7 +170,9 @@ async def test_worker_duerme_ante_rate_limit_activo(monkeypatch, sleeps):
     monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
     procesados: list[str] = []
 
-    async def _ok(worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False):
+    async def _ok(
+        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+    ):
         procesados.append(pid)
         return True
 
@@ -189,7 +195,9 @@ async def test_worker_sobrevive_excepcion_no_controlada_de_procesar_pedido(monke
     sin log, sin resultado en la cola, y el resto de la cola sin consumir."""
     llamadas: list[str] = []
 
-    async def _revienta_en_P2(worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False):
+    async def _revienta_en_P2(
+        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+    ):
         llamadas.append(pid)
         if pid == "P2":
             raise RuntimeError("bug no previsto simulado")
@@ -235,7 +243,9 @@ async def test_worker_espera_cola_larga_se_loguea(monkeypatch):
     reloj = _RelojControlado()
     monkeypatch.setattr(time, "monotonic", reloj)
 
-    async def _ok(worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False):
+    async def _ok(
+        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+    ):
         return True
 
     monkeypatch.setattr(sw, "procesar_pedido", _ok)
@@ -263,7 +273,9 @@ async def test_worker_espera_cola_corta_no_se_loguea(monkeypatch):
     reloj = _RelojControlado()
     monkeypatch.setattr(time, "monotonic", reloj)
 
-    async def _ok(worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False):
+    async def _ok(
+        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+    ):
         return True
 
     monkeypatch.setattr(sw, "procesar_pedido", _ok)
@@ -286,7 +298,9 @@ async def test_rate_limit_espera_loguea_duracion(monkeypatch, sleeps):
     eventos: list[tuple] = []
     monkeypatch.setattr(sw, "log_event", lambda evento, **kw: eventos.append((evento, kw)))
 
-    async def _ok(worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False):
+    async def _ok(
+        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+    ):
         return True
 
     monkeypatch.setattr(sw, "procesar_pedido", _ok)
@@ -307,7 +321,9 @@ async def test_circuit_open_loguea_duracion_del_cooldown(monkeypatch, circuito_c
     eventos: list[tuple] = []
     monkeypatch.setattr(sw, "log_event", lambda evento, **kw: eventos.append((evento, kw)))
 
-    async def _siempre_falla(worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False):
+    async def _siempre_falla(
+        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+    ):
         return False
 
     monkeypatch.setattr(sw, "procesar_pedido", _siempre_falla)
@@ -329,7 +345,9 @@ async def test_refresco_periodico_alterna_goto_y_push(monkeypatch):
     usar_push=True (navegación interna vía router)."""
     llamadas_usar_push: list[bool] = []
 
-    async def _ok(worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False):
+    async def _ok(
+        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+    ):
         llamadas_usar_push.append(usar_push)
         return True
 
@@ -348,7 +366,9 @@ async def test_fallo_fuerza_goto_en_el_siguiente_pedido(monkeypatch):
     al punto de refresco periódico."""
     llamadas_usar_push: list[bool] = []
 
-    async def _falla_p2(worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False):
+    async def _falla_p2(
+        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+    ):
         llamadas_usar_push.append(usar_push)
         return pid != "P2"
 
@@ -372,7 +392,9 @@ async def test_pagina_se_crea_y_cierra_una_sola_vez_por_worker(monkeypatch):
             paginas_creadas.append(p)
             return p
 
-    async def _ok(worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False):
+    async def _ok(
+        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+    ):
         return True
 
     monkeypatch.setattr(sw, "procesar_pedido", _ok)
@@ -384,3 +406,28 @@ async def test_pagina_se_crea_y_cierra_una_sola_vez_por_worker(monkeypatch):
     await sw.scraper_worker(0, _ContextoContador(), cola, asyncio.Queue(), "db-fake")
 
     assert len(paginas_creadas) == 1
+
+
+# ── DEC-142: el worker propaga el forzado de modo completo por pedido ──────────
+
+
+@pytest.mark.unit
+async def test_worker_fuerza_completo_solo_para_los_ids_del_conjunto(monkeypatch):
+    vistos: dict[str, bool] = {}
+
+    async def _registra(
+        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+    ):
+        vistos[pid] = forzar_completo
+        return True
+
+    monkeypatch.setattr(sw, "procesar_pedido", _registra)
+    cola: asyncio.Queue = asyncio.Queue()
+    for pid in ("P1", "P2", "P3"):
+        await cola.put(pid)
+    await cola.put(None)
+    await sw.scraper_worker(
+        0, _FakeContext(), cola, asyncio.Queue(), "db-fake", ids_forzar_completo=frozenset({"P2"})
+    )
+
+    assert vistos == {"P1": False, "P2": True, "P3": False}

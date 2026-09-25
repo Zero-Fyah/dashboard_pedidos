@@ -1,8 +1,10 @@
 """Pasada de mantenimiento — DEC-092.
 
-Recupera la información de entrega mientras el origen todavía la muestra. La
-ventana es de ~6 meses y avanza un día por día (DEC-091): lo que no se capture
-ahí no se recupera nunca, y ya hay 3.517 pedidos perdidos.
+Recupera la información de entrega mientras el origen todavía la muestra. DEC-091
+la describió como una ventana de ~6 meses que avanzaba un día por día; DEC-127
+lo refutó midiendo un mes después: es una **pared fija** en el 2026-02-03, y lo
+anterior se perdió de forma permanente (DEC-129). Los pedidos elegidos se
+fuerzan a modo completo en memoria, sin marcar la base (DEC-142).
 
 En producción el selector devuelve 0 hoy —marzo a junio están completos y
 julio es demasiado reciente— así que **el comportamiento se fija acá**: un
@@ -15,10 +17,11 @@ import aiosqlite
 import pytest
 
 from scraper.orquestador import (
-    marcar_para_recuperacion,
     obtener_ids_para_recuperar,
     ventana_mantenimiento,
 )
+
+pytestmark = pytest.mark.integration
 
 
 async def _crear(db_path: str) -> None:
@@ -121,32 +124,6 @@ async def test_respeta_los_dos_bordes_de_la_ventana(tmp_path):
     hasta = (hoy - timedelta(days=20)).isoformat()
 
     assert await obtener_ids_para_recuperar(db, desde=desde, hasta=hasta) == ["DENTRO"]
-
-
-@pytest.mark.integration
-async def test_marcar_fuerza_el_modo_completo(tmp_path):
-    """`determinar_modo()` manda a `completo` solo si scraping_completo=0.
-    Es el mismo mecanismo del backfill de DEC-027, no una vía nueva."""
-    db = str(tmp_path / "m.db")
-    await _crear(db)
-    await _pedido(db, "A", dias=60)
-    await _pedido(db, "B", dias=60, hora_entrega="2026-06-01 08:00 ~ 10:00")
-
-    await marcar_para_recuperacion(db, ["A"])
-
-    async with aiosqlite.connect(db) as con:
-        filas = dict(
-            await (await con.execute("SELECT id_pedido, scraping_completo FROM pedidos")).fetchall()
-        )
-    assert filas["A"] == 0
-    assert filas["B"] == 1  # no se toca lo que no se eligió
-
-
-@pytest.mark.integration
-async def test_marcar_sin_ids_no_hace_nada(tmp_path):
-    db = str(tmp_path / "m.db")
-    await _crear(db)
-    await marcar_para_recuperacion(db, [])
 
 
 @pytest.mark.integration

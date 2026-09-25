@@ -111,6 +111,7 @@ async def procesar_pedido(
     db_path: str,
     max_reintentos: int | None = None,
     usar_push: bool = False,
+    forzar_completo: bool = False,
 ) -> bool:
     """Determina el modo de extracción, navega al detalle y publica en la cola.
 
@@ -173,7 +174,13 @@ async def procesar_pedido(
                 subs_db = []
 
         scraping_completo = row[0] if row is not None else 1
-        modo = determinar_modo(es_nuevo, subs_db, scraping_completo)
+        # DEC-142: la re-extracción (DEC-140) y el mantenimiento (DEC-092)
+        # fuerzan el modo en memoria, sin marcar `scraping_completo=0` en la
+        # base: una marca persistida quedaba huérfana si el ciclo moría
+        # antes de procesar el pedido (1.382 la noche del 2026-09-23).
+        modo = (
+            "completo" if forzar_completo else determinar_modo(es_nuevo, subs_db, scraping_completo)
+        )
     except Exception as exc:
         detalle = f"Determinación de modo falló: {exc}"
         log_event(
@@ -450,6 +457,7 @@ async def scraper_worker(
     resultados_queue: asyncio.Queue,
     db_path: str,
     max_reintentos: int | None = None,
+    ids_forzar_completo: frozenset[str] = frozenset(),
 ) -> None:
     """Consume IDs de pedido de la cola y los procesa uno a uno.
 
@@ -509,6 +517,7 @@ async def scraper_worker(
             db_path,
             max_reintentos,
             current_pedido,
+            ids_forzar_completo,
         )
     finally:
         await page.close()
@@ -522,6 +531,7 @@ async def _consumir_cola(
     db_path: str,
     max_reintentos: int | None,
     current_pedido: list[str],
+    ids_forzar_completo: frozenset[str] = frozenset(),
 ) -> None:
     """Cuerpo del loop de scraper_worker() — extraído para que la página
     se cree y se cierre una sola vez en el llamador, con garantía de
@@ -589,6 +599,7 @@ async def _consumir_cola(
                 db_path,
                 max_reintentos=max_reintentos,
                 usar_push=usar_push,
+                forzar_completo=id_pedido in ids_forzar_completo,
             )
         except Exception as exc:
             # AUD-M9: red de seguridad final — procesar_pedido() ya cubre su

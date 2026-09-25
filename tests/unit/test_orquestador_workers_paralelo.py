@@ -100,3 +100,80 @@ async def test_logins_de_workers_corren_en_paralelo_no_secuencial(monkeypatch):
     # debe acercarse a un solo demora_s. Margen 3x para tolerar CI lento
     # sin dejar de detectar una regresión a secuencial (que daría ~6x).
     assert transcurrido < demora_s * 3
+
+
+# ── DEC-142: un worker que no entra ya no tumba el ciclo ──────────────────────
+
+
+class _FakeContextCerrable(_FakeContext):
+    def __init__(self):
+        super().__init__()
+        self.cerrado = False
+
+    async def close(self):
+        self.cerrado = True
+
+
+class _FakeBrowserCerrable(_FakeBrowser):
+    def __init__(self):
+        super().__init__()
+        self.contextos: list[_FakeContextCerrable] = []
+
+    async def new_context(self, **kwargs):
+        ctx = _FakeContextCerrable()
+        self.contextos.append(ctx)
+        return ctx
+
+
+def _login_que_falla_para(wids_que_fallan: set[int]):
+    llamada = {"n": 0}
+
+    async def _login(page, usuario, clave):
+        wid = llamada["n"]
+        llamada["n"] += 1
+        if wid in wids_que_fallan:
+            raise RuntimeError("Login fallido tras 3 intentos")
+
+    return _login
+
+
+async def test_worker_que_no_entra_se_descarta_y_el_resto_sigue(monkeypatch):
+    eventos: list[tuple] = []
+    monkeypatch.setattr(orq, "log_event", lambda ev, **kw: eventos.append((ev, kw)))
+    monkeypatch.setattr(orq, "login", _login_que_falla_para({2}))
+    monkeypatch.setitem(orq.CONFIG, "NUM_WORKERS", 6)
+    browser = _FakeBrowserCerrable()
+
+    workers = await orq._autenticar_workers(browser)
+
+    assert [wid for wid, _ in workers] == [0, 1, 3, 4, 5]
+    assert browser.contextos[2].cerrado is True  # el contexto del caído no queda abierto
+    assert not any(ctx.cerrado for wid, ctx in workers)
+    assert [kw["worker_id"] for ev, kw in eventos if ev == "worker_login_fallido"] == [2]
+    resumen = [kw for ev, kw in eventos if ev == "workers_login_completado"][0]
+    assert resumen["level"] == "WARNING"
+    assert "5/6" in resumen["msg"]
+
+
+async def test_sin_ningun_worker_autenticado_el_run_se_aborta(monkeypatch):
+    monkeypatch.setattr(orq, "log_event", lambda ev, **kw: None)
+    monkeypatch.setattr(orq, "login", _login_que_falla_para(set(range(6))))
+    monkeypatch.setitem(orq.CONFIG, "NUM_WORKERS", 6)
+    browser = _FakeBrowserCerrable()
+
+    with pytest.raises(RuntimeError, match="Ningún worker"):
+        await orq._autenticar_workers(browser)
+    assert all(ctx.cerrado for ctx in browser.contextos)
+
+
+async def test_todos_autenticados_reporta_info(monkeypatch):
+    eventos: list[tuple] = []
+    monkeypatch.setattr(orq, "log_event", lambda ev, **kw: eventos.append((ev, kw)))
+    monkeypatch.setattr(orq, "login", _login_que_falla_para(set()))
+    monkeypatch.setitem(orq.CONFIG, "NUM_WORKERS", 6)
+
+    workers = await orq._autenticar_workers(_FakeBrowserCerrable())
+
+    assert len(workers) == 6
+    resumen = [kw for ev, kw in eventos if ev == "workers_login_completado"][0]
+    assert resumen["level"] == "INFO"
