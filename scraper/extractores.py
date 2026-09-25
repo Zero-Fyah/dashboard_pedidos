@@ -6,7 +6,6 @@ del detalle de pedido y el volcado de debug (screenshot + HTML).
 """
 
 import asyncio
-import json
 import re
 import time
 from pathlib import Path
@@ -160,6 +159,73 @@ async def leer_presentacion(info_col) -> str:
 # ─────────────────────────────────────────────
 
 
+# DEC-141: selectores del formulario de login, compartidos por el llenado y la
+# espera posterior al clic.
+_SEL_LOGIN_USUARIO = "input[type='email'], input[type='text']"
+_SEL_LOGIN_CLAVE = "input[type='password']"
+
+# DEC-141: el login es de AWS Cognito. `goto()` vuelve en el primer `load`,
+# pero la página sigue una cadena de redirecciones (4 navegaciones más,
+# medido) y el formulario DEFINITIVO aparece ~3 s después, con `csrf` y la
+# huella `cognitoAsfData` ya calculados. Llenar antes significa que la
+# siguiente navegación borra lo escrito, o que se envía un formulario
+# intermedio sin huella y Cognito responde 400 (capturado el 2026-09-24).
+_JS_FORMULARIO_LOGIN_LISTO = """() => {
+    const huella = document.querySelector("input[name='cognitoAsfData']");
+    const usuario = document.querySelector("input[name='username']");
+    return !!(huella && huella.value.length > 0 && usuario);
+}"""
+# Si el origen deja de usar la huella, no se bloquea el login: se espera esto
+# y se sigue como antes, con WARNING.
+_ESPERA_FORMULARIO_LISTO_MS = 15_000
+
+# DEC-141: tras el clic se espera la redirección O la señal de que el envío no
+# salió — algún campo vacío. Antes se esperaba solo la redirección y, si el
+# formulario se había vaciado, el intento moría a los 45 s sin que el servidor
+# recibiera nada.
+_JS_ESPERA_LOGIN = """([destino, selUsuario, selClave]) => {
+    if (window.location.href.startsWith(destino)) return 'ok';
+    const u = document.querySelector(selUsuario);
+    const c = document.querySelector(selClave);
+    if (u && c && (u.value === '' || c.value === '')) return 'vacio';
+    return false;
+}"""
+
+
+async def _llenar_formulario_login(
+    page: Page, usuario: str, clave: str, max_rellenos: int = 5
+) -> int:
+    """Llena usuario y clave y verifica que el valor se quedó (DEC-141).
+
+    La página de login termina de inicializar su JavaScript DESPUÉS del
+    evento `load` y, al hacerlo, vuelve a dibujar el formulario y borra lo
+    escrito. Con 6 navegadores cargando a la vez la inicialización es más
+    lenta y el llenado cae antes: el clic envía un formulario vacío, la
+    validación del cliente lo frena («Missing username.») y nunca sale el
+    `POST /login`. Reproducido el 2026-09-24: 2 de 30 logins paralelos,
+    ambos sin ninguna petición de red tras el clic.
+
+    Returns:
+        Cuántas veces hubo que volver a llenar (0 = quedó al primer intento).
+
+    Raises:
+        RuntimeError: si tras `max_rellenos` los campos siguen sin quedar.
+    """
+    campo_usuario = page.locator(_SEL_LOGIN_USUARIO).first
+    campo_clave = page.locator(_SEL_LOGIN_CLAVE).first
+    for relleno in range(max_rellenos):
+        await campo_usuario.fill(usuario)
+        await campo_clave.fill(clave)
+        # Margen para que un re-render pendiente se manifieste antes de verificar.
+        await asyncio.sleep(0.3)
+        if (
+            await campo_usuario.input_value() == usuario
+            and await campo_clave.input_value() == clave
+        ):
+            return relleno
+    raise RuntimeError("El formulario de login borró los campos en todos los rellenos (DEC-141)")
+
+
 async def login(page: Page, usuario: str, clave: str) -> None:
     """Autentica en el panel administrativo y ajusta el idioma a español.
 
@@ -184,14 +250,44 @@ async def login(page: Page, usuario: str, clave: str) -> None:
                 "input[type='password'], input[type='email'], input[type='text']",
                 timeout=CONFIG["ELEM_TIMEOUT_MS"],
             )
+            try:
+                await page.wait_for_function(
+                    _JS_FORMULARIO_LOGIN_LISTO, timeout=_ESPERA_FORMULARIO_LISTO_MS
+                )
+            except PlaywrightTimeoutError:
+                log_event(
+                    "login_sin_huella",
+                    level="WARNING",
+                    msg=(
+                        "El formulario de login no mostró `cognitoAsfData` en "
+                        f"{_ESPERA_FORMULARIO_LISTO_MS // 1000} s — ¿cambió el origen? "
+                        "Se sigue con el llenado verificado (DEC-141)"
+                    ),
+                )
 
-            await page.locator("input[type='email'], input[type='text']").first.fill(usuario)
-            await page.locator("input[type='password']").first.fill(clave)
+            rellenos = await _llenar_formulario_login(page, usuario, clave)
+            if rellenos:
+                log_event(
+                    "login_campos_borrados",
+                    level="WARNING",
+                    msg=(
+                        f"El formulario borró los campos {rellenos} vez/veces "
+                        "antes de quedar lleno — se volvieron a llenar (DEC-141)"
+                    ),
+                )
             await page.locator("button[type='submit'], form button").first.click()
-            await page.wait_for_function(
-                f"() => window.location.href.startsWith({json.dumps(CONFIG['url_post_login'])})",
+            resultado = await page.wait_for_function(
+                _JS_ESPERA_LOGIN,
+                arg=[CONFIG["url_post_login"], _SEL_LOGIN_USUARIO, _SEL_LOGIN_CLAVE],
                 timeout=CONFIG["NAV_TIMEOUT_MS"],
             )
+            if await resultado.json_value() == "vacio":
+                # El formulario se reinició entre la verificación y el clic:
+                # el envío no salió. Se falla ya y se reintenta, en vez de
+                # esperar 45 s una redirección imposible.
+                raise RuntimeError(
+                    "Formulario vacío tras el clic — el envío no salió o Cognito lo rechazó (DEC-141)"
+                )
             await page.wait_for_selector(
                 "#app, .el-container, .el-header, .el-main, main, "
                 "[class*='layout'], [class*='container']",
