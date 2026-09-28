@@ -236,27 +236,36 @@ def calcular_clasificacion(
 
 
 def _movimiento(con: sqlite3.Connection, almacen: str, meses: list[str]) -> pd.DataFrame:
-    """Líneas de pedido de la ventana, sin cancelados y del almacén pedido."""
-    lineas = pd.read_sql(
-        """SELECT id_pedido, numero_subpedido, referencia, codigo_barras, almacen,
-                  cantidad_comprada, monto_final_num
-           FROM lineas_pedido
-           WHERE referencia IS NOT NULL AND referencia != ''""",
-        con,
-    )
-    pedidos = pd.read_sql("SELECT id_pedido, fecha FROM pedidos", con)
-    subpedidos = pd.read_sql("SELECT id_pedido, numero_subpedido, estado FROM subpedidos", con)
+    """Unidades y valor por referencia, código de barras y mes de la ventana,
+    sin cancelados y del almacén pedido.
 
-    mov = lineas.merge(pedidos, on="id_pedido").merge(
-        subpedidos, on=["id_pedido", "numero_subpedido"]
+    DEC-151: agrega en SQL por los valores tal como están guardados (todo lo
+    de abajo son sumas por clave y mes, así que pre-sumar no cambia nada) y
+    deja en pandas el `strip()` — traer las ~1,1 M líneas costaba ~580 MB de
+    pico en cada ciclo. Resultado idéntico (verificado sobre la base real).
+    """
+    marcas = ",".join("?" * len(meses))
+    mov = pd.read_sql(
+        f"""SELECT l.referencia, l.codigo_barras, substr(p.fecha, 1, 7) AS mes,
+                   SUM(l.cantidad_comprada) AS cantidad_comprada,
+                   SUM(l.monto_final_num) AS monto_final_num
+            FROM lineas_pedido l
+            JOIN pedidos p ON p.id_pedido = l.id_pedido
+            JOIN subpedidos s
+              ON s.id_pedido = l.id_pedido AND s.numero_subpedido = l.numero_subpedido
+            WHERE l.referencia IS NOT NULL AND l.referencia != ''
+              AND l.almacen = ?
+              AND substr(p.fecha, 1, 7) IN ({marcas})
+              -- Un subpedido cancelado no es consumo: contarlo distorsionaría
+              -- tanto el ranking de valor como la variabilidad.
+              AND (s.estado IS NULL OR lower(s.estado) != 'cancelado')
+            GROUP BY l.referencia, l.codigo_barras, mes""",
+        con,
+        params=[almacen, *meses],
     )
-    # Un subpedido cancelado no es consumo: contarlo distorsionaría tanto el
-    # ranking de valor como la variabilidad.
-    mov = mov[(mov["almacen"] == almacen) & (mov["estado"].str.lower() != "cancelado")]
     mov["ref"] = mov["referencia"].astype(str).str.strip()
     mov["cb"] = mov["codigo_barras"].astype(str).str.strip()
-    mov["mes"] = mov["fecha"].astype(str).str[:7]
-    return mov[mov["mes"].isin(meses)]
+    return mov
 
 
 def _abc_xyz(

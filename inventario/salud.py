@@ -90,31 +90,42 @@ def _hoy_colombia() -> dt.date:
     return (dt.datetime.now(tz=dt.timezone.utc) - dt.timedelta(hours=_OFFSET_CO_H)).date()
 
 
-def _demanda_por_referencia(con: sqlite3.Connection, almacen: str) -> pd.DataFrame:
-    """Agrega unidades vendidas y última salida por referencia.
-
-    Se resuelve en pandas y no en SQL porque se midió: 10,4 s contra 22,2 s
-    sobre los mismos datos.
+def _demanda_por_referencia(
+    con: sqlite3.Connection, almacen: str, desde_larga: str, desde_corta: str
+) -> pd.DataFrame:
+    """Última salida y unidades vendidas en las dos ventanas, por referencia.
 
     **Excluye los subpedidos cancelados**: una venta que se canceló no es
     demanda, y contarla inflaría la cobertura justo en las referencias con
-    más cancelaciones.
-    """
-    lineas = pd.read_sql(
-        """SELECT id_pedido, numero_subpedido, referencia, almacen, cantidad_comprada
-           FROM lineas_pedido
-           WHERE referencia IS NOT NULL AND referencia != ''""",
-        con,
-    )
-    pedidos = pd.read_sql("SELECT id_pedido, fecha FROM pedidos", con)
-    subpedidos = pd.read_sql("SELECT id_pedido, numero_subpedido, estado FROM subpedidos", con)
+    más cancelaciones. Un estado NULL no es cancelado (igual que antes).
 
-    m = lineas.merge(pedidos, on="id_pedido").merge(
-        subpedidos, on=["id_pedido", "numero_subpedido"]
+    DEC-151: agrega en SQL por la referencia tal como está guardada y solo
+    el `strip()` y la re-agregación quedan en pandas — traer las ~1,1 M
+    líneas a un DataFrame costaba ~530 MB de pico en cada ciclo. Resultado
+    idéntico (verificado contra la versión anterior sobre la base real).
+    """
+    crudo = pd.read_sql(
+        """SELECT l.referencia,
+                  MAX(p.fecha) AS ultima_salida,
+                  SUM(CASE WHEN p.fecha >= :larga THEN l.cantidad_comprada END) AS demanda_90d,
+                  SUM(CASE WHEN p.fecha >= :corta THEN l.cantidad_comprada END) AS demanda_30d
+           FROM lineas_pedido l
+           JOIN pedidos p ON p.id_pedido = l.id_pedido
+           JOIN subpedidos s
+             ON s.id_pedido = l.id_pedido AND s.numero_subpedido = l.numero_subpedido
+           WHERE l.referencia IS NOT NULL AND l.referencia != ''
+             AND l.almacen = :almacen
+             AND (s.estado IS NULL OR lower(s.estado) != 'cancelado')
+           GROUP BY l.referencia""",
+        con,
+        params={"larga": desde_larga, "corta": desde_corta, "almacen": almacen},
     )
-    m = m[(m["almacen"] == almacen) & (m["estado"].str.lower() != "cancelado")]
-    m["referencia"] = m["referencia"].astype(str).str.strip()
-    return m
+    crudo["referencia"] = crudo["referencia"].astype(str).str.strip()
+    return crudo.groupby("referencia", as_index=False).agg(
+        ultima_salida=("ultima_salida", "max"),
+        demanda_90d=("demanda_90d", "sum"),
+        demanda_30d=("demanda_30d", "sum"),
+    )
 
 
 def calcular_salud(
@@ -155,16 +166,7 @@ def calcular_salud(
         disponible=("inventario", "sum"), valor_venta=("valor_fila", "sum")
     )
 
-    mov = _demanda_por_referencia(con, almacen)
-    agregados = mov.groupby("referencia", as_index=False).agg(ultima_salida=("fecha", "max"))
-    for etiqueta, desde in (("demanda_90d", desde_larga), ("demanda_30d", desde_corta)):
-        ventana = (
-            mov[mov["fecha"] >= desde]
-            .groupby("referencia", as_index=False)["cantidad_comprada"]
-            .sum()
-            .rename(columns={"cantidad_comprada": etiqueta})
-        )
-        agregados = agregados.merge(ventana, on="referencia", how="left")
+    agregados = _demanda_por_referencia(con, almacen, desde_larga, desde_corta)
 
     df = stock.merge(agregados, on="referencia", how="left")
     for col in ("demanda_90d", "demanda_30d"):

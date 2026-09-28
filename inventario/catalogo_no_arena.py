@@ -339,24 +339,32 @@ def _ultima_venta(con: sqlite3.Connection) -> pd.DataFrame:
     `inventario/salud.py::_demanda_por_referencia()` (una venta cancelada no
     es una venta).
     """
-    lineas = pd.read_sql(
-        """SELECT lp.id_pedido, lp.numero_subpedido, lp.referencia, lp.codigo_barras
+    # Auditoría 2026-09-25: la agregación se hace en SQL. Antes se cargaban
+    # en pandas las ~1,14 M líneas más pedidos y subpedidos para quedarse
+    # con una fecha: 9,3 s de los 12,5 s de la página «Catálogo no Arena».
+    # El máximo por ID es el máximo de los máximos por par (referencia,
+    # código) crudo, así que agrupar primero no cambia el resultado
+    # (verificado idéntico contra la base real). El `.strip()` y el puente
+    # siguen en pandas para conservar su semántica exacta (str.strip quita
+    # más que el TRIM de SQLite), y el estado NULL se conserva como antes
+    # (en pandas, NaN != "cancelado").
+    ventas = pd.read_sql(
+        """SELECT lp.referencia, lp.codigo_barras, MAX(p.fecha) AS fecha
            FROM lineas_pedido lp
-           WHERE lp.referencia IS NOT NULL AND lp.referencia != ''""",
+           JOIN pedidos p ON p.id_pedido = lp.id_pedido
+           JOIN subpedidos s
+             ON s.id_pedido = lp.id_pedido AND s.numero_subpedido = lp.numero_subpedido
+           WHERE lp.referencia IS NOT NULL AND lp.referencia != ''
+             AND (s.estado IS NULL OR LOWER(s.estado) != 'cancelado')
+           GROUP BY lp.referencia, lp.codigo_barras""",
         con,
     )
-    pedidos = pd.read_sql("SELECT id_pedido, fecha FROM pedidos", con)
-    subpedidos = pd.read_sql("SELECT id_pedido, numero_subpedido, estado FROM subpedidos", con)
     puente = pd.read_sql(
         "SELECT referencia, codigo_barras, id_especificacion "
         "FROM catalogo_productos WHERE id_especificacion IS NOT NULL",
         con,
     )
 
-    ventas = lineas.merge(pedidos, on="id_pedido").merge(
-        subpedidos, on=["id_pedido", "numero_subpedido"]
-    )
-    ventas = ventas[ventas["estado"].str.lower() != "cancelado"]
     ventas["referencia"] = ventas["referencia"].astype(str).str.strip()
     ventas["codigo_barras"] = ventas["codigo_barras"].astype(str).str.strip()
 

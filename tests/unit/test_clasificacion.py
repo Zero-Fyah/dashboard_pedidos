@@ -138,6 +138,23 @@ def test_cancelado_no_es_consumo(con):
     assert df.loc["PA01", "abc"] == SIN_CONSUMO
 
 
+def test_subpedido_sin_estado_si_es_consumo(con):
+    """DEC-151: NULL no es «cancelado», igual que en la versión pandas."""
+    _venta(con, "PA01", "2026-01", 5, 5000, estado=None)
+    df = _refs(calcular_clasificacion(_admin(["PA01"]), con, hoy=HOY))
+    assert df.loc["PA01", "unidades"] == 5
+
+
+def test_referencia_con_espacios_se_suma_a_la_limpia(con):
+    """DEC-151: el SQL agrupa por el valor guardado; el strip en pandas y las
+    sumas de abajo tienen que juntar las dos grafías."""
+    _venta(con, "PA01", "2026-01", 5, 5000)
+    _venta(con, "PA01 ", "2026-01", 3, 3000)
+    df = _refs(calcular_clasificacion(_admin(["PA01"]), con, hoy=HOY))
+    assert df.loc["PA01", "unidades"] == 8
+    assert df.loc["PA01", "valor_consumo"] == 8000
+
+
 def test_otro_almacen_no_cuenta(con):
     _venta(con, "PA01", "2026-01", 5, 5000, almacen="Medellin")
     df = _refs(calcular_clasificacion(_admin(["PA01"]), con, hoy=HOY))

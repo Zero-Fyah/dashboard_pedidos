@@ -111,6 +111,26 @@ def test_subpedido_cancelado_no_cuenta_como_demanda(con):
     assert df.loc["PA01", "demanda_90d"] == 0
 
 
+def test_subpedido_sin_estado_si_cuenta_como_demanda(con):
+    """DEC-151: NULL no es «cancelado» — la versión pandas lo contaba y el SQL
+    tiene que seguir contándolo."""
+    _venta(con, "PA01", 10, 900, estado=None)
+    df = calcular_salud(_admin([("PA01", 300, 1000)]), con, hoy=HOY).set_index("referencia")
+    assert df.loc["PA01", "demanda_90d"] == 900
+
+
+def test_referencia_con_espacios_se_suma_a_la_limpia(con):
+    """DEC-151: el SQL agrupa por el valor guardado; el strip y la
+    re-agregación en pandas tienen que juntar las dos grafías."""
+    _venta(con, "PA01", 10, 100)
+    _venta(con, "PA01 ", 5, 50)
+    df = calcular_salud(_admin([("PA01", 300, 1000)]), con, hoy=HOY)
+    assert (df["referencia"] == "PA01").sum() == 1
+    fila = df.set_index("referencia").loc["PA01"]
+    assert fila["demanda_90d"] == 150
+    assert fila["ultima_salida"] == (HOY - dt.timedelta(days=5)).isoformat()
+
+
 def test_otro_almacen_no_cuenta(con):
     _venta(con, "PA01", 10, 900, almacen="Medellin")
     df = calcular_salud(_admin([("PA01", 300, 1000)]), con, hoy=HOY).set_index("referencia")
