@@ -8,7 +8,7 @@ sido el primer import cruzado entre etapas, contra DEC-022.
 
 Este módulo es el punto de entrada del paso: `python -m
 inventario.persistencia` carga las tres fuentes, calcula y escribe. Lo
-invoca `scraper/actualizar_pedidos.bat` después de las dos descargas y
+invoca `scraper/actualizar_pedidos.sh` después de las descargas y
 antes del ETL.
 
 `inventario/` es dueño de sus tablas y de sus VIEWs — no pasa por el ETL,
@@ -1394,7 +1394,7 @@ def _normalizar(fila: tuple) -> tuple:
 def main() -> int:
     """Carga las tres fuentes, calcula la comparación y la persiste.
 
-    Composition root del paso: es lo único que `actualizar_pedidos.bat`
+    Composition root del paso: es lo único que `actualizar_pedidos.sh`
     necesita invocar. AUD-B7: retorna el exit code, `sys.exit` vive en
     `__main__`.
 

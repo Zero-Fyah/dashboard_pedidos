@@ -68,7 +68,7 @@ st.caption(
 )
 
 if corrida["datos_desactualizados"]:
-    # Las líneas del .bat corren sin `&&`: una descarga caída deja el Excel
+    # Los pasos de actualizar_pedidos.sh son independientes: una descarga caída deja el Excel
     # anterior en su sitio y el número parecería fresco (DEC-043).
     st.warning(
         f"⚠️ La fuente más antigua tiene {corrida['fuente_mas_vieja_h']:.1f} horas. "

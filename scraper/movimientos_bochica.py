@@ -34,7 +34,7 @@ Vocabulario de `tipo` medido en la carga inicial (38.056 filas,
 El scraper diario reutiliza el patrón de `cambios_inventario.py` (decisión
 confirmada por el Arquitecto sobre la alternativa de un gate fijo a las
 23:00): captura "ayer completo", autoverificado con `ya_cargado()`, sin
-condición de hora en el `.bat`. La actividad medida de bodega es 0 entre
+condición de hora en `actualizar_pedidos.sh`. La actividad medida de bodega es 0 entre
 las 22:00 y las 05:00 (carga inicial, 38.056 filas) — "ayer completo" y
 "hoy hasta las 23:00" son el mismo dato, y el patrón de "ayer" es más
 robusto: se autocorrige en el siguiente ciclo horario si uno falla, un
@@ -561,7 +561,7 @@ async def descargar_movimientos_bochica(page: Page, fecha: date, destino: Path) 
     # pd.DataFrame(filas, columns=_COLUMNAS_FUENTE) revienta con "N columns
     # passed, passed data had 1 columns" y esa fecha queda sin poder
     # registrarse nunca — ya_cargado() nunca ve una fila con esa
-    # fecha_operacion, así que el .bat reintenta cada hora y falla cada hora
+    # fecha_operacion, así que el ciclo reintenta cada hora y falla cada hora
     # hasta que "ayer" avanza al día siguiente (incidente real: 19 fallos
     # consecutivos el 2026-08-31 tratando de capturar el 2026-08-30).
     if len(filas) == 1 and len(filas[0]) != len(_COLUMNAS_FUENTE):
@@ -604,7 +604,7 @@ async def main() -> int:
     """Punto de entrada diario: captura el día anterior si aún no está cargado.
 
     Mismo patrón que `cambios_inventario.main()`: sin condición de fecha/hora
-    en el `.bat` — este módulo decide solo, con `ya_cargado()`, si ya hay
+    en `actualizar_pedidos.sh` — este módulo decide solo, con `ya_cargado()`, si ya hay
     trabajo hecho para "ayer" y termina de inmediato si sí.
 
     Además de cargar los movimientos, archiva el snapshot de Bochica de ese

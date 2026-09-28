@@ -13,7 +13,7 @@ Por eso extracción y persistencia viven en el mismo módulo, sin el cruce de
 fuentes que justificó separar Bochica/admin en dos módulos.
 
 El gate de "una vez al día" vive en main() (ya_capturado()), no en el
-scheduler: el .bat llama a este módulo en cada corrida horaria sin
+scheduler: `actualizar_pedidos.sh` llama a este módulo en cada corrida horaria sin
 condición, y es esta función la que decide si ya hay trabajo hecho.
 """
 
@@ -299,7 +299,7 @@ async def main() -> int:
     """Punto de entrada diario: captura el día anterior si aún no está cargado.
 
     Se invoca sin condición en cada corrida horaria del scheduler — el gate
-    real es ya_capturado(), no un cálculo de fecha/hora en el .bat.
+    real es ya_capturado(), no un cálculo de fecha/hora en el script del ciclo.
 
     Returns:
         0 si terminó sin errores (incluye "no había nada que hacer"),

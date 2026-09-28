@@ -3,13 +3,13 @@
 
 # dashboard_pedidos
 
-**Actualizado:** 2026-08-26
+**Actualizado:** 2026-09-27
 
 Pipeline de datos en tres etapas para un sistema administrativo interno (SPA Vue.js + Element
 Plus) de una empresa colombiana que gestiona su propia operación logística. Un scraper asíncrono
 extrae pedidos, subpedidos, líneas de producto, línea de tiempo de alistamiento, registros de
-pago y registros operacionales; un ETL los normaliza; y un dashboard de 17 páginas los publica.
-Todo vive en SQLite: **35 tablas y 24 VIEWs**. Los datos recopilados servirán como insumo para
+pago y registros operacionales; un ETL los normaliza; y un dashboard de 18 páginas los publica.
+Todo vive en SQLite: **33 tablas y 24 VIEWs**. Los datos recopilados servirán como insumo para
 un futuro sistema de predicción de demanda.
 
 Sobre esa base se construyó además un **módulo de inventario** que cruza el catálogo del sistema
@@ -31,7 +31,7 @@ analítica sobre:
 - **Diferencias en envíos:** frecuencia, montos y productos con mayor incidencia.
 - **Rendimiento por operador:** tiempos y volúmenes por alistador e inspector.
 
-Este pipeline extrae esa información de forma automatizada, la normaliza en 30 tablas SQLite
+Este pipeline extrae esa información de forma automatizada, la normaliza en SQLite
 y la publica en un dashboard. Corre desatendido cada hora.
 
 ---
@@ -48,7 +48,7 @@ scraper/actualizar_pedidos.sh
 scraper/scraper_principal.py
         │
    ┌────┴───────────────────────────────────────────┐
-   │           Modo incremental (diario)            │
+   │         Modo incremental (cada hora)           │
    │  1. Activos en DB   →  ids_activos[]           │
    │  2. Con errores     →  ids_error[]             │
    │  3. Nuevos (watermark) → ids_nuevos[]          │
@@ -62,12 +62,13 @@ scraper/scraper_principal.py
   │   sentinel None al final, uno por worker     │
   └──┬──────┬───────┬─────────┬────────┬─────────┘
      │      │       │         │        │
-   W-0    W-1     W-2       W-3      W-4    W-5   ← 6 workers
-     │      │       │         │        │      BrowserContext independiente
-     ┴──────┴───────┴─────────┴────────┘      circuit breaker + re-login;
-                                              un worker que no logra
-                                              loguearse se descarta sin
-                                              tumbar el ciclo
+   W-0    W-1     W-2       W-3      W-4   ← 5 workers (SCRAPER_NUM_WORKERS)
+     │      │       │         │        │     BrowserContext independiente,
+     ┴──────┴───────┴─────────┴────────┘     página nueva cada N pedidos,
+                                             circuit breaker + re-login;
+                                             un worker que no logra
+                                             loguearse reintenta durante
+                                             el run sin tumbar el ciclo
                 │
                 ▼
         resultados_queue
@@ -82,22 +83,32 @@ scraper/scraper_principal.py
    scraper.inventario + scraper.bochica   ← descarga de las dos fuentes de inventario
                 │
                 ▼
-   inventario.persistencia   ← cruce con el layout de bodega y escritura de tablas derivadas
-                │
-                ▼
    scraper.cambios_inventario + scraper.movimientos_bochica   ← captura diaria de
                 │                                                movimientos (admin + Bochica)
                 ▼
+   inventario.persistencia   ← cruce con el layout de bodega y escritura de tablas derivadas
+                │
+                ▼
+   integraciones.sheets_cliente   ← exportación a Google Sheets
+                │
+                ▼
         etl/etl_principal.py   ← normalización de montos + VIEWs analíticas + ANALYZE
+                │
+                ▼
+   scripts/respaldar_db.py   ← respaldo diario verificado (una vez por día)
 ```
 
-El mismo `.bat` encadena siete pasos en ese orden: el ETL va último para que normalice a
-`_num` todo lo que los pasos anteriores acaban de capturar. Un ciclo completo tarda **~30-32
-min** en producción real (auditoría de rendimiento, 2026-08-26 — navegación interna vía Vue
-Router en vez de recargar la SPA por cada pedido).
+`actualizar_pedidos.sh` encadena esos nueve pasos en ese orden (más una pasada de
+mantenimiento el día 1 de cada mes) y deja en el log el código de salida y la duración de
+cada uno. El ETL va después de todo lo que captura para que normalice a `_num` lo recién
+extraído. Con la configuración de producción (5 workers, página nueva cada 10 pedidos, V8
+optimizado para tamaño) un ciclo de ~1.800 pedidos tarda **24-27 min** y su pico de memoria
+es de **~1,4 GB** (medido el 2026-09-27; antes ~4,9 GB).
 
 El pipeline termina en `dashboard/app.py` (Streamlit), que consume `data/pedidos.db` **solo por
-lectura** y, salvo excepción medida, a través de VIEWs.
+lectura**. Puede leer las tablas del scraper, pero los montos siempre como valor numérico
+normalizado por el ETL (`*_num` o sus VIEWs), nunca como el texto del origen — lo verifica un
+test (DEC-157).
 
 ### Principios de diseño
 
@@ -108,6 +119,10 @@ dominio compartido vive una única vez en `comun/`, y las optimizaciones
 requieren medición previa que las justifique. Cada decisión de diseño no
 trivial queda registrada con su trade-off antes de implementarse.
 
+Las referencias `DEC-NNN`, `BUG-NNN` y `AUD-*` que aparecen en este README y en
+el código remiten a ese registro de decisiones, que es interno y no se publica
+con el repositorio.
+
 ---
 
 ## Estructura del repositorio
@@ -117,12 +132,12 @@ dashboard_pedidos/
 ├── .claude/                  # Configuración Claude Code
 ├── .github/
 │   └── workflows/
-│       └── ci.yml            # CI: ruff+mypy, pytest (ubuntu+windows), gitleaks
+│       └── ci.yml            # CI: ruff+mypy, pytest (ubuntu), gitleaks
 ├── comun/                    # Módulo común — único origen de verdad del dominio
 │   ├── __init__.py           # to_num, get_db_path, ESTADOS_*, umbrales
 │   ├── entregas.py           # los tres formatos de hora_entrega y el OTIF
 │   ├── motivos.py            # clasificación del motivo de cancelación
-│   ├── arena.py              # dominio compartido del módulo Arena (DEC-117)
+│   ├── arena.py              # demanda y punto de reorden de Arena por ciudad
 │   └── reposicion.py         # punto de reorden y cantidad sugerida
 ├── data/                     # Datos locales — gitignored
 │   ├── pedidos.db            # Base de datos SQLite
@@ -134,19 +149,21 @@ dashboard_pedidos/
 │   ├── __init__.py
 │   ├── app.py                # Entry point: tema + st.navigation
 │   ├── theme.py              # Paleta e inyección de CSS global
-│   ├── db.py                 # Capa de lectura (VIEWs de SQLite)
+│   ├── db.py                 # Capa de lectura de SQLite (solo lectura)
 │   ├── filtros.py            # Filtros globales compartidos por session_state
 │   ├── tareas_db.py          # Tareas manuales — data/tareas.db
 │   ├── conteos_io.py         # Recibe y archiva las hojas de conteo
-│   └── pages/                # 17 páginas, en cuatro secciones:
-│                             #   inventario → estado del área, alertas, bodega vs.
-│                             #     sistema, salud, ABC-XYZ, mapa, plan de conteo,
-│                             #     faltantes, Arena (módulo aparte, checkpoint DEC-118)
-│                             #   pedidos    → consolidado, excepciones, productividad
-│                             #   comercial  → ventas, cobranza
+│   └── pages/                # 18 páginas, en cinco secciones:
+│                             #   principal  → estado del área, centro de alertas
+│                             #   pedidos    → consolidado
+│                             #   inventario → bodega vs. sistema, salud,
+│                             #     ABC-XYZ, mapa, plan de conteo, faltantes,
+│                             #     Arena (checkpoint DEC-118), catálogo no-Arena
+│                             #   operación  → tiempos y productividad, excepciones
 │                             #   fuera del alcance del área → ciclo de vida,
-│                             #     cumplimiento de entrega
-│                             # (+ tareas, que se oculta sola si no hay pendientes)
+│                             #     cumplimiento de entrega, ventas, cobranza
+│                             # (+ tareas / calidad de datos, que se oculta sola
+│                             #   si no hay pendientes)
 ├── inventario/               # Cruce bodega ↔ sistema y plan de conteo
 │   ├── layout.py             # Clasificación de ubicaciones del layout
 │   ├── normalizador.py       # Carga y normalización de las 3 fuentes
@@ -157,15 +174,16 @@ dashboard_pedidos/
 │   ├── operacion.py          # Tiempos de ciclo y capacidad del equipo
 │   ├── conteos.py            # Ingesta de conteos físicos desde Excel
 │   ├── cancelaciones.py      # Mercancía alistada que se canceló
-│   ├── hallazgos.py          # Detectores de calidad de datos
+│   ├── hallazgos.py          # 14 detectores de calidad de datos
 │   ├── alertas.py            # Centro de excepciones
-│   ├── arena.py              # Inventario del módulo Arena por ciudad (DEC-117)
+│   ├── arena.py              # Inventario del módulo Arena por ciudad (DEC-118)
+│   ├── catalogo_no_arena.py  # Catálogo sin Arena: venta, ABC-XYZ e inventario
 │   └── persistencia.py       # Esquema, VIEWs y escritura transaccional
 ├── integraciones/            # Consumidores externos de pedidos.db
 │   ├── sheets_arena.py       # Consultas del inventario Arena y pedidos previos
 │   │                         # a picking, por ciudad (12, Bogotá incluida)
 │   └── sheets_cliente.py     # Escritura a Google Sheets (cuenta de servicio)
-├── docs/                     # Contexto persistente del proyecto
+├── docs/                     # Contexto interno del proyecto — no se publica en este repo
 │   ├── integral.md           # Visión, problema y objetivo de negocio
 │   ├── structure.md          # Arquitectura técnica y esquema de datos
 │   ├── agent.md              # Instrucciones de comportamiento para Claude
@@ -175,7 +193,7 @@ dashboard_pedidos/
 │   ├── __init__.py           # paquete importable por tests/
 │   └── etl_principal.py      # normalización de montos y VIEWs
 ├── logs/                     # Logs de ejecución — gitignored
-├── scraper/                  # Etapa 1 — extracción de datos (paquete de 9 módulos)
+├── scraper/                  # Etapa 1 — extracción de datos (paquete de 11 módulos)
 │   ├── __init__.py           # paquete importable por tests/
 │   ├── archive/              # Versión inicial del scraper — solo referencia
 │   ├── migrations/           # Scripts de migración de única ejecución
@@ -191,10 +209,13 @@ dashboard_pedidos/
 │   ├── db.py                 # esquema SQLite, migraciones y watermark
 │   ├── extractores.py        # login (espera el formulario definitivo de Cognito),
 │   │                         # listado, extractores del detalle leídos por
-│   │                         # etiqueta/encabezado, navegación vía Vue Router
+│   │                         # etiqueta/encabezado, navegación vía Vue Router y
+│   │                         # espera de las secciones que cargan tarde
 │   ├── persistencia.py       # persistencia_worker + helpers transaccionales
-│   ├── workers.py            # selección de modo, scraping por pedido, circuit breaker
+│   ├── workers.py            # selección de modo, scraping por pedido, circuit breaker,
+│   │                         # página nueva cada N pedidos
 │   ├── orquestador.py        # main(): carriles, dead-letter, resumen y CLI
+│   │                         # (incluye re-extracción dirigida con --ids-archivo)
 │   ├── inventario.py         # descarga del catálogo del sistema administrativo
 │   ├── bochica.py            # descarga del reporte del sistema de bodega
 │   ├── cambios_inventario.py # captura diaria de "Cambios de inventario" del admin
@@ -208,12 +229,19 @@ dashboard_pedidos/
 ├── scripts/
 │   ├── hooks/
 │   │   └── pre-commit        # gate: ruff check + format + mypy comun
-│   ├── iniciar_dashboard.bat # arranque del dashboard como tarea de Windows
+│   ├── systemd/              # units del dashboard, del ciclo horario y del monitor
+│   ├── iniciar_dashboard.sh  # arranque del dashboard (dashboard_pedidos.service)
+│   ├── respaldar_db.py       # respaldo diario verificado de las dos bases
+│   ├── respaldar_remoto.py   # copia del respaldo fuera de esta máquina (opcional, por SSH)
+│   ├── monitor_laptop_tailscale.py  # registro de conexión de un equipo remoto al tailnet
+│   ├── notificar_fallo_scheduler.sh # aviso ante fallo del ciclo (requiere sesión gráfica)
+│   ├── notificar_fallo_email.py     # aviso por email (opcional, por SMTP)
+│   ├── *.bat / *.ps1         # versiones Windows — referencia histórica
 │   └── verify_db.py          # utilitario de inspección manual de la DB
 ├── .env                      # Credenciales locales — gitignored
 ├── .env.example              # Plantilla de variables de entorno
 ├── .gitignore
-├── CLAUDE.md                 # Guía de arranque para Claude Code
+├── CLAUDE.md                 # Guía de arranque para Claude Code — no se publica
 ├── pyproject.toml            # empaquetado editable + configuración de ruff y mypy
 ├── pytest.ini                # configuración de pytest y marcadores
 ├── README.md
@@ -236,7 +264,7 @@ dashboard_pedidos/
 | `detalle_diferencias` | Desglose por producto de las diferencias detectadas |
 | `registro_operaciones` | Log de acciones realizadas sobre el pedido: quién hizo qué y cuándo |
 | `registros_pago` | Comprobantes de pago: banco, cuenta receptora, monto, revisor y estado de revisión |
-| `catalogo_productos` | Catálogo de productos del sistema administrativo, por producto y almacén |
+| `catalogo_productos` | Puente (referencia, código de barras) → IDs de producto del catálogo del sistema administrativo (la escribe `inventario/`) |
 | `errores` | Pedidos que fallaron el scraping, disponibles para reintento automático |
 | `meta` | Watermark de la última corrida OK del incremental |
 
@@ -246,9 +274,9 @@ clasificación ABC-XYZ, salud, tiempos de operación, conteos físicos,
 alertas y hallazgos de calidad), todas reconstruidas en cada corrida del
 scheduler salvo las que guardan historia.
 
-En total: **35 tablas y 24 VIEWs** (verificado en vivo el 2026-08-26). El
-dashboard consume las VIEWs como contrato de datos estable, no las tablas
-crudas del scraper.
+En total: **33 tablas y 24 VIEWs** (verificado en vivo el 2026-09-27). El
+dashboard abre la base solo para lectura; las VIEWs son el contrato de datos
+preferido.
 
 ---
 
@@ -312,6 +340,10 @@ python scraper/scraper_principal.py --modo incremental
 # el listado, y no avanza el watermark. Corre el día 1 de cada mes.
 python scraper/scraper_principal.py --modo mantenimiento
 
+# Re-extracción dirigida — exactamente los IDs del archivo (uno por línea), en
+# modo completo, sin recorrer el listado ni mover el watermark
+python scraper/scraper_principal.py --modo completo --ids-archivo ids.txt
+
 # Normalizar montos y crear VIEWs analíticas (como módulo — E-7)
 python -m etl.etl_principal
 
@@ -324,7 +356,7 @@ python -m streamlit run dashboard/app.py
 
 Al finalizar, el scraper imprime un resumen JSON con tiempo total, modo, pedidos procesados,
 errores, tasa de éxito y — en modo incremental — el desglose por carril (activos, reintentos,
-nuevos). Las métricas se miden sobre los resultados del propio run (pedidos persistidos con
+nuevos, re-extracción). Las métricas se miden sobre los resultados del propio run (pedidos persistidos con
 COMMIT exitoso), no sobre el estado acumulado en la DB. Código de salida `0` si la tasa de
 éxito es ≥ 95 %, `1` si es menor.
 
@@ -332,8 +364,8 @@ COMMIT exitoso), no sobre el estado acumulado en la DB. Código de salida `0` si
 
 ## Cómo funciona el modo incremental
 
-El modo incremental evita recorrer todo el historial en cada ejecución mediante tres carriles
-independientes:
+El modo incremental evita recorrer todo el historial en cada ejecución mediante cuatro
+carriles independientes:
 
 - **Activos:** consulta la DB directamente para obtener pedidos con `scraping_completo = 1`
   que tienen al menos un subpedido en estado no cerrado. No abre ninguna página del servidor.
@@ -344,7 +376,11 @@ independientes:
   los IDs ya presentes en la DB y encola únicamente los pedidos nuevos. Un outage del
   scheduler de varios días se recupera solo en la primera corrida exitosa posterior.
 
-Los tres conjuntos se combinan con `dict.fromkeys()` para eliminar duplicados y se procesan
+- **Re-extracción:** una tanda de pedidos del histórico (`SCRAPER_REEXTRACCION_POR_CICLO`)
+  a los que les faltan columnas agregadas después de su captura; se procesan en modo
+  completo forzado en memoria y el carril se apaga solo cuando no queda ninguno.
+
+Los cuatro conjuntos se combinan con `dict.fromkeys()` para eliminar duplicados y se procesan
 en una sola pasada de workers paralelos.
 
 ---
@@ -355,13 +391,13 @@ en una sola pasada de workers paralelos.
 |---|---|
 | Etapa 1 — Scraper (extracción) | ✅ Completa |
 | Etapa 2 — ETL (normalización + VIEWs SQL) | ✅ Completa |
-| Etapa 3 — Dashboard (visualización) | ✅ Construida — 17 páginas |
+| Etapa 3 — Dashboard (visualización) | ✅ Construida — 18 páginas |
 | Módulo de inventario (cruce bodega ↔ sistema + ciclo de conteo) | ✅ Construido |
 | Módulo Arena (inventario por ciudad) | ✅ Construido — alcance ampliado bajo checkpoint de autorización (DEC-118) |
 
 El pipeline corre desatendido cada hora con un timer de systemd (Linux) y la
-suite tiene **1.068 tests** (1.059 passed + 9 e2e que requieren `--e2e`, medido
-2026-09-24), todos marcados `unit`, `integration` o `e2e`.
+suite tiene **1.224 tests** (1.212 passed + 12 e2e que requieren `--e2e`, medido
+2026-09-27), todos marcados `unit`, `integration` o `e2e`.
 
 El dashboard tiene dos propósitos: el trabajo diario del área de inventarios
 —el principal— y la consulta y el análisis general para las demás áreas, que
