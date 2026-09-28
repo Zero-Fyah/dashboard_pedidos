@@ -146,3 +146,30 @@ def test_el_conteo_de_lineas_con_faltante_tampoco_ignora_los_nulos(db):
         "la línea con entregada NULL no se contó como faltante: el fill rate "
         "por línea saldría mejor de lo que es"
     )
+
+
+# ── DEC-160: "entregado sin liquidar" cuenta como despacho ─────────────────
+
+
+@pytest.mark.integration
+def test_entregado_sin_liquidar_cuenta_para_el_fill_rate(db):
+    """DEC-160: la mercancía ya salió (100% pago a crédito, 99% de las líneas
+    completas medido en producción) — solo falta liquidar el saldo, que es
+    un asunto de Cobranza. Antes del fix, estas líneas no entraban a
+    ninguna consulta de despacho: `diario` habría salido vacío."""
+    db.execute(
+        "INSERT INTO subpedidos (id_pedido, numero_subpedido, estado)"
+        " VALUES ('P1', 'S2', 'Entregado sin liquidar')"
+    )
+    db.execute(
+        "INSERT INTO lineas_pedido (id_pedido, numero_subpedido, nombre_producto,"
+        " referencia, codigo_barras, almacen, cantidad_comprada, cantidad_entregada)"
+        " VALUES ('P1', 'S2', 'Prod', 'REF-CREDITO', '770', 'BOD', 10.0, 7.0)"
+    )
+    db.commit()
+
+    diario = ddb.get_despacho_lineas_diario("2026-01-01", "2026-12-31")
+    assert int(diario.iloc[0]["lineas"]) == 1
+
+    faltantes = ddb.get_despacho_faltantes("2026-01-01", "2026-12-31")
+    assert "REF-CREDITO" in set(faltantes["referencia"])

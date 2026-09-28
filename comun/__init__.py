@@ -98,8 +98,15 @@ ESTADOS_PREVIOS_PICKING: tuple[str, ...] = (
 # Un estado presente en DB que no esté aquí indica que el sistema origen
 # agregó o renombró estados: las VIEWs podrían estar excluyéndolo en
 # silencio y hay que actualizar las listas de arriba.
+#
+# DEC-160: "entregado sin liquidar" se suma acá (y a ESTADOS_DESPACHADOS,
+# más abajo) — llevaba desde que existe en el origen marcado como estado
+# "sin clasificar" por el detector de calidad (728 pedidos, `tareas_hallazgos`).
 ESTADOS_CONOCIDOS: frozenset[str] = (
-    ESTADOS_CERRADOS | ESTADOS_FIJAN_CANTIDADES | frozenset(ESTADOS_ACTIVOS_INVENTARIO)
+    ESTADOS_CERRADOS
+    | ESTADOS_FIJAN_CANTIDADES
+    | frozenset(ESTADOS_ACTIVOS_INVENTARIO)
+    | {"entregado sin liquidar"}
 )
 
 # Familias de producto (DEC-041, confirmado por el Arquitecto 2026-07-25).
@@ -168,6 +175,12 @@ MODALIDAD_YUMBO_HUB = "Yumbo (hub)"
 # Arquitecto — el campo del origen es contraintuitivo: 'Fue' = activo,
 # 'No hay' = inactivo para venta directa). Sus `Nombre comercial` dicen
 # literalmente "...unidades".
+#
+# DEC-162: PRA79 («Arena de Tofu Biodegradable», 2,5 kg Lavanda/Café) entró
+# al admin sin lanzar —solo Bogotá, inventario 0, precio 0, inactiva, 0
+# ventas— y sin el sufijo "unidades" en el nombre; el Arquitecto confirmó
+# el 2026-09-28 que se vende como Unidades. Clasificada antes del
+# lanzamiento para que no quede fuera del stock y las alertas de Arena.
 ARENA_REFERENCIAS_UNIDADES: tuple[str, ...] = (
     "PRA13",
     "PRA36",
@@ -176,6 +189,7 @@ ARENA_REFERENCIAS_UNIDADES: tuple[str, ...] = (
     "PRA76",
     "PRA77",
     "PRA78",
+    "PRA79",
 )
 # Pool nacional de tonelada, distribuido por ciudad vía su propia columna
 # `almacen` — no reparte a través de YUMBO TONELADA.
@@ -324,7 +338,18 @@ VENTANA_DEMANDA_D = 90
 # siempre, pero su definición sigue **pendiente del Arquitecto** y pesa:
 # aporta 1.196 de las 4.782 líneas con faltante. Si resulta no ser un
 # despacho, el fill rate por línea sube.
-ESTADOS_DESPACHADOS: frozenset[str] = ESTADOS_CERRADOS - {"cancelado"}
+#
+# DEC-160 (2026-09-28): "entregado sin liquidar" se suma acá. Medido contra
+# la base real: 728 pedidos, **100% forma_pago "Pago a crédito"**, 99,05%
+# de sus 15.527 líneas con cantidad_entregada >= cantidad_comprada — la
+# mercancía salió; lo único abierto es el saldo, un asunto de Cobranza, no
+# de despacho. No entra a `ESTADOS_CERRADOS`: el origen no lo trata como
+# estado terminal (no hay evidencia de que deje de aparecer solo, y el
+# incremental debe seguir viéndolo como activo hasta que el origen lo
+# mueva a "completado" al liquidarse).
+ESTADOS_DESPACHADOS: frozenset[str] = (ESTADOS_CERRADOS - {"cancelado"}) | {
+    "entregado sin liquidar"
+}
 
 
 # Vocabulario de clases de la línea SKU-posición y del conteo (DEC-067).

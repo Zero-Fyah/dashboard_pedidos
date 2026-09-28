@@ -16,6 +16,8 @@ import pytest
 
 from inventario.hallazgos import (
     arena_referencias_no_reconocidas,
+    averia_fuera_de_outlet,
+    codigos_barras_comodin,
     codigos_barras_multiples_ids,
     detectar_todos,
     especificacion_discrepante,
@@ -27,12 +29,13 @@ from inventario.hallazgos import (
     referencias_con_espacios,
     sku_en_bodega_fuera_de_catalogo,
 )
+from inventario.normalizador import tipo_codigo_comodin
 
 pytestmark = pytest.mark.unit
 
 
-def _admin(filas):
-    return pd.DataFrame(
+def _admin(filas, categoria="Juguetes y entretenimiento", producto_activo="Sí"):
+    df = pd.DataFrame(
         filas,
         columns=[
             "id_especificacion",
@@ -42,6 +45,10 @@ def _admin(filas):
             "nombre_comercial",
         ],
     )
+    # DEC-153: el alcance de accesorios mira categoría y vigencia.
+    df["categoria"] = categoria
+    df["producto_activo"] = producto_activo
+    return df
 
 
 @pytest.fixture
@@ -96,6 +103,152 @@ def test_codigo_con_un_solo_id_no_se_detecta():
     assert codigos_barras_multiples_ids(admin).cantidad == 0
 
 
+# DEC-153: solo accesorios en buen estado (vigentes o descontinuados)
+
+
+@pytest.mark.parametrize("categoria", ["Outlet %", "Arena", "Snacks y Alimentos"])
+def test_codigo_compartido_fuera_de_accesorios_no_se_detecta(categoria):
+    admin = _admin(
+        [("E1", "PS01", "7700001", "a", "P"), ("E2", "PS01 L2", "7700001", "b", "P")],
+        categoria=categoria,
+    )
+    assert codigos_barras_multiples_ids(admin).cantidad == 0
+
+
+def test_codigo_compartido_con_su_averia_no_cuenta():
+    """La avería comparte el código del producto sano: no es el error a corregir."""
+    admin = _admin(
+        [("E1", "PJ91", "7700001", "a", "P"), ("E2", "PJ91 Avería 2", "7700001", "a", "P")]
+    )
+    assert codigos_barras_multiples_ids(admin).cantidad == 0
+
+
+def test_codigo_compartido_entre_descontinuados_si_se_detecta():
+    """Decisión del Arquitecto (2026-09-27): los descontinuados cuentan."""
+    admin = _admin(
+        [("E1", "PJ91", "7700001", "a", "P"), ("E2", "PJ91", "7700001", "b", "P")],
+        producto_activo="No",
+    )
+    assert codigos_barras_multiples_ids(admin).cantidad == 1
+
+
+def test_codigo_compartido_entre_accesorios_vigentes_lista_la_categoria():
+    h = codigos_barras_multiples_ids(
+        _admin([("E1", "PB04", "7700001", "a", "P"), ("E2", "PB04", "7700001", "b", "P")])
+    )
+    assert h.cantidad == 1
+    assert set(h.filas["Categoría"]) == {"Juguetes y entretenimiento"}
+
+
+# ─────────────────────────────────────────────
+# DEC-156: códigos de barras comodín
+# ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("codigo", "tipo"),
+    [
+        ("1111111111111", "Un solo dígito repetido"),
+        ("9999999999999", "Un solo dígito repetido"),
+        ("0", "Un solo dígito repetido"),
+        ("1212121212121", "Patrón repetido"),
+        ("1231231231231", "Patrón repetido"),
+        ("1234567890123", "Secuencia"),
+        ("9876543210", "Secuencia"),
+        (" 1111111111111 ", "Un solo dígito repetido"),
+    ],
+)
+def test_codigo_comodin_se_clasifica(codigo, tipo):
+    assert tipo_codigo_comodin(codigo) == tipo
+
+
+@pytest.mark.parametrize(
+    "codigo",
+    ["7700000000001", "6932284301644", "693228434090", "7700001", "", "nan", "ABC123456789"],
+)
+def test_codigo_real_vacio_o_no_numerico_no_es_comodin(codigo):
+    """Un código real (aunque no cumpla GS1) no es comodín; vacío es otro problema."""
+    assert tipo_codigo_comodin(codigo) is None
+
+
+def test_comodin_se_detecta_aunque_lo_use_una_sola_especificacion():
+    h = codigos_barras_comodin(_admin([("E1", "PJ174", "1212121212121", "a", "P")]))
+    assert h.cantidad == 1
+    assert list(h.filas["Tipo de comodín"]) == ["Patrón repetido"]
+
+
+@pytest.mark.parametrize("categoria", ["Outlet %", "Arena", "Snacks y Alimentos"])
+def test_comodin_cubre_todo_el_catalogo(categoria):
+    """Objetivo: que todo producto tenga código propio — sin exclusiones."""
+    admin = _admin([("E1", "PS09 L2", "1313131313131", "a", "P")], categoria=categoria)
+    assert codigos_barras_comodin(admin).cantidad == 1
+
+
+def test_comodin_cuenta_especificaciones_no_codigos():
+    admin = _admin(
+        [
+            ("E1", "PJ207", "1111111111111", "a", "P"),
+            ("E2", "PO005", "1111111111111", "b", "P"),
+            ("E3", "PC26BB", "9999999999999", "c", "P"),
+        ]
+    )
+    assert codigos_barras_comodin(admin).cantidad == 3
+
+
+def test_comodin_compartido_no_se_cuenta_tambien_como_multiples_id():
+    """El mismo problema no aparece en dos tareas."""
+    admin = _admin(
+        [("E1", "PJ207", "1111111111111", "a", "P"), ("E2", "PO005", "1111111111111", "b", "P")]
+    )
+    assert codigos_barras_multiples_ids(admin).cantidad == 0
+    assert codigos_barras_comodin(admin).cantidad == 2
+
+
+# ─────────────────────────────────────────────
+# DEC-153: averías fuera de Outlet %
+# ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "referencia", ["PJ91 AVERIA", "PJ91 averia 2", "PJ91 AVERÍA", "AVERÍA PJ91"]
+)
+def test_averia_en_cualquier_posicion_y_grafia_fuera_de_outlet_se_detecta(referencia):
+    h = averia_fuera_de_outlet(_admin([("E1", referencia, "7700001", "a", "P")]))
+    assert h.cantidad == 1
+    assert list(h.filas["Categoría actual"]) == ["Juguetes y entretenimiento"]
+
+
+def test_averia_ya_en_outlet_no_se_detecta():
+    admin = _admin([("E1", "PJ91 AVERIA", "7700001", "a", "P")], categoria="Outlet %")
+    assert averia_fuera_de_outlet(admin).cantidad == 0
+
+
+def test_averia_de_arena_se_excluye():
+    """El módulo de Arena toma `ARENA AVERIA <ciudad>` por su categoría."""
+    admin = _admin([("E1", "ARENA AVERIA BOGOTA", "7700001", "a", "P")], categoria="Arena")
+    assert averia_fuera_de_outlet(admin).cantidad == 0
+
+
+def test_averia_cuenta_productos_no_especificaciones():
+    admin = _admin(
+        [
+            ("E1", "PJ91 AVERIA", "7700001", "a", "P"),
+            ("E2", "PJ91 AVERIA", "7700002", "b", "P"),
+            ("E3", "PB04 AVERIA", "7700003", "c", "P"),
+        ]
+    )
+    h = averia_fuera_de_outlet(admin)
+    assert h.cantidad == 2
+    assert dict(zip(h.filas["Referencia"], h.filas["Especificaciones"], strict=True)) == {
+        "PB04 AVERIA": 1,
+        "PJ91 AVERIA": 2,
+    }
+
+
+def test_referencia_sin_averia_no_se_detecta():
+    assert averia_fuera_de_outlet(_admin([("E1", "PJ91", "7700001", "a", "P")])).cantidad == 0
+
+
 # ─────────────────────────────────────────────
 # Referencias con espacios
 # ─────────────────────────────────────────────
@@ -148,16 +301,24 @@ def test_producto_ausente_del_catalogo_no_cuenta_como_discrepancia(con):
 
 
 def test_estado_desconocido_se_detecta(con):
-    con.execute("INSERT INTO subpedidos VALUES ('P1','Entregado sin liquidar')")
+    con.execute("INSERT INTO subpedidos VALUES ('P1','Estado Nunca Visto')")
     con.execute("INSERT INTO subpedidos VALUES ('P2','Completado')")
     h = estados_sin_clasificar(con)
     assert h.cantidad == 1
-    assert h.filas.iloc[0]["Estado"] == "Entregado sin liquidar"
+    assert h.filas.iloc[0]["Estado"] == "Estado Nunca Visto"
 
 
 def test_estados_conocidos_no_se_detectan(con):
     for e in ("Completado", "Cancelado", "En inspección"):
         con.execute("INSERT INTO subpedidos VALUES ('P1', ?)", (e,))
+    assert estados_sin_clasificar(con).cantidad == 0
+
+
+def test_entregado_sin_liquidar_ya_no_es_desconocido(con):
+    """DEC-160: llevaba desde siempre en este detector (728 pedidos en
+    producción) — es despacho a crédito sin liquidar, no un estado nuevo
+    del origen."""
+    con.execute("INSERT INTO subpedidos VALUES ('P1','Entregado sin liquidar')")
     assert estados_sin_clasificar(con).cantidad == 0
 
 

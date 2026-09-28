@@ -25,6 +25,7 @@ pytestmark = pytest.mark.unit
     [
         ("PRA13", MODALIDAD_UNIDADES),
         ("PRA78", MODALIDAD_UNIDADES),
+        ("PRA79", MODALIDAD_UNIDADES),  # DEC-162: nueva, confirmada por el Arquitecto
         ("PRA ARENA TONELADA", MODALIDAD_TONELADA),
         ("ARENA TONELADA CORPORATIVO BOGOTA", MODALIDAD_CORPORATIVO),
         ("ARENA TONELADA CORPORATIVO  PEREIRA", MODALIDAD_CORPORATIVO),  # doble espacio real
