@@ -2,17 +2,14 @@
 # notificar_fallo_scheduler.sh — aviso best-effort de un ciclo del scheduler
 # con al menos un paso fallido (deuda "notificación de fallo" de CLAUDE.md).
 #
-# Equivalente Linux de scripts/notificar_fallo_scheduler.ps1 (que usaba
-# System.Windows.Forms.NotifyIcon, Windows-only). Acá el mecanismo nativo es
-# notify-send (libnotify) contra el bus de sesión D-Bus del usuario.
+# Mecanismo: notify-send (libnotify) contra el bus de sesión D-Bus del
+# usuario.
 #
-# Mismo riesgo conocido que en Windows, sin verificar en vivo (ver
-# docs/decisions.md DEC-120): si el servicio systemd que llama a este script
-# corre sin una sesión gráfica de usuario activa (D-Bus de sesión), la
-# notificación puede no mostrarse nunca, en silencio — es el mismo punto
-# ciego que tenían con LogonType=Password en Windows, no uno nuevo.
-# Confirmar visualmente tras el primer fallo real; si no aparece, la
-# alternativa ya prevista es email por SMTP.
+# CONFIRMADO ROTO (DEC-120): el servicio systemd que llama a este script
+# corre sin sesión gráfica de usuario activa (sin D-Bus de sesión), así
+# que la notificación nunca se muestra — falló las 4 veces que se disparó
+# en producción. La alternativa prevista es email por SMTP; pendiente de
+# decisión del Arquitecto.
 set -uo pipefail
 
 LOGFILE="${1:?uso: notificar_fallo_scheduler.sh <ruta-al-log>}"

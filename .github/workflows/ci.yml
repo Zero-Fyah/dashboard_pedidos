@@ -1,6 +1,7 @@
 # CI del proyecto (DEC-018). Espejo del gate pre-commit (DEC-016) + suite
-# completa en ambos SO + escaneo de secretos. El gate local es opcional por
-# clon (core.hooksPath); este workflow es el gate obligatorio.
+# completa + escaneo de secretos, sobre ubuntu-latest — el mismo SO que
+# producción desde la migración a Linux (DEC-125). El gate local es
+# opcional por clon (core.hooksPath); este workflow es el gate obligatorio.
 name: CI
 
 on:
@@ -27,12 +28,7 @@ jobs:
         run: mypy comun/
 
   tests:
-    strategy:
-      matrix:
-        # windows-latest: paridad con el entorno de producción (scheduler);
-        # ubuntu-latest: canario de portabilidad de rutas y asyncio.
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

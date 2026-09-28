@@ -167,10 +167,12 @@ if tab_pago.open:
 
             st.caption(
                 f"Cubre **{formato_miles(len(ep))} pedidos del periodo**: la tarjeta existe "
-                "en el origen desde el **2026-07-16** y se verificó que no se renderiza para "
-                "pedidos anteriores. Sustituye a la derivación `total − pagado`, que sobre "
-                "los mismos pedidos marcaba impagos a 6 que el origen da por pagados. "
-                "**No sirve para el saldo a favor**: `Saldo pendiente` nunca es negativo."
+                "en el origen desde el **2026-02-05** (antes no se renderiza; en 2026-02-05..28 "
+                "la cobertura fue parcial —83%, 3.078 de 3.702— por una falla de captura ya "
+                "reparada, DEC-149/152; desde marzo, 100%). Sustituye a la derivación "
+                "`total − pagado`, que sobre los mismos pedidos marcaba impagos a 6 que el "
+                "origen da por pagados. **No sirve para el saldo a favor**: `Saldo pendiente` "
+                "nunca es negativo."
             )
             st.divider()
 
@@ -951,9 +953,10 @@ if tab_cancel.open:
                     "en contra entrega el cobro se registra fuera de este campo (figura al 8,4% "
                     "pagado, DEC-084). Incluirlos llenaría la lista de falsos positivos. "
                     f"El saldo sale **del origen en {formato_miles(n_origen)} de "
-                    f"{formato_miles(len(impagos))}** pedidos (DEC-089); en el resto —anteriores "
-                    "al 2026-07-16, donde la tarjeta no existe— se deriva de `total − pagado`, "
-                    "que marca impagos a algunos que ya pagaron."
+                    f"{formato_miles(len(impagos))}** pedidos (DEC-089); en el resto —sin "
+                    "tarjeta, casi todos anteriores al 2026-02-05, donde el origen no la "
+                    "renderiza (DEC-149)— se deriva de `total − pagado`, que marca impagos a "
+                    "algunos que ya pagaron."
                 )
 
             st.caption(

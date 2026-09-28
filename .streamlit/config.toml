@@ -41,7 +41,7 @@ fastReruns = true
 #
 # Esto revierte a propósito la comodidad que había antes ("full"). El error
 # NO se pierde: sigue yendo a stderr y de ahí a logs/dashboard_YYYY-MM-DD.log
-# por la redirección de scripts/iniciar_dashboard.bat.
+# por la redirección de scripts/iniciar_dashboard.sh.
 #
 # Valores de Streamlit 1.59: full | stacktrace | type | none.
 # Volver a "full" solo mientras se depura, y con el dashboard fuera de la malla.

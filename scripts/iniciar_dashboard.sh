@@ -1,22 +1,18 @@
 #!/bin/bash
 # ============================================================================
-# Arranque del dashboard como servicio de Linux (DEC-105).
+# Arranque del dashboard como servicio (DEC-105/125).
 #
-# Equivalente Linux de scripts/iniciar_dashboard.bat (Windows Task Scheduler).
-# Migración de entorno Windows → Linux Mint: este script lo invoca la unidad
-# systemd dashboard_pedidos.service (Restart=always), que reemplaza a la
-# tarea "Al iniciar el equipo, ejecutar tanto si el usuario inició sesión
-# como si no" de Windows. No requiere privilegios: escucha en 8501, que no
-# es un puerto privilegiado.
+# Lo invoca la unidad systemd dashboard_pedidos.service (Restart=always),
+# que arranca con el equipo. No requiere privilegios: escucha en 8501, que
+# no es un puerto privilegiado.
 # ============================================================================
 set -uo pipefail
 
 # Raíz del proyecto (un nivel arriba de scripts/)
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-# DEC-015: clavado al python del venv (3.12), por la misma razón que en
-# Windows — no depender de un launcher global que pueda apuntar a otra
-# versión o tener otro streamlit instalado.
+# DEC-015: clavado al python del venv (3.12) — no depender de un launcher
+# global que pueda apuntar a otra versión o tener otro streamlit instalado.
 PYEXE=".venv/bin/python"
 
 # Rotación diaria, mismo criterio que DEC-028: un archivo único sin límite

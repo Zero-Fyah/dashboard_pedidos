@@ -23,13 +23,14 @@ logger = logging.getLogger("conteos_io")
 CARPETA_CONTEOS = Path(__file__).parent.parent / "data" / "conteos"
 CARPETA_ANULADOS = CARPETA_CONTEOS / "anulados"
 
-# Respaldo a disco externo (deuda cerrada, ver docs/decisions.md): antes de
-# esto, data/conteos/ no tenía ninguna copia fuera de este equipo. Es el
-# mismo disco USB dedicado a respaldo (EJPC-RESPALDO) que en Windows se veía
-# como E:; en Linux Mint el gestor de discos (udisks2) lo monta por etiqueta
-# en /media/<usuario>/EJPC-RESPALDO — aun así la copia es best-effort: si no
-# está montado no debe romper la subida, que ya dejó el archivo a salvo en
-# CARPETA_CONTEOS (DEC-058).
+# Respaldo a disco externo dedicado (EJPC-RESPALDO, montado por udisks2 en
+# /media/<usuario>/EJPC-RESPALDO): antes de esto, data/conteos/ no tenía
+# ninguna copia fuera de este equipo. Best-effort a propósito: si el disco
+# no está disponible, no debe romper la subida, que ya dejó el archivo a
+# salvo en CARPETA_CONTEOS (DEC-058). **El disco se dañó físicamente y no
+# hay reemplazo todavía (2026-09-28)** — sin conteos reales aún, no protege
+# nada en la práctica, pero cuando lo reemplacen esto vuelve a funcionar
+# solo, sin tocar código.
 CARPETA_RESPALDO = (
     Path("/media") / Path.home().name / "EJPC-RESPALDO" / "dashboard_pedidos_respaldo" / "conteos"
 )

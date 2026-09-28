@@ -3,8 +3,7 @@
 construir_resumen() calcula las métricas a partir de los resultados del
 propio run (sets "ok"/"error" poblados por persistencia_worker), no del
 estado acumulado en DB. La tasa decide el exit code del scraper, así que
-estos tests protegen la veracidad de la señal hacia systemd (DEC-125; antes,
-el Task Scheduler de Windows).
+estos tests protegen la veracidad de la señal hacia systemd (DEC-125).
 """
 
 import pytest

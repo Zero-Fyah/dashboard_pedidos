@@ -1,5 +1,4 @@
-# Unidad systemd — dashboard siempre activo (equivalente Linux de la tarea
-# de Windows Task Scheduler "Al iniciar el equipo", DEC-105).
+# Unidad systemd — dashboard siempre activo, arranca con el equipo (DEC-105/125).
 #
 # Instalar (requiere sudo):
 #   sudo cp scripts/systemd/dashboard_pedidos.service /etc/systemd/system/
