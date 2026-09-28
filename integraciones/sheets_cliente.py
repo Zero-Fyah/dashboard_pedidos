@@ -22,6 +22,7 @@ from pathlib import Path
 import gspread
 import pandas as pd
 from dotenv import load_dotenv
+from gspread.utils import rowcol_to_a1
 
 from integraciones.sheets_arena import (
     inventario_disponible_arena,
@@ -51,6 +52,8 @@ def escribir_hoja(gc: gspread.Client, id_hoja: str, df: pd.DataFrame) -> int:
     Fila 1: marca de tiempo de captura (hora Colombia). Fila 2: encabezados
     (nombres de columna de `df`). Desde la fila 3: los datos. NaN se
     convierte a cadena vacía — la API de Sheets no acepta `NaN` como valor.
+    Lo que sobre de la escritura anterior (filas o columnas) se limpia
+    después de escribir, nunca antes.
 
     Args:
         gc: Cliente ya autenticado (`_cliente()`).
@@ -62,11 +65,24 @@ def escribir_hoja(gc: gspread.Client, id_hoja: str, df: pd.DataFrame) -> int:
         Cantidad de filas de datos escritas (sin contar timestamp/encabezado).
     """
     hoja = gc.open_by_key(id_hoja).sheet1
-    hoja.clear()
     marca = [f"Actualizado: {_hoy_colombia_str()} (hora Colombia, UTC-5)"]
     encabezado = df.columns.tolist()
     datos = df.where(df.notna(), "").values.tolist()
-    hoja.update([marca, encabezado, *datos], value_input_option="USER_ENTERED")
+    valores = [marca, encabezado, *datos]
+    # Auditoría 2026-09-25: se escribe PRIMERO y después se limpia solo lo
+    # que sobra de la foto anterior. Antes era clear() + update(): si la
+    # escritura fallaba (la semana del 2026-09-19 hubo un corte de conexión
+    # con Google), la hoja quedaba vacía hasta el ciclo siguiente. Ahora un
+    # fallo deja la foto anterior, que declara su propia hora en la fila 1.
+    hoja.update(valores, "A1", value_input_option="USER_ENTERED")
+    filas, columnas = len(valores), max(len(encabezado), 1)
+    sobrantes = []
+    if hoja.row_count > filas:
+        sobrantes.append(f"A{filas + 1}:{rowcol_to_a1(hoja.row_count, hoja.col_count)}")
+    if hoja.col_count > columnas:
+        sobrantes.append(f"{rowcol_to_a1(1, columnas + 1)}:{rowcol_to_a1(filas, hoja.col_count)}")
+    if sobrantes:
+        hoja.batch_clear(sobrantes)
     return len(datos)
 
 
