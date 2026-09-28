@@ -1,7 +1,6 @@
-# Unidad systemd — ciclo horario del scraper/ETL (equivalente Linux de la
-# tarea de Windows Task Scheduler que corría scraper/actualizar_pedidos.bat,
-# DEC-092/105/124). Disparada por dashboard_pedidos_ciclo.timer, no por sí
-# sola.
+# Unidad systemd — ciclo horario del scraper/ETL (DEC-092/125): ejecuta
+# scraper/actualizar_pedidos.sh. Disparada por dashboard_pedidos_ciclo.timer,
+# no por sí sola.
 #
 # Instalar junto con el timer (requiere sudo):
 #   sudo cp scripts/systemd/dashboard_pedidos_ciclo.service /etc/systemd/system/
@@ -30,7 +29,7 @@ User=zero_fyah
 WorkingDirectory=/home/zero_fyah/Escritorio/Documents/dashboard_pedidos
 ExecStart=/home/zero_fyah/Escritorio/Documents/dashboard_pedidos/scraper/actualizar_pedidos.sh
 # Sin límite de tiempo: el día 1 (pasada de mantenimiento, DEC-092) el
-# ciclo dura ~60 min en vez de ~45 — igual que en Windows, no se corta.
+# ciclo dura ~60 min en vez de los 24-27 habituales (DEC-150) — no se corta.
 TimeoutStartSec=infinity
 
 # Auditoría de memoria 2026-09-14: el ciclo (6 Chromium concurrentes,
@@ -39,4 +38,6 @@ TimeoutStartSec=infinity
 # esto, el kernel elige la víctima por heurística propia — con esto, el
 # ciclo de producción queda protegido: el kernel preferirá matar algo
 # menos negativo (-1000..1000, más negativo = más protegido) antes.
+# Desde DEC-148/150 (2026-09-27) el pico del ciclo es ~1,4 GB (5 workers,
+# página nueva cada 10 pedidos, V8 optimizado para tamaño).
 OOMScoreAdjust=-500
