@@ -105,20 +105,32 @@ def _norm_especificacion(valor: object) -> str:
 
 
 def codigos_barras_multiples_ids(df_admin: pd.DataFrame) -> Hallazgo:
-    """Códigos de barras que identifican más de un producto en el catálogo.
+    """Códigos de barras que identifican más de un accesorio en el catálogo.
 
     Es la inconsistencia que impide usar el código de barras como llave de
-    producto (DEC-045): un mismo código puede colgar de decenas de
-    referencias cuando el artículo se vende bajo varias modalidades.
+    producto (DEC-045) — y en bodega, que el escáner distinga variantes que
+    son artículos físicamente distintos (diseño, color, talla).
+
+    DEC-153: acotado a los **accesorios en buen estado**, vigentes o
+    descontinuados (`normalizador.accesorios_buen_estado`). Arena y alimentos
+    comparten código a propósito entre modalidades del mismo producto, y una
+    avería o un outlet comparten el del producto sano: nada de eso es el
+    error que hay que corregir. El código se cuenta como compartido solo
+    entre especificaciones que están dentro del alcance.
     """
-    df = df_admin.copy()
+    from inventario.normalizador import accesorios_buen_estado, tipo_codigo_comodin
+
+    df = accesorios_buen_estado(df_admin).copy()
     df["codigo_barras"] = df["codigo_barras"].astype(str).str.strip()
+    # DEC-156: los comodines tienen su propio detector — contarlos también acá
+    # duplicaría el mismo problema en dos tareas.
+    df = df[df["codigo_barras"].map(tipo_codigo_comodin).isna()]
     por_codigo = df.groupby("codigo_barras")["id_especificacion"].nunique()
     afectados = por_codigo[por_codigo > 1].index
 
     filas = (
         df[df["codigo_barras"].isin(afectados)][
-            ["codigo_barras", "id_especificacion", "referencia", "nombre_comercial"]
+            ["codigo_barras", "id_especificacion", "referencia", "nombre_comercial", "categoria"]
         ]
         .drop_duplicates()
         .sort_values(["codigo_barras", "referencia"])
@@ -128,6 +140,7 @@ def codigos_barras_multiples_ids(df_admin: pd.DataFrame) -> Hallazgo:
                 "id_especificacion": "ID de especificación",
                 "referencia": "Referencia",
                 "nombre_comercial": "Nombre comercial",
+                "categoria": "Categoría",
             }
         )
     )
@@ -135,15 +148,133 @@ def codigos_barras_multiples_ids(df_admin: pd.DataFrame) -> Hallazgo:
         clave="codigos_barras_multiples_ids",
         titulo="Códigos de barras asociados a múltiples ID",
         explicacion=(
-            "Un mismo código de barras identifica más de un producto en el catálogo. "
-            "Mientras exista, el código no sirve como llave para relacionar el "
-            "producto con los pedidos, y hay que apoyarse en la referencia."
+            "Un mismo código de barras identifica más de un accesorio en buen estado. "
+            "Mientras exista, el escáner no distingue las "
+            "variantes en bodega y el código no sirve como llave para relacionar el "
+            "producto con los pedidos. No incluye Outlet %, Arena, Snacks y Alimentos "
+            "ni averías; sí incluye productos descontinuados. Los códigos de relleno "
+            "(1111…, 9999…) van en su propia tarea."
         ),
         categoria="Códigos y referencias",
         prioridad="Alta",
-        origen="DEC-045",
+        origen="DEC-045 / DEC-153",
         unidad="códigos",
         cantidad=len(afectados),  # códigos afectados, no filas de detalle
+        filas=filas,
+    )
+
+
+def codigos_barras_comodin(df_admin: pd.DataFrame) -> Hallazgo:
+    """Especificaciones con un código de barras de relleno (DEC-156).
+
+    `1111111111111`, `9999999999999`, `0`… no identifican a nadie: aunque hoy
+    los use una sola especificación, el día que otra reciba el mismo relleno
+    el código deja de ser llave. El objetivo del Arquitecto es que **todo**
+    producto tenga código propio, así que el alcance es el catálogo completo
+    (todas las categorías, averías y descontinuados incluidos) y la unidad es
+    la especificación: cada una necesita su código.
+    """
+    from inventario.normalizador import tipo_codigo_comodin
+
+    df = df_admin.copy()
+    df["codigo_barras"] = df["codigo_barras"].astype(str).str.strip()
+    df["tipo"] = df["codigo_barras"].map(tipo_codigo_comodin)
+    df = df[df["tipo"].notna()]
+    filas = (
+        df[
+            [
+                "codigo_barras",
+                "tipo",
+                "id_especificacion",
+                "referencia",
+                "nombre_comercial",
+                "especificacion",
+                "categoria",
+            ]
+        ]
+        .drop_duplicates(subset=["codigo_barras", "id_especificacion"])
+        .sort_values(["codigo_barras", "referencia", "especificacion"])
+        .rename(
+            columns={
+                "codigo_barras": "Código de barras",
+                "tipo": "Tipo de comodín",
+                "id_especificacion": "ID de especificación",
+                "referencia": "Referencia",
+                "nombre_comercial": "Nombre comercial",
+                "especificacion": "Especificación",
+                "categoria": "Categoría",
+            }
+        )
+    )
+    return Hallazgo(
+        clave="codigos_barras_comodin",
+        titulo="Códigos de barras de relleno (comodín)",
+        explicacion=(
+            "Estos productos tienen un código de barras de relleno (1111111111111, "
+            "9999999999999, 0…), no uno real. No sirve para escanear ni para "
+            "relacionar el producto con los pedidos, aunque hoy lo use una sola "
+            "variante. Hay que asignarle a cada especificación su código propio en "
+            "el sistema administrativo."
+        ),
+        categoria="Códigos y referencias",
+        prioridad="Alta",
+        origen="DEC-156",
+        unidad="especificaciones",
+        cantidad=filas["ID de especificación"].nunique(),
+        filas=filas,
+    )
+
+
+def averia_fuera_de_outlet(df_admin: pd.DataFrame) -> Hallazgo:
+    """Productos con «AVERIA»/«AVERÍA» en la referencia que no están en la
+    categoría `Outlet %` (DEC-153, regla del Arquitecto): deben pasar a ella.
+
+    **Se excluye `Arena`:** `ARENA AVERIA <ciudad>` son modalidades que el
+    módulo de Arena toma por categoría (DEC-118/143); moverlas a Outlet las
+    sacaría de ese módulo en silencio. Un producto cuenta una vez aunque
+    tenga varias especificaciones.
+    """
+    from inventario.normalizador import (
+        CATEGORIA_AVERIA,
+        CATEGORIA_RECIBIDA_POR_PESO,
+        referencia_contiene_averia,
+    )
+
+    df = df_admin[
+        referencia_contiene_averia(df_admin["referencia"])
+        & ~df_admin["categoria"].isin({CATEGORIA_AVERIA, CATEGORIA_RECIBIDA_POR_PESO})
+    ]
+    filas = (
+        df.groupby("referencia", as_index=False)
+        .agg(
+            nombre=("nombre_comercial", "first"),
+            categoria=("categoria", lambda s: ", ".join(sorted(set(map(str, s))))),
+            especificaciones=("id_especificacion", "nunique"),
+        )
+        .sort_values("referencia")
+        .rename(
+            columns={
+                "referencia": "Referencia",
+                "nombre": "Nombre comercial",
+                "categoria": "Categoría actual",
+                "especificaciones": "Especificaciones",
+            }
+        )
+    )
+    return Hallazgo(
+        clave="averia_fuera_de_outlet",
+        titulo="Averías fuera de la categoría Outlet %",
+        explicacion=(
+            "La referencia dice AVERIA/AVERÍA pero el producto no está en Outlet %: "
+            "se ofrece y se cuenta como mercancía en buen estado. Hay que pasarlo a "
+            "Outlet % en el sistema administrativo. (Las averías de Arena se "
+            "excluyen: el módulo de Arena las toma por su categoría.)"
+        ),
+        categoria="Códigos y referencias",
+        prioridad="Alta",
+        origen="DEC-153",
+        unidad="productos",
+        cantidad=len(filas),
         filas=filas,
     )
 
@@ -1085,6 +1216,8 @@ def detectar_todos(df_admin: pd.DataFrame, con: sqlite3.Connection) -> list[Hall
     """
     detectores = [
         lambda: codigos_barras_multiples_ids(df_admin),
+        lambda: averia_fuera_de_outlet(df_admin),
+        lambda: codigos_barras_comodin(df_admin),
         lambda: referencias_con_espacios(df_admin),
         lambda: especificacion_discrepante(df_admin, con),
         lambda: estados_sin_clasificar(con),

@@ -12,6 +12,7 @@ acá está el recorte de alcance del lado del catálogo administrativo.
 """
 
 import logging
+import unicodedata
 from pathlib import Path
 
 import pandas as pd
@@ -49,6 +50,7 @@ ALMACEN_BODEGA = "Bogotá"
 # categoría.
 CATEGORIA_AVERIA = "Outlet %"
 _PATRON_AVERIA = r"\sAVER[ÍI]A$"
+CATEGORIA_ALIMENTOS = "Snacks y Alimentos"
 
 # Los valores crudos de `producto_activo` en el export del admin (DEC-065).
 # Vocabulario del sistema origen, así que vive acá; las etiquetas que se
@@ -287,6 +289,64 @@ def marcar_averias(df_admin: pd.DataFrame) -> pd.Series:
             CATEGORIA_AVERIA,
         )
     return por_categoria | por_referencia
+
+
+def tipo_codigo_comodin(codigo: object) -> str | None:
+    """Clasifica un código de barras de relleno («comodín»), o None si no lo es
+    (DEC-156, pedido del Arquitecto del 2026-09-28).
+
+    Solo patrones inequívocos: un dígito repetido (`0`, `1111`,
+    `1111111111111`, `9999999999999`), un patrón periódico de 2-3 dígitos
+    (`1212121212121`) o una secuencia (`123456…`). Ni la longitud (los únicos
+    cortos del catálogo, `0` y `1111`, ya caen como dígito repetido) ni el
+    dígito verificador GS1 sirven: medido el 2026-09-28, el 32% de los
+    códigos del catálogo no lo cumple (códigos internos de la empresa), así
+    que marcaría como falsos códigos que no lo son. Un código vacío no es un
+    comodín: es otro problema.
+    """
+    c = str(codigo).strip()
+    if c in ("", "nan", "None") or not c.isdigit():
+        return None
+    if len(set(c)) == 1:
+        return "Un solo dígito repetido"
+    for periodo in (2, 3):
+        if len(c) >= 2 * periodo and c == (c[:periodo] * len(c))[: len(c)]:
+            return "Patrón repetido"
+    if len(c) >= 6 and (c in "01234567890123456789" or c in "98765432109876543210"):
+        return "Secuencia"
+    return None
+
+
+def referencia_contiene_averia(referencias: pd.Series) -> pd.Series:
+    """True si la referencia CONTIENE «AVERIA»/«AVERÍA», en cualquier posición
+    y sin importar mayúsculas (DEC-153, regla del Arquitecto).
+
+    Más amplia que `_PATRON_AVERIA` (que exige el sufijo y usa
+    `marcar_averias()` para el cruce bodega-sistema de DEC-041, que no se
+    toca): medido el 2026-09-27, 1.523 filas del catálogo contienen la
+    palabra y 566 terminan en ella.
+    """
+    return referencias.map(
+        lambda r: (
+            "AVERIA"
+            in unicodedata.normalize("NFKD", str(r)).encode("ascii", "ignore").decode().upper()
+        )
+    )
+
+
+def accesorios_buen_estado(df_admin: pd.DataFrame) -> pd.DataFrame:
+    """Filas del catálogo que son accesorios en buen estado (DEC-153,
+    definición del Arquitecto del 2026-09-27).
+
+    Quedan fuera `Outlet %` y avería por referencia (no están en buen
+    estado) y `Arena` y `Snacks y Alimentos` (no son accesorios: comparten
+    código a propósito entre modalidades del mismo producto). Los
+    descontinuados **sí cuentan**, por decisión del Arquitecto.
+    """
+    fuera = {CATEGORIA_AVERIA, CATEGORIA_RECIBIDA_POR_PESO, CATEGORIA_ALIMENTOS}
+    return df_admin[
+        ~df_admin["categoria"].isin(fuera) & ~referencia_contiene_averia(df_admin["referencia"])
+    ]
 
 
 def clasificar_vigencia(valores: pd.Series) -> pd.Series:
