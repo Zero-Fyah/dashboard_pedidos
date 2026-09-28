@@ -1,7 +1,41 @@
+import logging
+from logging.handlers import TimedRotatingFileHandler
+
 import pytest
 import pytest_asyncio
 
+from scraper.config import CONFIG
 from scraper.scraper_principal import init_db
+
+
+# Auditoría 2026-09-25: la suite escribía en las salidas de PRODUCCIÓN —
+# `logs/scraper.log` (cientos de ERROR falsos por corrida: `db_error`,
+# `worker_excepcion_no_controlada`… con IDs `TEST-`/`SUB-001`, que
+# contaminaban la telemetría) y `data/debug/`, donde cada archivo de un test
+# desplazaba de la rotación (tope de 50) un HTML real de diagnóstico.
+# Se redirigen a un directorio temporal para toda la sesión. El reemplazo
+# es otro TimedRotatingFileHandler para que el guard N-4 (un solo handler
+# de ese tipo, `test_logger_tiene_un_solo_handler`) siga midiendo lo mismo.
+@pytest.fixture(autouse=True, scope="session")
+def _aislar_salidas_del_scraper(tmp_path_factory):
+    salidas = tmp_path_factory.mktemp("salidas_scraper")
+    logger = logging.getLogger("scraper.config")
+    originales = [h for h in logger.handlers if type(h) is TimedRotatingFileHandler]
+    for h in originales:
+        logger.removeHandler(h)
+    aislado = TimedRotatingFileHandler(salidas / "scraper.log", when="midnight", encoding="utf-8")
+    aislado.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(aislado)
+    mp = pytest.MonkeyPatch()
+    mp.setitem(CONFIG, "LOG_FILE", str(salidas / "scraper.log"))
+    mp.setitem(CONFIG, "ERRORS_DIR", str(salidas / "errors"))
+    mp.setitem(CONFIG, "DEBUG_DIR", str(salidas / "debug"))
+    yield salidas
+    mp.undo()
+    logger.removeHandler(aislado)
+    aislado.close()
+    for h in originales:
+        logger.addHandler(h)
 
 
 @pytest_asyncio.fixture
