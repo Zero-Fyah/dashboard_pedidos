@@ -217,6 +217,7 @@ async def test_estadisticas_sin_card_retorna_no_verificado():
 async def test_estadisticas_mapea_filas_y_hay_diferencia():
     crudo = {
         "hay_diferencia": True,
+        "encabezados": list(sp._ENCABEZADOS_ESTADISTICAS),
         "filas": [
             {
                 "concepto": "Total precio original",
@@ -245,7 +246,7 @@ async def test_estadisticas_mapea_filas_y_hay_diferencia():
 
 @pytest.mark.unit
 async def test_estadisticas_card_presente_sin_diferencia():
-    crudo = {"hay_diferencia": False, "filas": []}
+    crudo = {"hay_diferencia": False, "filas": [], "encabezados": []}
     filas, hay_dif = await extraer_estadisticas_monto(_FakePage(crudo), "TEST-8")
     assert hay_dif is False
     assert filas == []
@@ -297,9 +298,25 @@ class _FakePageSubpedidos(_FakePage):
         return []  # sin iconos pendientes de expandir en este fake
 
 
+# Encabezados verificados en vivo el 2026-09-25 (el primero es la columna
+# de expansión).
+_ENCABEZADOS_SUBPEDIDO_REALES = [
+    "",
+    "Número de subpedido",
+    "Categoría",
+    "Estado",
+    "Inicio de alistamiento",
+    "Alistamiento completado",
+    "Alistador",
+    "Inicio de inspección",
+    "Inspección completada",
+    "Inspector",
+]
+
 _CRUDO_SUBPEDIDO_SIMPLE = [
     {
         "raw_child_order_id": "Arena + 176319",
+        "encabezados_subpedido": _ENCABEZADOS_SUBPEDIDO_REALES,
         "estado": "Completado",
         "inicio_alistamiento": "2026-07-16 11:02:43",
         "alistamiento_completado": "2026-07-16 15:42:47",
@@ -500,9 +517,15 @@ class _FakeCardDD:
 
 
 class _FakePageDD:
-    def __init__(self, card, bulk):
+    def __init__(self, card, bulk, encabezados=None):
         self._card = card
-        self._bulk = bulk
+        # El JS devuelve {encabezados, filas} desde la auditoría 2026-09-25.
+        self._bulk = {
+            "encabezados": list(
+                sp._ENCABEZADOS_DETALLE_DIF if encabezados is None else encabezados
+            ),
+            "filas": bulk,
+        }
 
     async def query_selector(self, sel: str):
         assert sel == ".diff-items-card"
@@ -638,3 +661,114 @@ async def test_subpedidos_sin_columna_obligatoria_falla_en_vez_de_persistir():
     sin_info = [h for h in _ENCABEZADOS_15 if h != "Información de productos"]
     with pytest.raises(ValueError, match="obligatorias"):
         await extraer_subpedidos(_FakePageSubpedidos(_crudo_con_encabezados(sin_info)))
+
+
+# ── Auditoría 2026-09-25: fila del subpedido por encabezado ─────────────────
+
+
+@pytest.mark.unit
+def test_encabezados_subpedido_reales_validan_sin_warning(monkeypatch):
+    eventos = []
+    monkeypatch.setattr(sp, "log_event", lambda evento, **kw: eventos.append(evento))
+    assert sp._validar_encabezados_subpedido(_ENCABEZADOS_SUBPEDIDO_REALES) == []
+    assert eventos == []
+
+
+@pytest.mark.unit
+def test_encabezado_nuevo_de_subpedido_emite_warning(monkeypatch):
+    eventos = []
+    monkeypatch.setattr(sp, "log_event", lambda evento, **kw: eventos.append((evento, kw)))
+    nuevos = sp._validar_encabezados_subpedido(_ENCABEZADOS_SUBPEDIDO_REALES + ["Bodega"])
+    assert nuevos == ["Bodega"]
+    assert eventos[0][0] == "subpedidos_columna_desconocida"
+    assert eventos[0][1]["level"] == "WARNING"
+
+
+@pytest.mark.unit
+def test_sin_columna_estado_falla_fuerte():
+    sin_estado = [h for h in _ENCABEZADOS_SUBPEDIDO_REALES if h != "Estado"]
+    with pytest.raises(ValueError, match="estado"):
+        sp._validar_encabezados_subpedido(sin_estado)
+
+
+@pytest.mark.unit
+async def test_subpedidos_sin_encabezado_de_estado_falla_en_vez_de_guardar_vacio():
+    crudo = [dict(_CRUDO_SUBPEDIDO_SIMPLE[0], encabezados_subpedido=[], estado="")]
+    with pytest.raises(ValueError, match="obligatorias"):
+        await extraer_subpedidos(_FakePageSubpedidos(crudo))
+
+
+@pytest.mark.unit
+async def test_estados_subpedidos_mapea_numero_y_estado():
+    crudo = [
+        _CRUDO_SUBPEDIDO_SIMPLE[0],
+        dict(
+            _CRUDO_SUBPEDIDO_SIMPLE[0], raw_child_order_id="Accesorios + 176320", estado="Cancelado"
+        ),
+    ]
+    res = await sp.extraer_estados_subpedidos(_FakePage(crudo))
+    assert res == [
+        {"numero_subpedido": "176319", "estado": "Completado"},
+        {"numero_subpedido": "176320", "estado": "Cancelado"},
+    ]
+
+
+@pytest.mark.unit
+async def test_estados_subpedidos_pasa_los_dos_mapas_al_js():
+    capturado = {}
+
+    class _Captura(_FakePage):
+        async def evaluate(self, js, arg=None):
+            capturado["arg"] = arg
+            return []
+
+    assert await sp.extraer_estados_subpedidos(_Captura([])) == []
+    assert capturado["arg"]["columnasSubpedido"] is sp._COLUMNAS_SUBPEDIDO
+    assert capturado["arg"]["columnas"] is sp._COLUMNAS_LINEA
+
+
+# ── Auditoría 2026-09-25: encabezados exactos en estadísticas y detalle ─────
+
+
+@pytest.mark.unit
+async def test_detalle_dif_con_columna_nueva_no_captura_y_avisa(monkeypatch):
+    eventos = []
+    monkeypatch.setattr(sp, "log_event", lambda evento, **kw: eventos.append((evento, kw)))
+    celda_dto = _FakeCeldaDescuentoDD(spans=[_FakeSpanDD("-")], tags=[], texto="-")
+    card = _FakeCardDD([_FakeFilaDD(celda_dto)])
+    encabezados = list(sp._ENCABEZADOS_DETALLE_DIF)
+    encabezados.insert(4, "Bodega")  # corre «Descuento» y todo lo que sigue
+    page = _FakePageDD(card, [_FILA_BULK_DD], encabezados=encabezados)
+
+    assert await extraer_detalle_diferencias(page, "TEST-15") == []
+    assert eventos[0][0] == "detalle_dif_encabezados_cambiaron"
+    assert eventos[0][1]["level"] == "WARNING"
+
+
+@pytest.mark.unit
+async def test_estadisticas_con_columna_nueva_no_captura_pero_conserva_el_tag(monkeypatch):
+    eventos = []
+    monkeypatch.setattr(sp, "log_event", lambda evento, **kw: eventos.append(evento))
+    crudo = {
+        "hay_diferencia": True,
+        "encabezados": [
+            "Concepto",
+            "Bodega",
+            "Monto a pagar del pedido",
+            "Monto final a pagar",
+            "Diferencia",
+        ],
+        "filas": [
+            {
+                "concepto": "Total",
+                "concepto_tag": "",
+                "monto_pagar": "Bogotá",
+                "monto_final": "COP 1",
+                "diferencia": "COP 1",
+            }
+        ],
+    }
+    filas, hay_dif = await extraer_estadisticas_monto(_FakePage(crudo), "TEST-16")
+    assert filas == []
+    assert hay_dif is True
+    assert eventos == ["estadisticas_encabezados_cambiaron"]

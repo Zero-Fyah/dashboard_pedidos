@@ -102,7 +102,15 @@ async def test_circuito_abre_y_termina_tras_max_reaperturas(monkeypatch, circuit
     llamadas = {"n": 0}
 
     async def _siempre_falla(
-        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+        worker_id,
+        page,
+        pid,
+        rq,
+        db,
+        max_reintentos=None,
+        usar_push=False,
+        forzar_completo=False,
+        seguidor=None,
     ):
         llamadas["n"] += 1
         return False
@@ -123,7 +131,15 @@ async def test_exito_resetea_fallos_consecutivos(monkeypatch, circuito_corto, sl
     llamadas = {"n": 0}
 
     async def _alterna(
-        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+        worker_id,
+        page,
+        pid,
+        rq,
+        db,
+        max_reintentos=None,
+        usar_push=False,
+        forzar_completo=False,
+        seguidor=None,
     ):
         llamadas["n"] += 1
         return llamadas["n"] % 2 == 0  # falla impares, acierta pares
@@ -143,7 +159,15 @@ async def test_circuito_cerrado_reanuda_tras_cooldown(monkeypatch, circuito_cort
     llamadas = {"n": 0}
 
     async def _falla_dos_luego_ok(
-        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+        worker_id,
+        page,
+        pid,
+        rq,
+        db,
+        max_reintentos=None,
+        usar_push=False,
+        forzar_completo=False,
+        seguidor=None,
     ):
         llamadas["n"] += 1
         return llamadas["n"] > 2
@@ -171,7 +195,15 @@ async def test_worker_duerme_ante_rate_limit_activo(monkeypatch, sleeps):
     procesados: list[str] = []
 
     async def _ok(
-        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+        worker_id,
+        page,
+        pid,
+        rq,
+        db,
+        max_reintentos=None,
+        usar_push=False,
+        forzar_completo=False,
+        seguidor=None,
     ):
         procesados.append(pid)
         return True
@@ -196,7 +228,15 @@ async def test_worker_sobrevive_excepcion_no_controlada_de_procesar_pedido(monke
     llamadas: list[str] = []
 
     async def _revienta_en_P2(
-        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+        worker_id,
+        page,
+        pid,
+        rq,
+        db,
+        max_reintentos=None,
+        usar_push=False,
+        forzar_completo=False,
+        seguidor=None,
     ):
         llamadas.append(pid)
         if pid == "P2":
@@ -244,7 +284,15 @@ async def test_worker_espera_cola_larga_se_loguea(monkeypatch):
     monkeypatch.setattr(time, "monotonic", reloj)
 
     async def _ok(
-        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+        worker_id,
+        page,
+        pid,
+        rq,
+        db,
+        max_reintentos=None,
+        usar_push=False,
+        forzar_completo=False,
+        seguidor=None,
     ):
         return True
 
@@ -274,7 +322,15 @@ async def test_worker_espera_cola_corta_no_se_loguea(monkeypatch):
     monkeypatch.setattr(time, "monotonic", reloj)
 
     async def _ok(
-        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+        worker_id,
+        page,
+        pid,
+        rq,
+        db,
+        max_reintentos=None,
+        usar_push=False,
+        forzar_completo=False,
+        seguidor=None,
     ):
         return True
 
@@ -299,7 +355,15 @@ async def test_rate_limit_espera_loguea_duracion(monkeypatch, sleeps):
     monkeypatch.setattr(sw, "log_event", lambda evento, **kw: eventos.append((evento, kw)))
 
     async def _ok(
-        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+        worker_id,
+        page,
+        pid,
+        rq,
+        db,
+        max_reintentos=None,
+        usar_push=False,
+        forzar_completo=False,
+        seguidor=None,
     ):
         return True
 
@@ -322,7 +386,15 @@ async def test_circuit_open_loguea_duracion_del_cooldown(monkeypatch, circuito_c
     monkeypatch.setattr(sw, "log_event", lambda evento, **kw: eventos.append((evento, kw)))
 
     async def _siempre_falla(
-        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+        worker_id,
+        page,
+        pid,
+        rq,
+        db,
+        max_reintentos=None,
+        usar_push=False,
+        forzar_completo=False,
+        seguidor=None,
     ):
         return False
 
@@ -346,7 +418,15 @@ async def test_refresco_periodico_alterna_goto_y_push(monkeypatch):
     llamadas_usar_push: list[bool] = []
 
     async def _ok(
-        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+        worker_id,
+        page,
+        pid,
+        rq,
+        db,
+        max_reintentos=None,
+        usar_push=False,
+        forzar_completo=False,
+        seguidor=None,
     ):
         llamadas_usar_push.append(usar_push)
         return True
@@ -367,7 +447,15 @@ async def test_fallo_fuerza_goto_en_el_siguiente_pedido(monkeypatch):
     llamadas_usar_push: list[bool] = []
 
     async def _falla_p2(
-        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+        worker_id,
+        page,
+        pid,
+        rq,
+        db,
+        max_reintentos=None,
+        usar_push=False,
+        forzar_completo=False,
+        seguidor=None,
     ):
         llamadas_usar_push.append(usar_push)
         return pid != "P2"
@@ -393,7 +481,15 @@ async def test_pagina_se_crea_y_cierra_una_sola_vez_por_worker(monkeypatch):
             return p
 
     async def _ok(
-        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+        worker_id,
+        page,
+        pid,
+        rq,
+        db,
+        max_reintentos=None,
+        usar_push=False,
+        forzar_completo=False,
+        seguidor=None,
     ):
         return True
 
@@ -416,7 +512,15 @@ async def test_worker_fuerza_completo_solo_para_los_ids_del_conjunto(monkeypatch
     vistos: dict[str, bool] = {}
 
     async def _registra(
-        worker_id, page, pid, rq, db, max_reintentos=None, usar_push=False, forzar_completo=False
+        worker_id,
+        page,
+        pid,
+        rq,
+        db,
+        max_reintentos=None,
+        usar_push=False,
+        forzar_completo=False,
+        seguidor=None,
     ):
         vistos[pid] = forzar_completo
         return True
@@ -431,3 +535,75 @@ async def test_worker_fuerza_completo_solo_para_los_ids_del_conjunto(monkeypatch
     )
 
     assert vistos == {"P1": False, "P2": True, "P3": False}
+
+
+# ── DEC-148: página nueva cada N pedidos ─────────────────────────────────────
+
+
+class _PaginaCerrable(_FakePage):
+    def __init__(self):
+        self.cerrada = False
+
+    async def close(self):
+        self.cerrada = True
+
+
+async def _correr_con_renovacion(monkeypatch, n: int, ids: list[str]):
+    monkeypatch.setitem(CONFIG, "PAGINA_NUEVA_CADA_N", n)
+    paginas: list[_PaginaCerrable] = []
+    llamadas: list[tuple] = []
+
+    class _Contexto:
+        async def new_page(self):
+            p = _PaginaCerrable()
+            paginas.append(p)
+            return p
+
+    async def _ok(
+        worker_id,
+        page,
+        pid,
+        rq,
+        db,
+        max_reintentos=None,
+        usar_push=False,
+        forzar_completo=False,
+        seguidor=None,
+    ):
+        assert page.cerrada is False  # nunca se procesa sobre una página cerrada
+        llamadas.append((pid, paginas.index(page), usar_push))
+        return True
+
+    monkeypatch.setattr(sw, "procesar_pedido", _ok)
+    cola: asyncio.Queue = asyncio.Queue()
+    for pid in ids:
+        await cola.put(pid)
+    await cola.put(None)
+    await sw.scraper_worker(0, _Contexto(), cola, asyncio.Queue(), "db-fake")
+    return paginas, llamadas
+
+
+@pytest.mark.unit
+async def test_pagina_nueva_cada_n_pedidos_y_todas_se_cierran(monkeypatch):
+    paginas, llamadas = await _correr_con_renovacion(monkeypatch, 2, ["P1", "P2", "P3", "P4", "P5"])
+
+    # P1-P2 en la página 0, P3-P4 en la 1, P5 en la 2; al salir se cierra la vigente.
+    assert [idx for _, idx, _ in llamadas] == [0, 0, 1, 1, 2]
+    assert all(p.cerrada for p in paginas)
+
+
+@pytest.mark.unit
+async def test_tras_renovar_el_primer_pedido_navega_con_goto(monkeypatch):
+    _, llamadas = await _correr_con_renovacion(monkeypatch, 2, ["P1", "P2", "P3", "P4"])
+
+    # P1 arranque (goto), P2 push; P3 página nueva (goto), P4 push.
+    assert [push for _, _, push in llamadas] == [False, True, False, True]
+
+
+@pytest.mark.unit
+async def test_con_n_cero_se_usa_una_sola_pagina(monkeypatch):
+    """Default: comportamiento idéntico al anterior a DEC-148."""
+    paginas, llamadas = await _correr_con_renovacion(monkeypatch, 0, ["P1", "P2", "P3", "P4", "P5"])
+
+    assert len(paginas) == 1
+    assert {idx for _, idx, _ in llamadas} == {0}

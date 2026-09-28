@@ -65,7 +65,21 @@ async def _actualizar_estado_subpedido(
         "actualizado"   — el estado cambió; se actualizó estado + estado_cambiado_en.
         "sin_cambio"    — el estado coincide (ignorando case/espacios); no se tocó nada.
         "no_encontrado" — no existe fila para (id_pedido, numero_subpedido); se loggeó WARNING.
+        "vacio"         — el estado scrapeado llegó vacío; no se tocó nada y se loggeó
+                          WARNING (auditoría 2026-09-25).
     """
+    # Auditoría 2026-09-25: un estado vacío es siempre una lectura fallida
+    # (celda sin etiqueta, columna movida), nunca un estado del origen — el
+    # placeholder legítimo es '-' (DEC-040). Guardarlo borraba el estado
+    # bueno y sacaba al pedido de ESTADOS_CERRADOS/activos.
+    if not (estado_scrapeado or "").strip():
+        log_event(
+            "estado_subpedido_vacio",
+            level="WARNING",
+            id_pedido=id_pedido,
+            msg=f"subpedido {numero_subpedido}: estado leído vacío — se conserva el de la base",
+        )
+        return "vacio"
     fila = await (
         await db.execute(
             "SELECT estado FROM subpedidos WHERE id_pedido = ? AND numero_subpedido = ?",
@@ -102,16 +116,137 @@ async def _actualizar_estado_subpedido(
     return "sin_cambio"
 
 
+# DEC-152 (D2): un valor real sobrescribe; un vacío o el placeholder '-' del
+# origen nunca pisan uno bueno (sí llenan una columna todavía NULL).
+_SQL_SIN_PISAR = (
+    "CASE WHEN NULLIF(NULLIF(TRIM(:{c}), ''), '-') IS NOT NULL THEN :{c} "
+    "ELSE COALESCE({c}, :{c}) END"
+)
+_CAMPOS_OPERACION_SUBPEDIDO = (
+    "inicio_alistamiento",
+    "alistamiento_completado",
+    "alistador",
+    "inicio_inspeccion",
+    "inspeccion_completada",
+    "inspector",
+)
+
+
+async def _actualizar_operacion_subpedido(
+    db: aiosqlite.Connection, id_pedido: str, num_sub: str, sp: dict
+) -> None:
+    """Alistamiento e inspección del subpedido en la pasada `con_cantidades`.
+
+    DEC-152 (D2): el modo los leía y los descartaba, así que quedaban con lo
+    que hubiera al crearse el pedido — antes de alistarlo (completados de
+    ago/sep: alistador 95/82%). Esta pasada corre cuando el subpedido cierra,
+    que es cuando los valores ya son definitivos.
+    """
+    asignaciones = ", ".join(
+        f"{c} = {_SQL_SIN_PISAR.format(c=c)}" for c in _CAMPOS_OPERACION_SUBPEDIDO
+    )
+    await db.execute(
+        f"UPDATE subpedidos SET {asignaciones} "
+        "WHERE id_pedido = :id_pedido AND numero_subpedido = :num_sub",
+        {
+            **{c: sp.get(c) for c in _CAMPOS_OPERACION_SUBPEDIDO},
+            "id_pedido": id_pedido,
+            "num_sub": num_sub,
+        },
+    )
+
+
+async def _actualizar_lineas_con_cantidades(
+    db: aiosqlite.Connection, id_pedido: str, num_sub: str, lineas: list[dict]
+) -> None:
+    """Cantidad y peso entregados, y número de caja, línea por línea.
+
+    DEC-152 (D1): antes el UPDATE iba por `(pedido, subpedido, código de
+    barras)`, así que con el mismo código en varias líneas todas quedaban con
+    la entregada de la ÚLTIMA (2.134 de las 2.142 líneas con entregada >
+    comprada; 23/23 grupos verificados contra el origen). Ahora cada grupo de
+    código repetido se empareja por posición con sus filas (orden de
+    inserción = orden del DOM en el modo completo), y solo si las cantidades
+    compradas coinciden en el mismo orden: si no, WARNING y el grupo no se
+    toca — mejor un dato viejo que uno cruzado.
+    """
+    grupos: dict[str, list[dict]] = {}
+    for linea in lineas:
+        grupos.setdefault(linea["codigo_barras"], []).append(linea)
+
+    for codigo, del_origen in grupos.items():
+        filas = await (
+            await db.execute(
+                "SELECT id, cantidad_comprada FROM lineas_pedido "
+                "WHERE id_pedido = ? AND numero_subpedido = ? AND codigo_barras = ? "
+                "ORDER BY id",
+                (id_pedido, num_sub, codigo),
+            )
+        ).fetchall()
+        if not filas:
+            log_event(
+                "update_sin_match",
+                level="WARNING",
+                id_pedido=id_pedido,
+                msg=(
+                    f"cantidad_entregada no actualizada — codigo_barras vacío o "
+                    f"no encontrado en subpedido {num_sub}"
+                ),
+            )
+            continue
+        if len(del_origen) == 1 and len(filas) == 1:
+            pares = [(filas[0][0], del_origen[0])]
+        elif len(del_origen) == len(filas) and all(
+            _misma_cantidad(f[1], ln["cantidad_comprada"])
+            for f, ln in zip(filas, del_origen, strict=True)
+        ):
+            pares = [(f[0], ln) for f, ln in zip(filas, del_origen, strict=True)]
+        else:
+            log_event(
+                "lineas_repetidas_no_emparejadas",
+                level="WARNING",
+                id_pedido=id_pedido,
+                msg=(
+                    f"código {codigo!r} repetido en subpedido {num_sub}: "
+                    f"{len(del_origen)} líneas en el origen contra {len(filas)} en la "
+                    f"base, o compradas en otro orden — cantidades no actualizadas"
+                ),
+            )
+            continue
+        for fila_id, linea in pares:
+            # DEC-140: el peso entregado se mueve con la cantidad entregada,
+            # sin pisar un valor bueno con uno vacío.
+            await db.execute(
+                "UPDATE lineas_pedido SET cantidad_entregada = :entregada, "
+                "peso_entregado = COALESCE(NULLIF(:peso_entregado, ''), peso_entregado), "
+                f"numero_caja = {_SQL_SIN_PISAR.format(c='numero_caja')} "
+                "WHERE id = :id",
+                {
+                    "entregada": linea["cantidad_entregada"],
+                    "peso_entregado": linea.get("peso_entregado", ""),
+                    "numero_caja": linea.get("numero_caja"),
+                    "id": fila_id,
+                },
+            )
+
+
+def _misma_cantidad(en_base: object, del_origen: object) -> bool:
+    try:
+        return float(en_base) == float(del_origen)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return en_base == del_origen
+
+
 async def _persistir_secciones_satelite(
     db,
     id_pedido: str,
     resultado: dict,
     warn: bool,
 ) -> None:
-    """Persiste las 4 tablas satélite del pedido con DELETE + INSERT condicional.
+    """Persiste las 5 tablas satélite del pedido con DELETE + INSERT condicional.
 
-    Tablas: estadisticas_monto, gestion_diferencias, detalle_diferencias y
-    registro_operaciones. El DELETE solo ocurre si la sección trae datos
+    Tablas: estadisticas_monto, gestion_diferencias, detalle_diferencias,
+    registro_operaciones y registros_pago (DEC-087). El DELETE solo ocurre si la sección trae datos
     (HAL-004): una extracción vacía preserva los datos existentes en vez de
     borrarlos. Extraída de las 3 ramas de persistencia_worker() (AUD-M10),
     donde el mismo bloque estaba triplicado.
@@ -123,8 +258,8 @@ async def _persistir_secciones_satelite(
         db: Conexión aiosqlite con una transacción abierta.
         id_pedido: ID del pedido en persistencia.
         resultado: Dict de resultado producido por scraper_worker.
-        warn: True en modo completo — que garantiza el renderizado de las 8
-              secciones, por lo que una sección vacía amerita WARNING. False
+        warn: True en modo completo — que garantiza el renderizado de todas
+              las secciones, por lo que una sección vacía amerita WARNING. False
               en con_cantidades y solo_estado, donde el vacío es esperable
               porque esos modos no garantizan el renderizado (criterio
               BUG-013/HAL-004).
@@ -419,12 +554,12 @@ async def persistencia_worker(
                                 id_pedido, numero_subpedido, tipo_subpedido, estado,
                                 inicio_alistamiento, alistamiento_completado, alistador,
                                 inicio_inspeccion, inspeccion_completada, inspector,
-                                estado_cambiado_en
+                                estado_cambiado_en, cantidades_definitivas
                             ) VALUES (
                                 :id_pedido, :numero_subpedido, :tipo_subpedido, :estado,
                                 :inicio_alistamiento, :alistamiento_completado, :alistador,
                                 :inicio_inspeccion, :inspeccion_completada, :inspector,
-                                :estado_cambiado_en
+                                :estado_cambiado_en, :cantidades_definitivas
                             )
                             """,
                             [
@@ -440,6 +575,15 @@ async def persistencia_worker(
                                     "inspeccion_completada": sp["inspeccion_completada"],
                                     "inspector": sp["inspector"],
                                     "estado_cambiado_en": ts_completo,
+                                    # DEC-147: un subpedido que ya llega cerrado
+                                    # trae sus cantidades definitivas en esta misma
+                                    # lectura. Sin esto el DELETE + INSERT lo dejaba
+                                    # en 0 y el ciclo siguiente lo repasaba entero
+                                    # en con_cantidades (1.108 de 1.131 el
+                                    # 2026-09-25 con la tanda de 1.200).
+                                    "cantidades_definitivas": int(
+                                        (sp["estado"] or "").strip().lower() in ESTADOS_CERRADOS
+                                    ),
                                 }
                                 for sp in subped
                             ],
@@ -630,7 +774,7 @@ async def persistencia_worker(
                     # HAL-004: DELETE dentro de if (sección con datos) para no
                     # borrar datos existentes cuando la extracción retorna
                     # vacío. warn=True: el modo completo garantiza el
-                    # renderizado de las 8 secciones — un vacío es anómalo.
+                    # renderizado de las secciones — un vacío es anómalo.
                     await _persistir_secciones_satelite(db, id_pedido, resultado, warn=True)
 
                     await db.execute("COMMIT")
@@ -658,34 +802,12 @@ async def persistencia_worker(
 
                     for sp in resultado["subpedidos"]:
                         num_sub = sp["numero_subpedido"]
-                        for linea in sp["lineas"]:
-                            # DEC-140: el peso entregado se mueve con la
-                            # cantidad entregada; se actualizan juntos, sin
-                            # pisar un valor bueno con uno vacío.
-                            cursor = await db.execute(
-                                "UPDATE lineas_pedido SET cantidad_entregada = ?, "
-                                "peso_entregado = COALESCE(NULLIF(?, ''), peso_entregado) "
-                                "WHERE id_pedido = ? AND numero_subpedido = ? "
-                                "AND codigo_barras = ?",
-                                (
-                                    linea["cantidad_entregada"],
-                                    linea.get("peso_entregado", ""),
-                                    id_pedido,
-                                    num_sub,
-                                    linea["codigo_barras"],
-                                ),
-                            )
-                            if cursor.rowcount == 0:
-                                log_event(
-                                    "update_sin_match",
-                                    level="WARNING",
-                                    id_pedido=id_pedido,
-                                    msg=(
-                                        f"cantidad_entregada no actualizada — "
-                                        f"codigo_barras vacío o no encontrado en "
-                                        f"subpedido {num_sub}"
-                                    ),
-                                )
+                        await _actualizar_lineas_con_cantidades(
+                            db, id_pedido, num_sub, sp["lineas"]
+                        )
+                        # DEC-152 (D2): alistador/inspector/fechas se leían y
+                        # no se persistían; esta pasada es justo la del cierre.
+                        await _actualizar_operacion_subpedido(db, id_pedido, num_sub, sp)
                         # Estado / estado_cambiado_en: la función auxiliar decide su
                         # propio UPDATE condicional (solo escribe si el estado cambió,
                         # ignorando diferencias de capitalización) y maneja el caso

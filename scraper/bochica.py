@@ -14,7 +14,7 @@ from pathlib import Path
 from playwright.async_api import Download, Frame, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from scraper.config import CONFIG, log_event
+from scraper.config import CONFIG, flags_v8, log_event
 
 DESTINO_DEFAULT = Path(__file__).parent.parent / "data" / "inventario" / "bochica_inventario.xlsx"
 SESION_DEFAULT = Path(__file__).parent.parent / "data" / "sesiones" / "bochica_storage_state.json"
@@ -269,6 +269,10 @@ if __name__ == "__main__":
             browser = await pw.chromium.launch(
                 headless=CONFIG["HEADLESS"],
                 slow_mo=CONFIG["SLOW_MO"],
+                # DEC-154: el reporte de BOCHICA era el pico del ciclo una vez
+                # achicado el scraper (1.648-1.683 MB); con V8 optimizado
+                # para tamaño, 1.214-1.285 MB y el mismo archivo (+3 s).
+                args=flags_v8(),
             )
             # DEC-116: el login de Google vía Playwright dispara CAPTCHA — se
             # reutiliza una sesión sembrada manualmente en vez de autenticar

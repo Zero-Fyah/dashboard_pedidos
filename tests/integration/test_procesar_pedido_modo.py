@@ -165,3 +165,119 @@ async def test_sin_forzar_decide_la_base(monkeypatch, db_path):
 
     assert exito is True
     assert "div.info-item" not in page.selectores  # fue por solo_estado
+
+
+# ── Auditoría 2026-09-25: sesión que expira después de navegar ───────────────
+
+
+class _PageSesionExpira(_PageSoloEstado):
+    """La primera navegación "funciona" pero la SPA redirige al login de
+    Cognito mientras se espera el render: el timeout ocurre con la URL ya en
+    el login. Tras re-loguearse, la siguiente navegación funciona."""
+
+    def __init__(self):
+        super().__init__()
+        self.logueado = False
+        self.esperas = 0
+
+    async def goto(self, url, *args, **kwargs):
+        self.goto_llamadas += 1
+        self.url = url
+
+    async def wait_for_selector(self, *args, **kwargs):
+        self.esperas += 1
+        if not self.logueado:
+            self.url = "https://auth.example.com/login?client_id=x"
+            raise TimeoutError("Timeout 20000ms exceeded")
+
+
+async def test_sesion_expirada_tras_navegar_se_re_loguea_y_recupera(monkeypatch, db_path):
+    await _sembrar_pedido_solo_estado(db_path, "TEST-SESION")
+    eventos = []
+    monkeypatch.setattr(sw, "log_event", lambda ev, **kw: eventos.append(ev))
+    monkeypatch.setitem(sw.CONFIG, "BACKOFF_BASE_S", 0)
+    monkeypatch.setitem(sw.CONFIG, "PAUSA_ENTRE_PEDIDOS_S", 0)
+
+    async def _guardar_debug(page, pid):
+        pass
+
+    logins = []
+
+    async def _login(page, usuario, clave):
+        logins.append(usuario)
+        page.logueado = True
+        page.url = "https://admin.example.com/home"
+
+    monkeypatch.setattr(sw, "guardar_debug", _guardar_debug)
+    monkeypatch.setattr(sw, "login", _login)
+
+    page = _PageSesionExpira()
+    exito = await procesar_pedido(0, page, "TEST-SESION", __import__("asyncio").Queue(), db_path)
+
+    assert exito is True
+    assert len(logins) == 1
+    assert "session_expired" in eventos
+    assert page.goto_llamadas == 2  # un intento fallido y uno bueno, no cinco
+
+
+async def test_timeout_sin_redireccion_al_login_no_re_loguea(monkeypatch, db_path):
+    """Un timeout común (origen lento) no debe disparar logins de más."""
+    await _sembrar_pedido_solo_estado(db_path, "TEST-LENTO")
+    monkeypatch.setitem(sw.CONFIG, "BACKOFF_BASE_S", 0)
+    monkeypatch.setitem(sw.CONFIG, "PAUSA_ENTRE_PEDIDOS_S", 0)
+
+    async def _guardar_debug(page, pid):
+        pass
+
+    logins = []
+
+    async def _login(page, usuario, clave):
+        logins.append(usuario)
+
+    class _PageLenta(_PageSoloEstado):
+        async def wait_for_selector(self, *args, **kwargs):
+            raise TimeoutError("Timeout 20000ms exceeded")
+
+    monkeypatch.setattr(sw, "guardar_debug", _guardar_debug)
+    monkeypatch.setattr(sw, "login", _login)
+
+    exito = await procesar_pedido(
+        0, _PageLenta(), "TEST-LENTO", __import__("asyncio").Queue(), db_path, max_reintentos=3
+    )
+
+    assert exito is False
+    assert logins == []
+
+
+class _PageSesionExpiraSinTimeout(_PageSesionExpira):
+    """El caso silencioso visto en el origen: la espera de render de
+    solo_estado solo avisa, así que sin sesión se extraía vacío y el pedido
+    salía como `pedido_ok`."""
+
+    async def wait_for_selector(self, *args, **kwargs):
+        self.esperas += 1
+        if not self.logueado:
+            self.url = "https://auth.example.com/login?client_id=x"
+
+
+async def test_sin_sesion_solo_estado_no_reporta_exito_vacio(monkeypatch, db_path):
+    await _sembrar_pedido_solo_estado(db_path, "TEST-VACIO")
+    monkeypatch.setitem(sw.CONFIG, "BACKOFF_BASE_S", 0)
+    monkeypatch.setitem(sw.CONFIG, "PAUSA_ENTRE_PEDIDOS_S", 0)
+
+    async def _guardar_debug(page, pid):
+        pass
+
+    async def _login(page, usuario, clave):
+        page.logueado = True
+        page.url = "https://admin.example.com/home"
+
+    monkeypatch.setattr(sw, "guardar_debug", _guardar_debug)
+    monkeypatch.setattr(sw, "login", _login)
+
+    page = _PageSesionExpiraSinTimeout()
+    exito = await procesar_pedido(0, page, "TEST-VACIO", __import__("asyncio").Queue(), db_path)
+
+    assert exito is True
+    assert page.logueado is True  # se re-logueó en vez de dar por buena la extracción vacía
+    assert page.goto_llamadas == 2

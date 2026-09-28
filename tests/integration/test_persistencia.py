@@ -804,3 +804,171 @@ async def test_con_cantidades_peso_vacio_no_pisa_valor_bueno(db_path, pedido_sin
     await persistir_uno(p, db_path)
     await persistir_uno(_resultado_con_cantidades([_sub_con_peso("")]), db_path)
     assert (await _leer_linea(db_path))[1] == "4000g"
+
+
+# ── DEC-152 (D1): códigos de barras repetidos en un subpedido ──────────────
+
+
+def _con_codigo_repetido(pedido_base: dict, compradas: list[float]) -> dict:
+    """Completo con N líneas del MISMO código en SUB-001 (orden = orden del DOM)."""
+    p = copy.deepcopy(pedido_base)
+    base = p["subpedidos"][0]["lineas"][0]
+    p["subpedidos"][0]["lineas"] = [
+        {**copy.deepcopy(base), "cantidad_comprada": c, "cantidad_entregada": 0.0}
+        for c in compradas
+    ]
+    return p
+
+
+def _sub_entregas(pares: list[tuple[float, float]], **extra) -> dict:
+    return {
+        "numero_subpedido": "SUB-001",
+        "estado": "completado",
+        **extra,
+        "lineas": [
+            {
+                "codigo_barras": "7700000000001",
+                "cantidad_comprada": comprada,
+                "cantidad_entregada": entregada,
+                "peso_entregado": "",
+                "numero_caja": "",
+            }
+            for comprada, entregada in pares
+        ],
+    }
+
+
+async def _entregadas(db_path: str) -> list[tuple[float, float]]:
+    async with aiosqlite.connect(db_path) as db:
+        return [
+            tuple(r)
+            for r in await (
+                await db.execute(
+                    "SELECT cantidad_comprada, cantidad_entregada FROM lineas_pedido "
+                    "WHERE id_pedido = 'TEST-001' ORDER BY id"
+                )
+            ).fetchall()
+        ]
+
+
+@pytest.mark.integration
+async def test_codigo_repetido_cada_linea_recibe_su_entregada(db_path, pedido_sin_diferencias):
+    """Antes todas quedaban con la entregada de la última (6, 6)."""
+    await persistir_uno(_con_codigo_repetido(pedido_sin_diferencias, [10.0, 3.0]), db_path)
+    await persistir_uno(
+        _resultado_con_cantidades([_sub_entregas([(10.0, 9.0), (3.0, 6.0)])]), db_path
+    )
+    assert await _entregadas(db_path) == [(10.0, 9.0), (3.0, 6.0)]
+
+
+@pytest.mark.integration
+async def test_codigo_repetido_con_distinta_cantidad_de_lineas_no_se_toca(
+    db_path, pedido_sin_diferencias, monkeypatch
+):
+    import scraper.persistencia as sp_mod
+
+    eventos = []
+    monkeypatch.setattr(sp_mod, "log_event", lambda ev, **kw: eventos.append(ev))
+    await persistir_uno(_con_codigo_repetido(pedido_sin_diferencias, [10.0, 3.0]), db_path)
+    await persistir_uno(_resultado_con_cantidades([_sub_entregas([(10.0, 9.0)])]), db_path)
+    assert await _entregadas(db_path) == [(10.0, 0.0), (3.0, 0.0)]
+    assert "lineas_repetidas_no_emparejadas" in eventos
+
+
+@pytest.mark.integration
+async def test_codigo_repetido_con_compradas_en_otro_orden_no_se_toca(
+    db_path, pedido_sin_diferencias
+):
+    """Si el orden no coincide no hay forma segura de emparejar: mejor viejo que cruzado."""
+    await persistir_uno(_con_codigo_repetido(pedido_sin_diferencias, [10.0, 3.0]), db_path)
+    await persistir_uno(
+        _resultado_con_cantidades([_sub_entregas([(3.0, 2.0), (10.0, 9.0)])]), db_path
+    )
+    assert await _entregadas(db_path) == [(10.0, 0.0), (3.0, 0.0)]
+
+
+@pytest.mark.integration
+async def test_codigo_unico_se_actualiza_como_siempre(db_path, pedido_sin_diferencias):
+    await persistir_uno(pedido_sin_diferencias, db_path)
+    await persistir_uno(_resultado_con_cantidades([_sub_entregas([(10.0, 7.0)])]), db_path)
+    assert await _entregadas(db_path) == [(10.0, 7.0)]
+
+
+# ── DEC-152 (D2): alistamiento, inspección y caja en con_cantidades ─────────
+
+
+async def _operacion(db_path: str) -> tuple:
+    async with aiosqlite.connect(db_path) as db:
+        sub = await (
+            await db.execute(
+                "SELECT alistador, alistamiento_completado, inspector, inspeccion_completada "
+                "FROM subpedidos WHERE id_pedido = 'TEST-001'"
+            )
+        ).fetchone()
+        caja = await (
+            await db.execute("SELECT numero_caja FROM lineas_pedido WHERE id_pedido = 'TEST-001'")
+        ).fetchone()
+    return (*sub, caja[0])
+
+
+@pytest.mark.integration
+async def test_con_cantidades_persiste_alistamiento_inspeccion_y_caja(
+    db_path, pedido_sin_diferencias
+):
+    await persistir_uno(pedido_sin_diferencias, db_path)
+    sub = _sub_entregas(
+        [(10.0, 10.0)],
+        alistador="Persona A",
+        alistamiento_completado="2026-05-23 09:00:00",
+        inspector="Persona B",
+        inspeccion_completada="2026-05-23 10:00:00",
+    )
+    sub["lineas"][0]["numero_caja"] = "Caja 1"
+    await persistir_uno(_resultado_con_cantidades([sub]), db_path)
+    assert await _operacion(db_path) == (
+        "Persona A",
+        "2026-05-23 09:00:00",
+        "Persona B",
+        "2026-05-23 10:00:00",
+        "Caja 1",
+    )
+
+
+@pytest.mark.integration
+async def test_con_cantidades_vacio_o_guion_no_pisa_valores_buenos(db_path, pedido_sin_diferencias):
+    p = copy.deepcopy(pedido_sin_diferencias)
+    p["subpedidos"][0].update(inspector="Persona B", inspeccion_completada="2026-05-23 10:00:00")
+    p["subpedidos"][0]["lineas"][0]["numero_caja"] = "Caja 1"
+    await persistir_uno(p, db_path)
+    sub = _sub_entregas(
+        [(10.0, 10.0)],
+        alistador="-",
+        alistamiento_completado="",
+        inspector=" - ",
+        inspeccion_completada="-",
+    )
+    sub["lineas"][0]["numero_caja"] = "-"
+    await persistir_uno(_resultado_con_cantidades([sub]), db_path)
+    # El alistador de la base ("Alistador Test") sobrevive al '-'; los vacíos
+    # de la base se quedan vacíos (no hay dato bueno que llenar).
+    assert await _operacion(db_path) == (
+        "Alistador Test",
+        "",
+        "Persona B",
+        "2026-05-23 10:00:00",
+        "Caja 1",
+    )
+
+
+@pytest.mark.integration
+async def test_con_cantidades_llena_con_placeholder_una_columna_nula(
+    db_path, pedido_sin_diferencias
+):
+    await persistir_uno(pedido_sin_diferencias, db_path)
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("UPDATE subpedidos SET inspector = NULL WHERE id_pedido = 'TEST-001'")
+        await db.commit()
+    await persistir_uno(
+        _resultado_con_cantidades([_sub_entregas([(10.0, 10.0)], inspector="-")]), db_path
+    )
+    assert (await _operacion(db_path))[2] == "-"

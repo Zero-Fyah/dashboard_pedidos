@@ -7,25 +7,29 @@ Desde DEC-013 (Fase 5) el código vive en los módulos del paquete scraper/:
 config.py, db.py, extractores.py, persistencia.py, workers.py y
 orquestador.py. Este archivo conserva dos responsabilidades:
 
-  1. Entry point ejecutable — el comando del Task Scheduler y de uso manual
-     no cambia:
+  1. Entry point ejecutable — el comando del ciclo horario
+     (`actualizar_pedidos.sh`, systemd desde DEC-125) y de uso manual:
 
         # Carga histórica completa (primera vez)
-        py scraper/scraper_principal.py --desde 2026-01-01 --hasta 2026-05-21 --modo completo
+        python scraper/scraper_principal.py --desde 2026-01-01 --hasta 2026-05-21 --modo completo
 
         # Actualización incremental (uso normal, cada 1 hora)
-        py scraper/scraper_principal.py --modo incremental
+        python scraper/scraper_principal.py --modo incremental
+
+        # Re-extracción dirigida de una lista de IDs (DEC-152)
+        python scraper/scraper_principal.py --modo completo --ids-archivo ids.txt
 
   2. Facade de compatibilidad — re-exporta todos los nombres públicos del
      paquete para los importadores existentes (tests, migraciones):
      `from scraper.scraper_principal import X` sigue funcionando.
 
-Configuración recomendada: NUM_WORKERS=6 (DEC-030, vía SCRAPER_NUM_WORKERS),
-PAUSA_ENTRE_PEDIDOS_S=1.2, MAX_REINTENTOS=5, NAV_TIMEOUT_MS=45s
+Configuración de producción (DEC-150): SCRAPER_NUM_WORKERS=5,
+SCRAPER_PAGINA_NUEVA_CADA_N=10, SCRAPER_BLOQUEAR_IMAGENES=true y
+SCRAPER_V8_OPTIMIZAR_TAMANO=true; PAUSA_ENTRE_PEDIDOS_S=1.2, MAX_REINTENTOS=5,
+NAV_TIMEOUT_MS=45s.
 
-Estimación de tiempo (modo incremental con 6 workers):
-    Activos + errores: ~35-45 min dependiendo del volumen
-    Pedidos nuevos del día: ~3-8 minutos
+Tiempo medido (2026-09-27): el ciclo horario completo, con ~1.800 pedidos en
+el incremental, tarda 24-27 min (tope pedido: 30).
 """
 
 import asyncio
@@ -33,7 +37,7 @@ import sys
 from pathlib import Path
 
 # El insert de sys.path permite ejecutar este archivo como script
-# (py scraper/scraper_principal.py) además de importarlo como paquete:
+# (python scraper/scraper_principal.py) además de importarlo como paquete:
 # pone la raíz del proyecto en el path para resolver comun/ y scraper/.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 

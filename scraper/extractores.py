@@ -1,17 +1,22 @@
 """
 extractores.py — Todo lo que lee la SPA con Playwright (DEC-013).
 
-Login, listado de pedidos (con retry y re-login, AUD-B1), los 8 extractores
-del detalle de pedido y el volcado de debug (screenshot + HTML).
+Login, listado de pedidos (con retry y re-login, AUD-B1), los extractores
+del detalle de pedido (leídos por etiqueta/encabezado, DEC-023/140/145), la
+navegación vía Vue Router, el seguimiento de las secciones que cargan tarde
+(`SeguidorSecciones`, DEC-152) y el volcado de debug (screenshot + HTML).
 """
 
 import asyncio
 import re
 import time
+from collections.abc import Iterable
 from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.async_api import (
     Page,
+    Request,
 )
 from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
@@ -386,6 +391,84 @@ async def navegar_a_detalle_via_router(page: Page, id_pedido: str) -> bool:
             msg=f"Navegación interna vía router falló, se recurre a page.goto(): {exc}",
         )
         return False
+
+
+# ─────────────────────────────────────────────
+# SECCIONES ASÍNCRONAS DEL DETALLE (D3, DEC-152)
+# ─────────────────────────────────────────────
+
+# Sondeo del 2026-09-27 (`logs/auditoria_memoria/sondear_secciones.py`): el
+# detalle pinta primero la cabecera y recién DESPUÉS pide, en paralelo, el
+# timeline, el registro de operaciones y los pagos — llegan 60-400 ms más
+# tarde, y leerlos apenas aparece la cabecera los daba vacíos (6-66% de las
+# lecturas de `solo_estado`; pedidos sin tarjeta de pago en `completo`). Las
+# tres peticiones salen SIEMPRE, también en pedidos viejos que no tienen esas
+# secciones (el origen responde vacío): el fin de la petición distingue
+# "todavía cargando" de "vacío de verdad" sin esperas en vano. El DOM no
+# puede: la tarjeta de pago no existe antes del 2026-02-05 y la máscara de
+# carga se apaga antes que el registro de operaciones (2 de 8 pedidos).
+SECCIONES_ASYNC: dict[str, str] = {
+    "timeline": "/timerShaft/findDetail",
+    "registro_ops": "/orderOperateLog/list",
+    "pagos": "/payRecord/list",
+}
+
+
+class SeguidorSecciones:
+    """Registra qué secciones asíncronas del detalle ya llegaron desde la
+    última navegación. Uno por worker; se conecta a cada página nueva."""
+
+    def __init__(self) -> None:
+        self._terminadas: set[str] = set()
+        self._ultima = 0.0
+        self._cambio = asyncio.Event()
+
+    def conectar(self, page: Page) -> None:
+        # Una petición fallida también cuenta como "terminada": la sección
+        # queda vacía y la persistencia no pisa con vacío.
+        page.on("requestfinished", self._al_terminar)
+        page.on("requestfailed", self._al_terminar)
+
+    def reiniciar(self) -> None:
+        """Llamar ANTES de navegar: las peticiones salen apenas llega la
+        cabecera, a veces antes de que el ID se vea en pantalla."""
+        self._terminadas.clear()
+        self._cambio.clear()
+
+    def _al_terminar(self, request: Request) -> None:
+        ruta = urlparse(request.url).path
+        for seccion, sufijo in SECCIONES_ASYNC.items():
+            if ruta.endswith(sufijo):
+                self._terminadas.add(seccion)
+                self._ultima = time.monotonic()
+                self._cambio.set()
+
+    async def esperar(self, secciones: Iterable[str]) -> set[str]:
+        """Espera hasta `SECCIONES_TIMEOUT_MS` a que lleguen `secciones` y
+        deja `SECCIONES_ASENTAR_MS` desde la última para que Vue las pinte.
+
+        Returns:
+            Las secciones que no llegaron a tiempo (vacío = todas llegaron).
+        """
+        pendientes = set(secciones)
+        limite = time.monotonic() + CONFIG["SECCIONES_TIMEOUT_MS"] / 1000
+        while not pendientes <= self._terminadas:
+            self._cambio.clear()
+            if pendientes <= self._terminadas:
+                break
+            restante = limite - time.monotonic()
+            if restante <= 0:
+                break
+            try:
+                await asyncio.wait_for(self._cambio.wait(), restante)
+            except TimeoutError:
+                break
+        faltan = pendientes - self._terminadas
+        if len(faltan) < len(pendientes):
+            asentar = CONFIG["SECCIONES_ASENTAR_MS"] / 1000 - (time.monotonic() - self._ultima)
+            if asentar > 0:
+                await asyncio.sleep(asentar)
+        return faltan
 
 
 # ─────────────────────────────────────────────
@@ -1112,12 +1195,74 @@ async def extraer_info_entrega(page: Page, id_pedido: str) -> dict:
     return resultado
 
 
+# Auditoría 2026-09-25: «Estadísticas de monto» y «Detalle de diferencias»
+# se leen por posición (el descuento del detalle pasa por ElementHandle en
+# la celda 4, así que no conviene remapear). En vez de remapear, se exige
+# el encabezado exacto verificado en vivo el 2026-09-25: si el origen lo
+# cambia, la tabla no se captura (la persistencia conserva lo que ya hay)
+# y queda un WARNING — nunca columnas corridas en silencio (DEC-023/140).
+_ENCABEZADOS_ESTADISTICAS: tuple[str, ...] = (
+    "Concepto",
+    "Monto a pagar del pedido",
+    "Monto final a pagar",
+    "Diferencia",
+)
+_ENCABEZADOS_DETALLE_DIF: tuple[str, ...] = (
+    "Nombre del producto",
+    "Especificación",
+    "Tipo",
+    "Precio unitario",
+    "Descuento",
+    "Precio con descuento",
+    "Cantidad del pedido",
+    "Cantidad real entregada",
+    "Diferencia de cantidad",
+    "Monto a pagar del pedido",
+    "Monto final a pagar",
+    "IVA",
+    "Monto de diferencia",
+)
+
+# Encabezados de una tabla Element Plus; descarta los `th` vacíos (gutter).
+_JS_FN_ENCABEZADOS = """
+const encabezadosDe = (raiz) => Array.from(raiz.querySelectorAll('thead th'))
+    .map((th) => {
+        const c = th.querySelector('.cell');
+        return (c ? c.textContent : th.textContent).trim();
+    })
+    .filter((h) => h !== '');
+"""
+
+
+def _encabezados_coinciden(
+    tabla: str, leidos: list[str], esperados: tuple[str, ...], id_pedido: str
+) -> bool:
+    """True si la tabla trae exactamente los encabezados esperados; si no,
+    emite WARNING `<tabla>_encabezados_cambiaron` (auditoría 2026-09-25)."""
+    if tuple(leidos) == esperados:
+        return True
+    log_event(
+        f"{tabla}_encabezados_cambiaron",
+        level="WARNING",
+        id_pedido=id_pedido,
+        msg=(
+            f"Encabezados de «{tabla}» distintos a los verificados — no se captura "
+            f"(se conservan los datos de la base). Esperados {list(esperados)}, "
+            f"leídos {leidos}"
+        ),
+    )
+    return False
+
+
 # DEC-030 Fase 3: un solo evaluate en vez de hasta ~5 round-trips por
 # fila (~10 filas → hasta 50 llamadas). Misma lógica exacta: primer
 # <span> de la celda de concepto que NO sea un el-tag; JS solo recolecta,
 # ninguna decisión de negocio se mueve de Python.
-_JS_ESTADISTICAS = """
-() => {
+_JS_ESTADISTICAS = (
+    """
+() => {"""
+    + _JS_FN_ENCABEZADOS
+    + """
     const card = document.querySelector('.amount-statistics-card');
     if (!card) return null;
     const tagDif = card.querySelector(
@@ -1146,9 +1291,10 @@ _JS_ESTADISTICAS = """
             };
         })
         .filter((f) => f !== null);
-    return { hay_diferencia: tagDif !== null, filas };
+    return { hay_diferencia: tagDif !== null, filas, encabezados: encabezadosDe(card) };
 }
 """
+)
 
 
 async def extraer_estadisticas_monto(page: Page, id_pedido: str) -> tuple[list[dict], bool | None]:
@@ -1174,6 +1320,12 @@ async def extraer_estadisticas_monto(page: Page, id_pedido: str) -> tuple[list[d
 
         # FIX C-3: card presente → estado verificado (True o False)
         hay_diferencia = r["hay_diferencia"]
+        # El tag de diferencia no depende de las columnas: se conserva aunque
+        # la tabla no se capture.
+        if r["filas"] and not _encabezados_coinciden(
+            "estadisticas", r["encabezados"], _ENCABEZADOS_ESTADISTICAS, id_pedido
+        ):
+            return filas_data, hay_diferencia
 
         for orden, f in enumerate(r["filas"], start=1):
             filas_data.append(
@@ -1254,11 +1406,14 @@ async def extraer_gestion_diferencias(page: Page, id_pedido: str) -> dict | None
 # propia suite de tests (DEC-024) y no vale la pena duplicar en JS. El
 # array conserva `null` para filas con <13 celdas (sin filtrar) para que
 # el índice siga alineado 1:1 con los ElementHandle de fila en Python.
-_JS_DETALLE_DIF = """
-() => {
+_JS_DETALLE_DIF = (
+    """
+() => {"""
+    + _JS_FN_ENCABEZADOS
+    + """
     const card = document.querySelector('.diff-items-card');
     if (!card) return null;
-    return Array.from(card.querySelectorAll('tbody tr')).map((fila) => {
+    const filas = Array.from(card.querySelectorAll('tbody tr')).map((fila) => {
         const celdas = Array.from(fila.querySelectorAll('td'));
         if (celdas.length < 13) return null;
         const tipoEl = celdas[2].querySelector('.el-tag__content');
@@ -1277,8 +1432,10 @@ _JS_DETALLE_DIF = """
             monto_diferencia: celdas[12].textContent.trim(),
         };
     });
+    return { encabezados: encabezadosDe(card), filas };
 }
 """
+)
 
 
 async def extraer_detalle_diferencias(page: Page, id_pedido: str) -> list[dict]:
@@ -1303,8 +1460,13 @@ async def extraer_detalle_diferencias(page: Page, id_pedido: str) -> list[dict]:
         if not card:
             return resultado
 
-        datos_bulk = await page.evaluate(_JS_DETALLE_DIF)
-        if datos_bulk is None:
+        crudo = await page.evaluate(_JS_DETALLE_DIF)
+        if crudo is None:
+            return resultado
+        datos_bulk = crudo["filas"]
+        if datos_bulk and not _encabezados_coinciden(
+            "detalle_dif", crudo["encabezados"], _ENCABEZADOS_DETALLE_DIF, id_pedido
+        ):
             return resultado
         filas = await card.query_selector_all("tbody tr")
 
@@ -1456,6 +1618,65 @@ def _validar_encabezados_linea(encabezados: list[str]) -> tuple[list[str], list[
     return desconocidos, faltantes
 
 
+# Auditoría 2026-09-25: la fila del subpedido (estado, alistamiento,
+# inspección) también se lee POR ENCABEZADO. Se leía por posición
+# (`celdas[3]` = estado) en los modos completo y solo_estado, y una columna
+# nueva del origen antes de «Estado» habría escrito otro valor —o vacío,
+# si la celda nueva no trae etiqueta— como estado de todos los pedidos
+# activos en cada ciclo. Encabezados verificados en vivo el 2026-09-25:
+# ['', 'Número de subpedido', 'Categoría', 'Estado', ...] — 10 `th` para 10
+# `td` (el primero es la columna de expansión).
+_COLUMNAS_SUBPEDIDO: dict[str, str] = {
+    "Estado": "estado",
+    "Inicio de alistamiento": "inicio_alistamiento",
+    "Alistamiento completado": "alistamiento_completado",
+    "Alistador": "alistador",
+    "Inicio de inspección": "inicio_inspeccion",
+    "Inspección completada": "inspeccion_completada",
+    "Inspector": "inspector",
+}
+# Encabezados conocidos que no alimentan un campo de esta tabla: el número y
+# la categoría salen de `span.child-order-id` («Categoría + número»).
+_ENCABEZADOS_SUBPEDIDO_SIN_CAMPO: frozenset[str] = frozenset({"Número de subpedido", "Categoría"})
+# Sin estado, persistir pisaría el estado bueno de la base.
+_COLUMNAS_SUBPEDIDO_OBLIGATORIAS: frozenset[str] = frozenset({"estado"})
+
+
+def _validar_encabezados_subpedido(encabezados: list[str]) -> list[str]:
+    """Valida los encabezados de la tabla de subpedidos contra `_COLUMNAS_SUBPEDIDO`.
+
+    Emite WARNING `subpedidos_columna_desconocida` por encabezados nuevos.
+
+    Returns:
+        Los encabezados desconocidos.
+
+    Raises:
+        ValueError: si falta una columna obligatoria — falla fuerte a
+            propósito, igual que las líneas (DEC-140).
+    """
+    presentes = {_COLUMNAS_SUBPEDIDO[h] for h in encabezados if h in _COLUMNAS_SUBPEDIDO}
+    faltantes = sorted(_COLUMNAS_SUBPEDIDO_OBLIGATORIAS - presentes)
+    if faltantes:
+        raise ValueError(
+            f"Tabla de subpedidos sin columnas obligatorias {faltantes} — "
+            f"encabezados del origen: {encabezados}"
+        )
+    desconocidos = sorted(
+        {
+            h
+            for h in encabezados
+            if h and h not in _COLUMNAS_SUBPEDIDO and h not in _ENCABEZADOS_SUBPEDIDO_SIN_CAMPO
+        }
+    )
+    if desconocidos:
+        log_event(
+            "subpedidos_columna_desconocida",
+            level="WARNING",
+            msg=f"Columnas nuevas en la tabla de subpedidos — campo no capturado: {desconocidos}",
+        )
+    return desconocidos
+
+
 # DEC-030 Fase 3 (híbrido): la lectura de filas + líneas de producto se
 # colapsa a un solo evaluate — antes era el mayor contribuyente de
 # round-trips del scraper (hasta 15-20 llamadas por línea de producto).
@@ -1466,13 +1687,29 @@ def _validar_encabezados_linea(encabezados: list[str]) -> tuple[list[str], list[
 # verdad que usa leer_celda_descuento() y sus tests
 # (DEC-022, DRY). cantidad_comprada/entregada se quedan como texto crudo:
 # to_num() y el WARNING de "no numérica" siguen en Python, sin cambios.
-# Recibe `_COLUMNAS_LINEA` como argumento (DEC-140): el mapeo vive una
-# sola vez, en Python.
+# Recibe `_COLUMNAS_LINEA` y `_COLUMNAS_SUBPEDIDO` como argumento (DEC-140,
+# auditoría 2026-09-25): los mapeos viven una sola vez, en Python.
 _JS_SUBPEDIDOS = """
-(columnas) => {
+({ columnas, columnasSubpedido }) => {
     const filas = Array.from(document.querySelectorAll(
         'div.el-scrollbar__wrap--hidden-default table tbody tr'
     ));
+    // Auditoría 2026-09-25: encabezados de la tabla que contiene las filas
+    // de subpedido (el selector de filas también alcanza otras tablas, como
+    // «Registros de pago»; solo la de subpedidos tiene columna de expansión).
+    const primera = filas.find((f) => f.querySelector('td.el-table__expand-column'));
+    const tablaSub = primera ? primera.closest('.el-table') : null;
+    const encabezadosSub = tablaSub
+        ? Array.from(tablaSub.querySelectorAll('.el-table__header thead th')).map((th) => {
+            const c = th.querySelector('.cell');
+            return (c ? c.textContent : th.textContent).trim();
+        })
+        : [];
+    const idxSub = {};
+    encabezadosSub.forEach((h, i) => {
+        const campo = columnasSubpedido[h];
+        if (campo && !(campo in idxSub)) idxSub[campo] = i;
+    });
     const subpedidos = [];
     for (const fila of filas) {
         const expandCol = fila.querySelector('td.el-table__expand-column');
@@ -1480,8 +1717,9 @@ _JS_SUBPEDIDOS = """
             const rawEl = fila.querySelector('span.child-order-id');
             const raw = rawEl ? rawEl.textContent.trim() : '';
             const celdas = Array.from(fila.querySelectorAll('td'));
-            const txt = (i, sel) => {
-                if (i >= celdas.length) return '';
+            const txt = (campo, sel) => {
+                const i = idxSub[campo];
+                if (i === undefined || i >= celdas.length) return '';
                 if (sel) {
                     const el = celdas[i].querySelector(sel);
                     return el ? el.textContent.trim() : '';
@@ -1490,13 +1728,14 @@ _JS_SUBPEDIDOS = """
             };
             subpedidos.push({
                 raw_child_order_id: raw,
-                estado: txt(3, '.el-tag__content'),
-                inicio_alistamiento: txt(4),
-                alistamiento_completado: txt(5),
-                alistador: txt(6),
-                inicio_inspeccion: txt(7),
-                inspeccion_completada: txt(8),
-                inspector: txt(9),
+                encabezados_subpedido: encabezadosSub,
+                estado: txt('estado', '.el-tag__content'),
+                inicio_alistamiento: txt('inicio_alistamiento'),
+                alistamiento_completado: txt('alistamiento_completado'),
+                alistador: txt('alistador'),
+                inicio_inspeccion: txt('inicio_inspeccion'),
+                inspeccion_completada: txt('inspeccion_completada'),
+                inspector: txt('inspector'),
                 lineas: [],
             });
         } else if (fila.querySelector('td.el-table__expanded-cell') && subpedidos.length > 0) {
@@ -1826,6 +2065,37 @@ async def extraer_total_subpedidos(page: Page) -> int | None:
         return None
 
 
+async def _evaluar_subpedidos(page: Page) -> list[dict]:
+    """Corre `_JS_SUBPEDIDOS` y valida los encabezados de la fila del
+    subpedido (auditoría 2026-09-25). Compartido por el modo completo y
+    `extraer_estados_subpedidos()` (solo_estado)."""
+    crudo = await page.evaluate(
+        _JS_SUBPEDIDOS,
+        {"columnas": _COLUMNAS_LINEA, "columnasSubpedido": _COLUMNAS_SUBPEDIDO},
+    )
+    if crudo:
+        _validar_encabezados_subpedido(crudo[0]["encabezados_subpedido"])
+    return crudo
+
+
+async def extraer_estados_subpedidos(page: Page) -> list[dict]:
+    """Número y estado de cada subpedido, sin expandir nada (modo solo_estado).
+
+    Auditoría 2026-09-25: antes el worker leía `celdas[3]` fila por fila con
+    ElementHandles; ahora usa el mismo JS y el mismo mapeo por encabezado
+    que el modo completo, en un solo `evaluate`.
+
+    Returns:
+        Lista de dicts con `numero_subpedido` y `estado`.
+    """
+    estados: list[dict] = []
+    for sp in await _evaluar_subpedidos(page):
+        raw = sp["raw_child_order_id"]
+        num_sub = raw.split(" + ", 1)[1].strip() if " + " in raw else raw
+        estados.append({"numero_subpedido": num_sub, "estado": sp["estado"]})
+    return estados
+
+
 async def extraer_subpedidos(page: Page) -> list[dict]:
     """Expande todos los subpedidos y extrae sus datos y líneas de productos.
 
@@ -1868,7 +2138,7 @@ async def extraer_subpedidos(page: Page) -> list[dict]:
             await asyncio.sleep(0.5)
 
     # 2 — Leer filas DESPUÉS de haber expandido todo (DEC-030 Fase 3)
-    crudo = await page.evaluate(_JS_SUBPEDIDOS, _COLUMNAS_LINEA)
+    crudo = await _evaluar_subpedidos(page)
 
     subpedidos: list[dict] = []
     for sp in crudo:

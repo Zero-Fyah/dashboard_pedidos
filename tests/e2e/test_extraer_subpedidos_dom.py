@@ -12,7 +12,35 @@ clase capturaba de más.
 import pytest
 from playwright.async_api import async_playwright
 
-from scraper.extractores import _COLUMNAS_LINEA, _JS_SUBPEDIDOS
+from scraper.extractores import _COLUMNAS_LINEA, _COLUMNAS_SUBPEDIDO, _JS_SUBPEDIDOS
+
+_ARGS = {"columnas": _COLUMNAS_LINEA, "columnasSubpedido": _COLUMNAS_SUBPEDIDO}
+
+# Encabezados de la tabla de subpedidos verificados en vivo el 2026-09-25:
+# 10 `th` para 10 `td`, el primero es la columna de expansión.
+_ENCABEZADOS_SUB = [
+    "",
+    "Número de subpedido",
+    "Categoría",
+    "Estado",
+    "Inicio de alistamiento",
+    "Alistamiento completado",
+    "Alistador",
+    "Inicio de inspección",
+    "Inspección completada",
+    "Inspector",
+]
+
+
+def _con_tabla(cuerpo: str, encabezados: list[str] = _ENCABEZADOS_SUB) -> str:
+    """Envuelve el cuerpo en la estructura de Element Plus: `.el-table` con
+    la tabla de encabezado aparte de la del cuerpo."""
+    ths = "".join(f'<th><div class="cell">{h}</div></th>' for h in encabezados)
+    return (
+        f'<div class="el-table"><table class="el-table__header"><thead><tr>{ths}'
+        f"</tr></thead></table>{cuerpo}</div>"
+    )
+
 
 # Encabezado real de 15 columnas (DOM compartido por el Arquitecto el
 # 2026-09-23, DEC-140): «Peso entregado» entre «Peso pedido» y
@@ -111,8 +139,8 @@ async def test_js_subpedidos_descarta_la_fila_total():
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         page = await browser.new_page()
-        await page.set_content(_DOM_CON_FILA_TOTAL)
-        resultado = await page.evaluate(_JS_SUBPEDIDOS, _COLUMNAS_LINEA)
+        await page.set_content(_con_tabla(_DOM_CON_FILA_TOTAL))
+        resultado = await page.evaluate(_JS_SUBPEDIDOS, _ARGS)
         await browser.close()
 
     assert len(resultado) == 1
@@ -174,8 +202,8 @@ async def test_js_subpedidos_sin_fila_total_no_pierde_lineas():
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         page = await browser.new_page()
-        await page.set_content(_DOM_SIN_FILA_TOTAL)
-        resultado = await page.evaluate(_JS_SUBPEDIDOS, _COLUMNAS_LINEA)
+        await page.set_content(_con_tabla(_DOM_SIN_FILA_TOTAL))
+        resultado = await page.evaluate(_JS_SUBPEDIDOS, _ARGS)
         await browser.close()
 
     assert len(resultado[0]["lineas"]) == 1
@@ -186,8 +214,8 @@ async def _evaluar(html: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         page = await browser.new_page()
-        await page.set_content(html)
-        resultado = await page.evaluate(_JS_SUBPEDIDOS, _COLUMNAS_LINEA)
+        await page.set_content(_con_tabla(html))
+        resultado = await page.evaluate(_JS_SUBPEDIDOS, _ARGS)
         await browser.close()
     return resultado
 
@@ -247,3 +275,76 @@ async def test_js_subpedidos_columnas_reordenadas_se_leen_por_nombre():
     assert linea["peso_entregado"] == "4.5KG"
     assert linea["peso_total"] == "13.5KG"
     assert linea["precio_unitario"] == ""  # columna ausente → vacío, no corrimiento
+
+
+# ── Auditoría 2026-09-25: la fila del subpedido también va por encabezado ────
+
+_FILA_SUB = """
+<div class="el-scrollbar__wrap--hidden-default"><table><tbody>
+  <tr><td class="el-table__expand-column"></td>{celdas}</tr>
+</tbody></table></div>"""
+
+
+async def _evaluar_crudo(html: str):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page()
+        await page.set_content(html)
+        resultado = await page.evaluate(_JS_SUBPEDIDOS, _ARGS)
+        await browser.close()
+    return resultado
+
+
+def _td(texto: str, etiqueta: bool = False) -> str:
+    return (
+        f'<td><span class="el-tag__content">{texto}</span></td>'
+        if etiqueta
+        else f"<td>{texto}</td>"
+    )
+
+
+@pytest.mark.e2e
+async def test_fila_subpedido_se_lee_por_encabezado():
+    celdas = (
+        '<td><span class="child-order-id">Arena + 9</span></td>'
+        + _td("Arena")
+        + _td("Completado", etiqueta=True)
+        + "".join(_td(v) for v in ["i-al", "f-al", "ALISTADOR", "i-in", "f-in", "INSPECTOR"])
+    )
+    sp = (await _evaluar_crudo(_con_tabla(_FILA_SUB.format(celdas=celdas))))[0]
+    assert sp["encabezados_subpedido"] == _ENCABEZADOS_SUB
+    assert sp["estado"] == "Completado"
+    assert sp["alistador"] == "ALISTADOR"
+    assert sp["inspector"] == "INSPECTOR"
+
+
+@pytest.mark.e2e
+async def test_columna_nueva_antes_del_estado_no_lo_corre():
+    """El caso que motivó el cambio: el origen inserta una columna antes de
+    «Estado». Leyendo `celdas[3]` se habría guardado la celda nueva."""
+    encabezados = _ENCABEZADOS_SUB[:3] + ["Bodega"] + _ENCABEZADOS_SUB[3:]
+    celdas = (
+        '<td><span class="child-order-id">Arena + 9</span></td>'
+        + _td("Arena")
+        + _td("Bogotá", etiqueta=True)
+        + _td("Pendiente de entrega", etiqueta=True)
+        + "".join(_td(v) for v in ["i-al", "f-al", "ALISTADOR", "i-in", "f-in", "INSPECTOR"])
+    )
+    sp = (await _evaluar_crudo(_con_tabla(_FILA_SUB.format(celdas=celdas), encabezados)))[0]
+    assert sp["estado"] == "Pendiente de entrega"
+    assert sp["alistador"] == "ALISTADOR"
+    assert sp["inspector"] == "INSPECTOR"
+
+
+@pytest.mark.e2e
+async def test_sin_encabezado_el_estado_queda_vacio_y_lo_reporta():
+    """Sin tabla de encabezado el JS no inventa posiciones: devuelve el
+    estado vacío y la lista de encabezados vacía, que Python rechaza."""
+    celdas = (
+        '<td><span class="child-order-id">Arena + 9</span></td>'
+        + _td("Arena")
+        + _td("Completado", etiqueta=True)
+    )
+    sp = (await _evaluar_crudo(_FILA_SUB.format(celdas=celdas)))[0]
+    assert sp["encabezados_subpedido"] == []
+    assert sp["estado"] == ""

@@ -1,10 +1,12 @@
 """
 orquestador.py — main(): flujo completo del run (DEC-013).
 
-Prepara DB y browser, arma la lista de IDs (3 carriles en incremental,
-rango completo en modo completo), lanza workers + persistencia, corre los
-pases dead-letter y emite el resumen final (FIX N-1) con exit code para el
-Task Scheduler. Incluye el CLI (build_arg_parser).
+Prepara DB y browser, arma la lista de IDs (4 carriles en incremental,
+selección desde la base en mantenimiento, archivo de IDs con
+`--ids-archivo` y rango completo en modo completo), lanza workers +
+persistencia, corre los pases dead-letter y emite el resumen final
+(FIX N-1) con exit code para el scheduler (systemd, DEC-125). Incluye el
+CLI (build_arg_parser).
 """
 
 import argparse
@@ -12,6 +14,7 @@ import asyncio
 import json
 import re
 import time
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -28,6 +31,7 @@ from scraper.config import (
     CLAVE,
     CONFIG,
     USUARIO,
+    flags_v8,
     log_event,
     validar_config,
 )
@@ -165,6 +169,122 @@ async def _autenticar_workers(browser: Browser) -> list[tuple[int, BrowserContex
         msg=f"{len(workers)}/{CONFIG['NUM_WORKERS']} workers autenticados en paralelo",
     )
     return workers
+
+
+def argumentos_navegador() -> list[str]:
+    """Flags extra de Chromium para el navegador del scraper (DEC-150).
+
+    `BLOQUEAR_IMAGENES`: Blink no pide imágenes. Producción ya las abortaba
+    con `_bloquear_recursos_pesados` (DEC-029); el flag evita además el viaje
+    de cada request de imagen al handler (driver ~230 → ~170 MB, -3%).
+    `V8_OPTIMIZAR_TAMANO`: V8 compila y reserva memoria priorizando tamaño.
+    """
+    args = []
+    if CONFIG["BLOQUEAR_IMAGENES"]:
+        args.append("--blink-settings=imagesEnabled=false")
+    return [*args, *flags_v8()]
+
+
+async def _llenar_cola(pedidos_queue: asyncio.Queue, ids: list[str]) -> None:
+    """Encola los IDs y, detrás, un centinela por worker POSIBLE (DEC-144).
+
+    No uno por worker vivo (DEC-142): un descartado puede sumarse después
+    (`_worker_tardio`). Cada consumidor toma a lo sumo un centinela y nunca
+    hay más de `NUM_WORKERS`, así que nadie queda bloqueado en `get()`; los
+    sobrantes los descarta el drenaje de FIX C-1.
+    """
+    for pid in ids:
+        await pedidos_queue.put(pid)
+    for _ in range(CONFIG["NUM_WORKERS"]):
+        await pedidos_queue.put(None)
+
+
+# DEC-144: la espera entre rondas se parte en tramos para notar pronto que
+# la cola se vació y no retener el cierre del run hasta 120 s.
+_TRAMO_ESPERA_REINTENTO_S = 5.0
+
+
+def _hay_trabajo_para_reintento(fill_task: asyncio.Task, pedidos_queue: asyncio.Queue) -> bool:
+    """¿Vale la pena que un worker descartado reintente el login? (DEC-144)
+
+    Con el llenado terminado, la cola guarda los IDs restantes más, a lo
+    sumo, `NUM_WORKERS` centinelas: más ítems que eso garantiza al menos un
+    pedido real. Con `NUM_WORKERS` pedidos o menos pendientes no compensa un
+    login de un minuto — los terminan los workers que ya están dentro.
+    """
+    return not fill_task.done() or pedidos_queue.qsize() > CONFIG["NUM_WORKERS"]
+
+
+async def _reautenticar_worker(
+    browser: Browser,
+    wid: int,
+    hay_trabajo: Callable[[], bool],
+) -> BrowserContext | None:
+    """Reintenta el login de un worker descartado al arrancar (DEC-144).
+
+    Hasta `LOGIN_REINTENTO_RONDAS` rondas, cada una tras esperar
+    `LOGIN_REINTENTO_ESPERA_S`. Antes de cada intento comprueba
+    `hay_trabajo()`: si la cola ya no lo justifica, se retira sin loguearse.
+
+    Returns:
+        El contexto autenticado, o None si se agotaron las rondas o no
+        quedaba trabajo.
+    """
+    rondas = CONFIG["LOGIN_REINTENTO_RONDAS"]
+    for ronda in range(1, rondas + 1):
+        restante = float(CONFIG["LOGIN_REINTENTO_ESPERA_S"])
+        while restante > 0 and hay_trabajo():
+            tramo = min(_TRAMO_ESPERA_REINTENTO_S, restante)
+            await asyncio.sleep(tramo)
+            restante -= tramo
+        if not hay_trabajo():
+            log_event(
+                "worker_login_reintento_omitido",
+                worker_id=wid,
+                msg=f"Sin trabajo pendiente — el worker no reintenta (ronda {ronda}/{rondas}, DEC-144)",
+            )
+            return None
+        try:
+            ctx = await _preparar_contexto_worker(browser, wid)
+        except Exception as exc:
+            log_event(
+                "worker_login_reintento_fallido",
+                level="WARNING",
+                worker_id=wid,
+                msg=f"Ronda {ronda}/{rondas}: {exc!r} (DEC-144)",
+            )
+            continue
+        log_event(
+            "worker_login_reintento_ok",
+            worker_id=wid,
+            msg=f"Worker incorporado al run en la ronda {ronda}/{rondas} (DEC-144)",
+        )
+        return ctx
+    log_event(
+        "worker_login_reintento_agotado",
+        level="ERROR",
+        worker_id=wid,
+        msg=f"Worker fuera del run tras {rondas} rondas de reintento (DEC-144)",
+    )
+    return None
+
+
+async def _worker_tardio(
+    browser: Browser,
+    wid: int,
+    hay_trabajo: Callable[[], bool],
+    consumir: Callable[[int, BrowserContext], Awaitable[None]],
+) -> None:
+    """Reintenta el login de un worker descartado y, si entra, lo pone a
+    consumir la misma cola que los demás (DEC-144). Es dueño de su
+    contexto: lo cierra al terminar."""
+    ctx = await _reautenticar_worker(browser, wid, hay_trabajo)
+    if ctx is None:
+        return
+    try:
+        await consumir(wid, ctx)
+    finally:
+        await ctx.close()
 
 
 async def obtener_ids_activos(db_path: str) -> list[str]:
@@ -373,6 +493,17 @@ async def obtener_ids_reextraccion(db_path: str, limite: int) -> list[str]:
     return [r[0] for r in rows]
 
 
+def leer_ids_archivo(ruta: Path) -> list[str]:
+    """IDs de un archivo, uno por línea, sin vacíos, comentarios ni repetidos
+    (en el orden del archivo). DEC-152."""
+    ids = []
+    for linea in ruta.read_text(encoding="utf-8").splitlines():
+        valor = linea.split("#", 1)[0].strip()
+        if valor:
+            ids.append(valor)
+    return list(dict.fromkeys(ids))
+
+
 def calcular_desde_nuevos(
     ultima_ok: str | None,
     *,
@@ -453,6 +584,47 @@ def construir_resumen(
     }
 
 
+def combinar_ids_incremental(
+    ids_activos: list[str],
+    ids_error: list[str],
+    ids_nuevos: list[str],
+    ids_reextraccion_candidatos: list[str],
+) -> tuple[list[str], frozenset[str], int]:
+    """Combina los 4 carriles del incremental en la cola final (DEC-140/159).
+
+    DEC-159: un candidato de re-extracción se fuerza a modo completo
+    **siempre**, esté o no ya en otro carril. Antes se excluía cualquier
+    candidato ya presente en `ids_activos`/`ids_error`/`ids_nuevos` —
+    correcto para no encolarlo dos veces, pero el mismo filtro también lo
+    sacaba de `ids_forzar_completo`, así que nunca se forzaba a completo.
+    Medido el 2026-09-28: con el histórico cerrado ya terminado (DEC-140,
+    2026-09-26), el **100% de los 1.076 candidatos restantes ya estaban en
+    `ids_activos`** — el carril llevaba semanas sin ningún efecto real
+    sobre esos pedidos, no solo ocasionalmente.
+
+    Args:
+        ids_activos, ids_error, ids_nuevos: los otros tres carriles del
+            incremental, ya calculados.
+        ids_reextraccion_candidatos: salida cruda de
+            `obtener_ids_reextraccion()`, sin filtrar.
+
+    Returns:
+        Tupla `(ids_pendientes, ids_forzar_completo, n_reextraccion_nuevos)`:
+        la cola final sin duplicados, el set completo a forzar a completo
+        (incluye los que ya estaban en otro carril), y cuántos candidatos
+        de re-extracción eran nuevos en la cola — para el desglose por
+        carril del resumen (los que ya estaban en otro carril se cuentan
+        ahí, no acá, aunque también se fuercen a completo).
+    """
+    ya_en_cola = set(ids_activos) | set(ids_error) | set(ids_nuevos)
+    ids_reextraccion_nuevos = [i for i in ids_reextraccion_candidatos if i not in ya_en_cola]
+    ids_pendientes = list(
+        dict.fromkeys(ids_activos + ids_error + ids_nuevos + ids_reextraccion_nuevos)
+    )
+    ids_forzar_completo = frozenset(ids_reextraccion_candidatos)
+    return ids_pendientes, ids_forzar_completo, len(ids_reextraccion_nuevos)
+
+
 async def main(args: argparse.Namespace) -> int:
     """Orquesta el scraping completo: DB, lista de IDs, workers y persistencia.
 
@@ -470,6 +642,16 @@ async def main(args: argparse.Namespace) -> int:
         Exit code del run: 0 si tasa_exito_pct >= 95, 1 si no (AUD-B7:
         el sys.exit vive en __main__, no dentro de la corrutina).
     """
+    # DEC-152: la re-extracción dirigida solo tiene sentido en modo completo;
+    # en los otros se ignoraría en silencio.
+    ids_archivo = getattr(args, "ids_archivo", None)
+    if ids_archivo is not None and args.modo != "completo":
+        log_event(
+            "argumentos_invalidos",
+            level="ERROR",
+            msg=f"--ids-archivo requiere --modo completo (llegó --modo {args.modo})",
+        )
+        return 2
     t_inicio = time.monotonic()
     db_path = get_db_path()
 
@@ -489,6 +671,7 @@ async def main(args: argparse.Namespace) -> int:
         browser: Browser = await pw.chromium.launch(
             headless=CONFIG["HEADLESS"],
             slow_mo=CONFIG["SLOW_MO"],
+            args=argumentos_navegador(),
         )
 
         # ── Obtener lista de IDs ──────────────────────────────────────────
@@ -559,27 +742,19 @@ async def main(args: argparse.Namespace) -> int:
             ids_nuevos = [i for i in ids_nuevos_servidor if i not in ids_en_db]
 
             # Proceso 4 — Re-extracción del histórico por tandas (DEC-140).
-            # Se excluyen los que ya van por otro carril: re-extraerlos dos
-            # veces en el mismo ciclo no aporta nada.
-            _ya_en_cola = set(ids_activos) | set(ids_error) | set(ids_nuevos)
-            ids_reextraccion = [
-                i
-                for i in await obtener_ids_reextraccion(db_path, CONFIG["REEXTRACCION_POR_CICLO"])
-                if i not in _ya_en_cola
-            ]
-            # DEC-142: se fuerza en memoria (ids_forzar_completo), no en la base.
-            ids_forzar_completo = frozenset(ids_reextraccion)
-
-            # Unión final sin duplicados
-            ids_pendientes: list[str] = list(
-                dict.fromkeys(ids_activos + ids_error + ids_nuevos + ids_reextraccion)
+            ids_reextraccion_candidatos = await obtener_ids_reextraccion(
+                db_path, CONFIG["REEXTRACCION_POR_CICLO"]
             )
+            ids_pendientes, ids_forzar_completo, n_reextraccion_nuevos = combinar_ids_incremental(
+                ids_activos, ids_error, ids_nuevos, ids_reextraccion_candidatos
+            )
+            n_reextraccion_ya_en_otro_carril = len(ids_forzar_completo) - n_reextraccion_nuevos
             # HAL-005: desglose por carril para el resumen JSON final.
             carriles: dict[str, int] | None = {
                 "activos": len(ids_activos),
                 "errores": len(ids_error),
                 "nuevos": len(ids_nuevos),
-                "reextraccion": len(ids_reextraccion),
+                "reextraccion": n_reextraccion_nuevos,
             }
             log_event(
                 "ids_filtrados",
@@ -587,7 +762,9 @@ async def main(args: argparse.Namespace) -> int:
                     f"Activos: {len(ids_activos)} | "
                     f"Errores: {len(ids_error)} | "
                     f"Nuevos: {len(ids_nuevos)} | "
-                    f"Re-extracción DEC-140: {len(ids_reextraccion)} | "
+                    f"Re-extracción DEC-140: {n_reextraccion_nuevos} nuevos en cola "
+                    f"(+{n_reextraccion_ya_en_otro_carril} ya en otro carril, forzados a "
+                    f"completo igual — DEC-159) | "
                     f"Ventana nuevos: {fecha_desde_nuevos}..{fecha_hoy} | "
                     f"Total: {len(ids_pendientes)}"
                 ),
@@ -614,6 +791,20 @@ async def main(args: argparse.Namespace) -> int:
                     f"Pedidos entregados sin información de entrega: "
                     f"{len(ids_pendientes)} | ventana: {_v_desde} .. {_v_hasta}"
                 ),
+            )
+
+        elif ids_archivo:
+            # DEC-152: re-extracción dirigida (reparación de D1/D2/D3) — los
+            # IDs del archivo, en modo completo forzado en memoria (DEC-142),
+            # sin recorrer el listado. Como el mantenimiento, no mira pedidos
+            # nuevos y por lo tanto no mueve el watermark.
+            ids_pendientes = leer_ids_archivo(args.ids_archivo)
+            ids_forzar_completo = frozenset(ids_pendientes)
+            carriles = None
+            fecha_cobertura = None
+            log_event(
+                "ids_filtrados",
+                msg=f"Re-extracción dirigida desde {args.ids_archivo}: {len(ids_pendientes)} pedidos",
             )
 
         else:
@@ -677,7 +868,9 @@ async def main(args: argparse.Namespace) -> int:
         # independiente (contexto propio, sin estado compartido), así que
         # asyncio.gather en vez del for secuencial no cambia el resultado
         # — solo el tiempo de pared. DEC-142: los que no logran entrar se
-        # descartan y el run sigue con el resto (`workers` lleva el wid).
+        # descartan y el run sigue con el resto (`workers` lleva el wid);
+        # DEC-144: cada descartado reintenta el login en segundo plano y,
+        # si entra, se suma a la misma cola (`_worker_tardio`, paso 5).
         workers = await _autenticar_workers(browser)
         contexts: list[BrowserContext] = [ctx for _, ctx in workers]
 
@@ -707,31 +900,44 @@ async def main(args: argparse.Namespace) -> int:
         persist_task = asyncio.create_task(
             persistencia_worker(resultados_queue, db_path, run_stats)
         )
-        worker_tasks = [
-            asyncio.create_task(
-                scraper_worker(
-                    wid,
-                    ctx,
-                    pedidos_queue,
-                    resultados_queue,
-                    db_path,
-                    ids_forzar_completo=ids_forzar_completo,
-                )
+
+        async def _consumir(wid: int, ctx: BrowserContext) -> None:
+            await scraper_worker(
+                wid,
+                ctx,
+                pedidos_queue,
+                resultados_queue,
+                db_path,
+                ids_forzar_completo=ids_forzar_completo,
             )
-            for wid, ctx in workers
-        ]
 
         # — Paso 5: llenar la cola concurrentemente con los workers —
-        async def _fill() -> None:
-            for pid in ids_pendientes:
-                await pedidos_queue.put(pid)
-            for _ in workers:  # un centinela por worker VIVO (DEC-142)
-                await pedidos_queue.put(None)
-
-        fill_task = asyncio.create_task(_fill())
+        fill_task = asyncio.create_task(_llenar_cola(pedidos_queue, ids_pendientes))
+        # (wid, task) de todos los consumidores: los que entraron al arrancar
+        # y los descartados que reintentan el login (DEC-144).
+        tareas_workers: list[tuple[int, asyncio.Task]] = [
+            (wid, asyncio.create_task(_consumir(wid, ctx))) for wid, ctx in workers
+        ]
+        ids_vivos = {wid for wid, _ in workers}
+        tareas_workers += [
+            (
+                wid,
+                asyncio.create_task(
+                    _worker_tardio(
+                        browser,
+                        wid,
+                        lambda: _hay_trabajo_para_reintento(fill_task, pedidos_queue),
+                        _consumir,
+                    )
+                ),
+            )
+            for wid in range(CONFIG["NUM_WORKERS"])
+            if wid not in ids_vivos
+        ]
+        worker_tasks = [t for _, t in tareas_workers]
         # FIX C-1: timeout global de red de seguridad — si algo cuelga pese a
         # los timeouts locales, el run cancela los workers y termina con ERROR
-        # en el log en vez de quedar congelado bajo el Task Scheduler.
+        # en el log en vez de quedar congelado bajo el scheduler (systemd).
         try:
             results = await asyncio.wait_for(
                 asyncio.gather(fill_task, *worker_tasks, return_exceptions=True),
@@ -749,7 +955,7 @@ async def main(args: argparse.Namespace) -> int:
             # wait_for ya canceló el gather; re-esperar las tasks recoge
             # los CancelledError sin relanzarlos.
             results = await asyncio.gather(fill_task, *worker_tasks, return_exceptions=True)
-        for (wid, _), res in zip(workers, results[1:], strict=True):  # [0] es fill_task
+        for (wid, _), res in zip(tareas_workers, results[1:], strict=True):  # [0] es fill_task
             if isinstance(res, BaseException):
                 log_event(
                     "worker_exception",
@@ -977,6 +1183,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "scraping_completo=1 | mantenimiento: re-extrae los pedidos "
             "entregados a los que les falta la información de entrega, antes "
             "de que el origen deje de mostrarla (DEC-092)"
+        ),
+    )
+    parser.add_argument(
+        "--ids-archivo",
+        type=Path,
+        default=None,
+        help=(
+            "Solo con --modo completo: re-extrae exactamente los IDs del "
+            "archivo (uno por línea; # comenta) sin recorrer el listado ni "
+            "mover el watermark (DEC-152)"
         ),
     )
     return parser

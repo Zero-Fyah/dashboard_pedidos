@@ -2,14 +2,17 @@
 workers.py — Selección de modo, scraping de pedido y worker con circuit
 breaker (DEC-013).
 
-scraper_worker() consume IDs de la cola; procesar_pedido() determina el
-modo (completo / con_cantidades / solo_estado), extrae y publica en la
-cola de resultados.
+scraper_worker() consume IDs de la cola con una página que renueva cada
+`PAGINA_NUEVA_CADA_N` pedidos (DEC-148); procesar_pedido() determina el
+modo (completo / con_cantidades / solo_estado), espera las secciones
+asíncronas que ese modo lee (DEC-152), extrae y publica en la cola de
+resultados.
 """
 
 import asyncio
 import random
 import time
+from collections.abc import Awaitable, Callable
 
 import aiosqlite
 from playwright.async_api import (
@@ -32,8 +35,10 @@ from scraper.config import (
     registrar_rate_limit,
 )
 from scraper.extractores import (
+    SeguidorSecciones,
     extraer_detalle_diferencias,
     extraer_estadisticas_monto,
+    extraer_estados_subpedidos,
     extraer_gestion_diferencias,
     extraer_info_entrega,
     extraer_info_general,
@@ -103,6 +108,51 @@ def determinar_modo(
 # ─────────────────────────────────────────────
 
 
+class SesionExpiradaError(RuntimeError):
+    """La página terminó en el login mientras se esperaba el render."""
+
+
+def _exigir_sesion(page: Page) -> None:
+    """Falla el intento si la SPA redirigió al login durante el render.
+
+    Auditoría 2026-09-25, validado contra el origen: sin sesión, `solo_estado`
+    y `con_cantidades` (cuya espera de render solo avisa) extraían vacío y
+    reportaban `pedido_ok` — el pedido no se actualizaba, contaba como éxito
+    y nunca se re-logueaba. Fallar acá lleva al camino de re-login del
+    `except` de `procesar_pedido()`.
+    """
+    if "/login" in page.url:
+        raise SesionExpiradaError("Redirigido al login durante el render — sesión expirada")
+
+
+# DEC-152 (D3): secciones asíncronas que lee cada modo. `solo_estado` y
+# `con_cantidades` no leen pagos: esperarlos solo costaría tiempo.
+_SECCIONES_POR_MODO: dict[str, tuple[str, ...]] = {
+    "completo": ("timeline", "registro_ops", "pagos"),
+    "con_cantidades": ("timeline", "registro_ops"),
+    "solo_estado": ("timeline", "registro_ops"),
+}
+
+
+async def _esperar_secciones(
+    seguidor: SeguidorSecciones | None, modo: str, worker_id: int, id_pedido: str
+) -> None:
+    """Espera las secciones asíncronas del modo; si alguna no llega, avisa y
+    sigue — la extracción la leerá vacía y la persistencia no pisa con vacío."""
+    if seguidor is None:
+        return
+    faltan = await seguidor.esperar(_SECCIONES_POR_MODO[modo])
+    if faltan:
+        log_event(
+            "secciones_async_incompletas",
+            level="WARNING",
+            worker_id=worker_id,
+            id_pedido=id_pedido,
+            msg=f"Sin respuesta del origen en {CONFIG['SECCIONES_TIMEOUT_MS']} ms: "
+            f"{', '.join(sorted(faltan))} — se extrae igual (modo={modo})",
+        )
+
+
 async def procesar_pedido(
     worker_id: int,
     page: Page,
@@ -112,6 +162,7 @@ async def procesar_pedido(
     max_reintentos: int | None = None,
     usar_push: bool = False,
     forzar_completo: bool = False,
+    seguidor: SeguidorSecciones | None = None,
 ) -> bool:
     """Determina el modo de extracción, navega al detalle y publica en la cola.
 
@@ -140,6 +191,9 @@ async def procesar_pedido(
             excepción, como red de seguridad de "reinicio limpio" (validado
             en el piloto). Default False preserva el comportamiento previo
             exacto — quien no pase este parámetro no nota ningún cambio.
+        seguidor: DEC-152 (D3) — con él, antes de extraer se espera a que
+            lleguen las secciones asíncronas que el modo lee (timeline,
+            registro de operaciones y, en completo, pagos). None = no espera.
 
     Returns:
         True si el pedido fue extraído y publicado con éxito, False si no.
@@ -201,6 +255,8 @@ async def procesar_pedido(
     for intento in range(1, max_reintentos + 1):
         try:
             t_nav_ini = time.monotonic()
+            if seguidor is not None:
+                seguidor.reiniciar()
             # Navegación interna vía router solo en el primer intento — un
             # reintento siempre usa page.goto() sin excepción: un "reinicio
             # limpio" tras un fallo previo, validado en el piloto de
@@ -249,7 +305,9 @@ async def procesar_pedido(
                     # El selector no apareció en el tiempo esperado.
                     # La extracción retornará [] — los Cambios 2/3 lo manejan.
                     pass
+                await _esperar_secciones(seguidor, modo, worker_id, id_pedido)
                 render_ms = int((time.monotonic() - t_render_ini) * 1000)
+                _exigir_sesion(page)
                 t_extract_ini = time.monotonic()
 
                 info_general = await extraer_info_general(page)
@@ -307,7 +365,9 @@ async def procesar_pedido(
                         id_pedido=id_pedido,
                         msg="Tabla de subpedidos no renderizada — cantidades no actualizadas en esta pasada",
                     )
+                await _esperar_secciones(seguidor, modo, worker_id, id_pedido)
                 render_ms = int((time.monotonic() - t_render_ini) * 1000)
+                _exigir_sesion(page)
                 t_extract_ini = time.monotonic()
                 subpedidos = await extraer_subpedidos(page)
                 timeline = await extraer_timeline(page, id_pedido)
@@ -346,25 +406,13 @@ async def procesar_pedido(
                         id_pedido=id_pedido,
                         msg="Tabla de subpedidos no renderizada — estados no actualizados en esta pasada",
                     )
+                await _esperar_secciones(seguidor, modo, worker_id, id_pedido)
                 render_ms = int((time.monotonic() - t_render_ini) * 1000)
+                _exigir_sesion(page)
                 t_extract_ini = time.monotonic()
-                filas = await page.query_selector_all(
-                    "div.el-scrollbar__wrap--hidden-default table tbody tr"
-                )
-                subs_estado: list[dict] = []
-                for fila in filas:
-                    if not await fila.query_selector("td.el-table__expand-column"):
-                        continue
-                    raw_el = await fila.query_selector("span.child-order-id")
-                    raw = (await raw_el.inner_text()).strip() if raw_el else ""
-                    num_sub = raw.split(" + ", 1)[1].strip() if " + " in raw else raw
-                    celdas = await fila.query_selector_all("td")
-                    if len(celdas) > 3:
-                        estado_el = await celdas[3].query_selector(".el-tag__content")
-                        estado = (await estado_el.inner_text()).strip() if estado_el else ""
-                    else:
-                        estado = ""
-                    subs_estado.append({"numero_subpedido": num_sub, "estado": estado})
+                # Auditoría 2026-09-25: por encabezado, igual que el modo
+                # completo — antes `celdas[3]` fila por fila.
+                subs_estado = await extraer_estados_subpedidos(page)
 
                 # DEC-030 Fase 2 (fix, no optimización a negociar — integral.md
                 # ya documentaba "fase activa: solo se actualiza su estado";
@@ -426,6 +474,32 @@ async def procesar_pedido(
                     id_pedido=id_pedido,
                     msg=str(ss_exc),
                 )
+            # Auditoría 2026-09-25: la expiración de sesión casi nunca se ve en
+            # el chequeo de arriba. `goto()` vuelve con la URL del detalle y
+            # la SPA redirige al login de Cognito DESPUÉS, mientras se espera
+            # el render; el intento falla por timeout y, sin esto, los
+            # reintentos navegan otra vez sin sesión. Medido el 2026-09-25: un
+            # ciclo de ~5 h (1 worker) perdió la sesión y cada pedido agotaba
+            # sus 5 intentos. Se detecta después del fallo, mirando dónde
+            # quedó la página, y se re-loguea antes del siguiente intento.
+            if intento < max_reintentos and "/login" in page.url:
+                try:
+                    async with LOGIN_LOCK:
+                        log_event(
+                            "session_expired",
+                            worker_id=worker_id,
+                            id_pedido=id_pedido,
+                            msg="Sesión expirada (redirección al login tras navegar) — re-login",
+                        )
+                        await login(page, USUARIO, CLAVE)
+                except Exception as login_exc:
+                    log_event(
+                        "relogin_fallido",
+                        level="WARNING",
+                        worker_id=worker_id,
+                        id_pedido=id_pedido,
+                        msg=f"Re-login tras sesión expirada falló: {login_exc}",
+                    )
             if intento < max_reintentos:
                 backoff = min(
                     CONFIG["BACKOFF_BASE_S"] ** intento + random.uniform(0, 1),
@@ -505,22 +579,41 @@ async def scraper_worker(
             msg=f"HTTP 429 — pausa de {wait_s:.0f}s señalizada para los workers",
         )
 
-    page = await context.new_page()
-    page.on("response", _response_handler)
+    # DEC-152 (D3): uno por worker, enganchado a cada página que abre.
+    seguidor = SeguidorSecciones()
+
+    async def _abrir_pagina() -> Page:
+        nueva = await context.new_page()
+        nueva.on("response", _response_handler)
+        seguidor.conectar(nueva)
+        return nueva
+
+    # DEC-148: la página puede renovarse durante el loop; el `finally` cierra
+    # siempre la vigente.
+    pagina = [await _abrir_pagina()]
+
+    async def _renovar_pagina() -> Page:
+        # Se cierra primero la vieja: así nunca conviven dos renderers del
+        # mismo worker, que es justo el pico que se quiere bajar.
+        await pagina[0].close()
+        pagina[0] = await _abrir_pagina()
+        return pagina[0]
 
     try:
         await _consumir_cola(
             worker_id,
-            page,
+            pagina[0],
             pedidos_queue,
             resultados_queue,
             db_path,
             max_reintentos,
             current_pedido,
             ids_forzar_completo,
+            renovar_pagina=_renovar_pagina,
+            seguidor=seguidor,
         )
     finally:
-        await page.close()
+        await pagina[0].close()
 
 
 async def _consumir_cola(
@@ -532,13 +625,22 @@ async def _consumir_cola(
     max_reintentos: int | None,
     current_pedido: list[str],
     ids_forzar_completo: frozenset[str] = frozenset(),
+    renovar_pagina: Callable[[], Awaitable[Page]] | None = None,
+    seguidor: SeguidorSecciones | None = None,
 ) -> None:
     """Cuerpo del loop de scraper_worker() — extraído para que la página
     se cree y se cierre una sola vez en el llamador, con garantía de
-    cierre (try/finally) sin importar por cuál salida termine el loop."""
+    cierre (try/finally) sin importar por cuál salida termine el loop.
+
+    DEC-148: con `PAGINA_NUEVA_CADA_N` > 0 y `renovar_pagina`, cada N
+    pedidos se descarta la página y se abre una nueva — la SPA del origen
+    retiene ~13 MB de DOM por navegación interna y solo los libera con un
+    documento nuevo (un renderer nuevo)."""
     consecutive_failures = 0
     circuit_reopenings = 0
     contador_desde_refresh = 0
+    pedidos_en_pagina = 0
+    cada_n = CONFIG["PAGINA_NUEVA_CADA_N"]
 
     while True:
         # Auditoría de rendimiento 2026-08-26: la ocupación medida de los
@@ -600,6 +702,7 @@ async def _consumir_cola(
                 max_reintentos=max_reintentos,
                 usar_push=usar_push,
                 forzar_completo=id_pedido in ids_forzar_completo,
+                seguidor=seguidor,
             )
         except Exception as exc:
             # AUD-M9: red de seguridad final — procesar_pedido() ya cubre su
@@ -619,6 +722,14 @@ async def _consumir_cola(
                 {"id_pedido": id_pedido, "_error": True, "detalle": str(exc)}
             )
             exito = False
+
+        pedidos_en_pagina += 1
+        if renovar_pagina is not None and cada_n > 0 and pedidos_en_pagina >= cada_n:
+            page = await renovar_pagina()
+            pedidos_en_pagina = 0
+            # Página nueva = documento vacío: el siguiente pedido entra con
+            # page.goto() completo, no con push del router.
+            contador_desde_refresh = -1
 
         if exito:
             consecutive_failures = 0

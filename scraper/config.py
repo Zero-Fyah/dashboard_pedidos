@@ -69,6 +69,8 @@ class ConfigDict(TypedDict):
     bochica_app_clave: str
     NAV_TIMEOUT_MS: int
     ELEM_TIMEOUT_MS: int
+    SECCIONES_TIMEOUT_MS: int
+    SECCIONES_ASENTAR_MS: int
     PAUSA_ENTRE_PEDIDOS_S: float
     PAUSA_PAGINACION_S: float
     MAX_REINTENTOS: int
@@ -80,6 +82,12 @@ class ConfigDict(TypedDict):
     RATE_LIMIT_WAIT_S: int
     INCREMENTAL_LOOKBACK_MAX_DIAS: int
     NUM_WORKERS: int
+    REEXTRACCION_POR_CICLO: int
+    PAGINA_NUEVA_CADA_N: int
+    BLOQUEAR_IMAGENES: bool
+    V8_OPTIMIZAR_TAMANO: bool
+    LOGIN_REINTENTO_ESPERA_S: int
+    LOGIN_REINTENTO_RONDAS: int
     RUN_TIMEOUT_S: int
     LISTADO_TIMEOUT_S: int
     MAX_SCREENSHOTS: int
@@ -118,6 +126,11 @@ CONFIG: ConfigDict = {
     # Timeouts (ms)
     "NAV_TIMEOUT_MS": 45_000,
     "ELEM_TIMEOUT_MS": 20_000,
+    # DEC-152 (D3): tope de espera a las secciones asíncronas del detalle
+    # (timeline, registro de operaciones, pagos) y margen para que Vue las
+    # pinte tras recibirlas. Medido: llegan 60-400 ms después de la cabecera.
+    "SECCIONES_TIMEOUT_MS": 5_000,
+    "SECCIONES_ASENTAR_MS": 100,
     # Pausas (segundos)
     "PAUSA_ENTRE_PEDIDOS_S": 1.2,
     "PAUSA_PAGINACION_S": 2.0,
@@ -140,11 +153,27 @@ CONFIG: ConfigDict = {
     # contención con NUM_WORKERS reducido sin editar código. Default 5
     # preserva el comportamiento histórico.
     "NUM_WORKERS": _env_int("SCRAPER_NUM_WORKERS", 5),
+    # DEC-144: un worker que no entra al arrancar reintenta el login
+    # durante el run — espera entre rondas y número de rondas. La lentitud
+    # del origen que lo dejó fuera suele pasar en minutos.
+    "LOGIN_REINTENTO_ESPERA_S": _env_int("SCRAPER_LOGIN_REINTENTO_ESPERA_S", 120),
+    "LOGIN_REINTENTO_RONDAS": _env_int("SCRAPER_LOGIN_REINTENTO_RONDAS", 3),
     # DEC-140: pedidos que cada ciclo incremental re-extrae para completar
     # `peso_entregado` y `observaciones` del histórico, por tandas y dentro
     # del mismo ciclo (sin segundo proceso sobre el lock ni RAM extra,
     # DEC-139). 500 ≈ +6-7 min por ciclo al ritmo de DEC-124. 0 lo apaga.
     "REEXTRACCION_POR_CICLO": _env_int("SCRAPER_REEXTRACCION_POR_CICLO", 500),
+    # DEC-148: cada worker abre una página nueva cada N pedidos. La SPA del
+    # origen retiene ~13 MB de DOM por navegación interna y solo los suelta
+    # al descartar el documento (medido 2026-09-26). 0 = apagado.
+    "PAGINA_NUEVA_CADA_N": _env_int("SCRAPER_PAGINA_NUEVA_CADA_N", 0),
+    # DEC-150: el navegador del scraper no descarga ni decodifica imágenes
+    # (ninguna extracción las lee). Medido con 1 worker y 100 pedidos: -26%
+    # de memoria del motor y -5% de tiempo, datos del modo completo idénticos.
+    "BLOQUEAR_IMAGENES": _env_bool("SCRAPER_BLOQUEAR_IMAGENES", False),
+    # DEC-150: V8 prioriza memoria sobre velocidad en los renderers. Medido
+    # con 1 worker y N=10: -21% de memoria del motor, +4% de tiempo.
+    "V8_OPTIMIZAR_TAMANO": _env_bool("SCRAPER_V8_OPTIMIZAR_TAMANO", False),
     # FIX C-1 (auditoría 2026-07-01): timeout global del run como red de
     # seguridad de última instancia. Debe superar el peor caso legítimo:
     # la carga histórica más larga registrada tomó ~5.5h (DEC-010) y el
@@ -187,6 +216,16 @@ HTML_LOCK: asyncio.Lock = asyncio.Lock()
 # Sin lock: el event loop es único y ambas operaciones son atómicas a
 # nivel de bytecode sobre un dict.
 _RATE_LIMIT: dict[str, float] = {"hasta": 0.0}
+
+
+def flags_v8() -> list[str]:
+    """Flag de V8 para los navegadores del ciclo (DEC-150/154).
+
+    Con `V8_OPTIMIZAR_TAMANO`, V8 prioriza memoria sobre velocidad. Lo usan
+    el scraper de pedidos (`orquestador.argumentos_navegador`) y la descarga
+    de BOCHICA — los dos medidos con resultado idéntico.
+    """
+    return ["--js-flags=--optimize-for-size"] if CONFIG["V8_OPTIMIZAR_TAMANO"] else []
 
 
 def registrar_rate_limit(retry_after: str, *, ahora: float | None = None) -> float:
@@ -246,9 +285,9 @@ if not _logger.handlers:
     # TimedRotatingFileHandler, cada medianoche local se renombra a
     # "scraper.log.YYYY-MM-DD" y se purgan automáticamente los que superan
     # backupCount=30 (30 días de retención, sin excepción, mismo criterio
-    # que el purgado de scraper_scheduler_*.log en actualizar_pedidos.bat).
+    # que el purgado de scraper_scheduler_*.log en actualizar_pedidos.sh).
     # Los archivos rotados no terminan en ".log", así que el purgado de
-    # forfiles del .bat no los toca — cada uno gestiona su propia retención,
+    # `find … -name "*.log"` del .sh no los toca — cada uno gestiona su propia retención,
     # sin lógica duplicada.
     _file_handler = TimedRotatingFileHandler(
         CONFIG["LOG_FILE"],

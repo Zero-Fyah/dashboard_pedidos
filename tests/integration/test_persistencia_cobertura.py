@@ -289,3 +289,92 @@ async def test_error_sin_detalle_loggea_db_error(db_path, capsys):
     await persistir_uno({"id_pedido": "TEST-ERR", "_error": True}, db_path, run_stats)
     assert run_stats["error"] == {"TEST-ERR"}
     assert "db_error" in capsys.readouterr().out
+
+
+@pytest.mark.integration
+async def test_solo_estado_vacio_no_pisa_el_estado_de_la_base(db_path, capsys):
+    """Auditoría 2026-09-25: un estado leído vacío (columna movida, celda sin
+    etiqueta) no borra el estado bueno; WARNING y el pedido sigue OK."""
+    await persistir_uno(copy.deepcopy(_PEDIDO_BASE), db_path)
+    async with aiosqlite.connect(db_path) as db:
+        antes = await (
+            await db.execute(
+                "SELECT estado, estado_cambiado_en FROM subpedidos "
+                "WHERE id_pedido = 'TEST-001' AND numero_subpedido = 'SUB-001'"
+            )
+        ).fetchone()
+    run_stats: dict[str, set[str]] = {"ok": set(), "error": set()}
+    vacio = _resultado_liviano("solo_estado", [{"numero_subpedido": "SUB-001", "estado": "  "}])
+
+    await persistir_uno(vacio, db_path, run_stats)
+
+    async with aiosqlite.connect(db_path) as db:
+        despues = await (
+            await db.execute(
+                "SELECT estado, estado_cambiado_en FROM subpedidos "
+                "WHERE id_pedido = 'TEST-001' AND numero_subpedido = 'SUB-001'"
+            )
+        ).fetchone()
+    assert antes[0]  # la base partía de un estado real
+    assert despues == antes
+    assert run_stats["ok"] == {"TEST-001"}
+    assert "estado_subpedido_vacio" in capsys.readouterr().out
+
+
+# ── DEC-147: el modo completo fija cantidades_definitivas en los cerrados ────
+
+
+def _con_id(valor, id_pedido: str):
+    """Copia `valor` reemplazando el ID base en todas las secciones (timeline,
+    estadísticas…), que también lo llevan y tienen clave foránea."""
+    if isinstance(valor, dict):
+        return {k: _con_id(v, id_pedido) for k, v in valor.items()}
+    if isinstance(valor, list):
+        return [_con_id(v, id_pedido) for v in valor]
+    return id_pedido if valor == _PEDIDO_BASE["id_pedido"] else valor
+
+
+def _pedido_con_subpedidos(id_pedido: str, estados: list[str]) -> dict:
+    pedido = _con_id(copy.deepcopy(_PEDIDO_BASE), id_pedido)
+    base = pedido["subpedidos"][0]
+    pedido["subpedidos"] = [
+        dict(copy.deepcopy(base), numero_subpedido=f"SUB-{i}", estado=e, lineas=[])
+        for i, e in enumerate(estados, start=1)
+    ]
+    return pedido
+
+
+@pytest.mark.integration
+async def test_completo_fija_definitivas_solo_en_subpedidos_cerrados(db_path):
+    await persistir_uno(
+        _pedido_con_subpedidos("TEST-DEF", ["Completado", "Pendiente de entrega", "Cancelado"]),
+        db_path,
+    )
+    async with aiosqlite.connect(db_path) as db:
+        filas = await (
+            await db.execute(
+                "SELECT numero_subpedido, cantidades_definitivas FROM subpedidos "
+                "WHERE id_pedido = 'TEST-DEF' ORDER BY numero_subpedido"
+            )
+        ).fetchall()
+    assert filas == [("SUB-1", 1), ("SUB-2", 0), ("SUB-3", 1)]
+
+
+@pytest.mark.integration
+async def test_pedido_re_extraido_ya_cerrado_sale_del_carril_de_activos(db_path):
+    """El caso que motivó DEC-147: un pedido cerrado re-extraído en modo
+    completo volvía al carril de activos (y a con_cantidades) el ciclo
+    siguiente. Un pedido con un subpedido abierto sigue entrando."""
+    from scraper.orquestador import obtener_ids_activos
+
+    await persistir_uno(
+        _pedido_con_subpedidos("TEST-CERRADO", ["Completado", "Comentado"]), db_path
+    )
+    await persistir_uno(
+        _pedido_con_subpedidos("TEST-ABIERTO", ["Completado", "En inspección"]), db_path
+    )
+
+    activos = await obtener_ids_activos(db_path)
+
+    assert "TEST-CERRADO" not in activos
+    assert "TEST-ABIERTO" in activos
