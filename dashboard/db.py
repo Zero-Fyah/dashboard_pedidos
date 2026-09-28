@@ -1368,9 +1368,10 @@ def get_pedidos_impagos() -> pd.DataFrame:
     en DEC-084 lo confirma). Meterlos daría una lista de falsos positivos.
 
     **El saldo sale del origen cuando existe (DEC-089).** La tarjeta
-    «Operación de pago» trae `pago_saldo` calculado por el sistema; solo
-    existe desde el 2026-07-16, así que fuera de ese rango se cae a la
-    derivación `total − pagado`. Medido sobre los 833 pedidos vivos con
+    «Operación de pago» trae `pago_saldo` calculado por el sistema; el
+    origen la muestra desde el 2026-02-05 (DEC-149; DEC-089 la creía del
+    2026-07-16), así que fuera de ese rango se cae a la derivación
+    `total − pagado`. Medido sobre los 833 pedidos vivos con
     tarjeta: la derivación marca 230 impagos y el origen 224 — los 6 que
     sobran son pedidos que el origen da por **`Pagado`**, y no hay ninguno
     en la dirección contraria. La columna `fuente` dice cuál se usó, porque
@@ -1411,7 +1412,7 @@ def get_pedidos_impagos() -> pd.DataFrame:
                           COALESCE(p.pago_total_num, m.total) AS total,
                           COALESCE(p.pago_pagado_num, m.pagado) AS pagado,
                           -- DEC-089: el saldo del origen manda; la
-                          -- derivación solo cubre lo anterior al 2026-07-16.
+                          -- derivación solo cubre lo que no tiene tarjeta.
                           COALESCE(p.pago_saldo_num,
                                    m.total - COALESCE(m.pagado, 0)) AS saldo,
                           CASE WHEN p.pago_saldo_num IS NOT NULL
@@ -1470,10 +1471,10 @@ def get_estado_pago(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
     respondiendo `get_saldo_a_favor()` sobre `gestion_diferencias`. Este
     listado filtra `saldo > 1`, así que los negativos no entran.
 
-    **Cobertura:** solo pedidos desde el 2026-07-16; DEC-087 verificó que el
-    origen no renderiza la tarjeta para los anteriores (0 de 24 en una prueba
-    sobre enero). La página tiene que decir el rango, no dar a entender que
-    cubre todo.
+    **Cobertura:** solo pedidos con tarjeta, que el origen muestra desde el
+    2026-02-05 (DEC-149, tras la re-extracción de DEC-140; DEC-087 la había
+    medido desde el 2026-07-16). La página tiene que decir el rango, no dar
+    a entender que cubre todo.
 
     Args:
         fecha_desde: Fecha inicial inclusive del pedido (YYYY-MM-DD).
@@ -1810,7 +1811,8 @@ def get_faltantes_clasificados() -> pd.DataFrame:
         crudo = pd.read_sql(
             f"""
             WITH universo AS (
-                SELECT p.id_pedido, p.fecha, gd.monto_diferencia
+                -- DEC-157: el monto numérico del ETL, no el texto 'COP 12.345'.
+                SELECT p.id_pedido, p.fecha, gd.monto_diferencia_num AS monto_diferencia
                 FROM pedidos p
                 JOIN gestion_diferencias gd ON gd.id_pedido = p.id_pedido
                 WHERE p.hay_diferencia = 1

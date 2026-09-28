@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 import dashboard.db as ddb
+from comun import to_num
 
 
 @pytest.fixture(autouse=True)
@@ -36,7 +37,8 @@ def _base(tmp_path):
             nombre_producto TEXT, cantidad_comprada REAL, cantidad_entregada REAL
         );
         CREATE TABLE gestion_diferencias (
-            id INTEGER PRIMARY KEY, id_pedido TEXT, monto_diferencia TEXT
+            id INTEGER PRIMARY KEY, id_pedido TEXT, monto_diferencia TEXT,
+            monto_diferencia_num REAL
         );
         """
     )
@@ -52,8 +54,9 @@ def _pedido(con, id_pedido, fecha, monto_diferencia, subpedidos):
         (id_pedido, fecha),
     )
     con.execute(
-        "INSERT INTO gestion_diferencias (id_pedido, monto_diferencia) VALUES (?, ?)",
-        (id_pedido, monto_diferencia),
+        "INSERT INTO gestion_diferencias (id_pedido, monto_diferencia, monto_diferencia_num)"
+        " VALUES (?, ?, ?)",
+        (id_pedido, monto_diferencia, to_num(monto_diferencia)),
     )
     for numero_subpedido, estado, lineas in subpedidos:
         con.execute(
@@ -247,3 +250,25 @@ def test_pedido_sin_diferencia_no_aparece(monkeypatch, tmp_path):
     df = ddb.get_faltantes_clasificados()
 
     assert df.empty or "TEST-SANO" not in set(df["id_pedido"])
+
+
+@pytest.mark.integration
+def test_monto_diferencia_es_numerico_no_el_texto_del_origen(monkeypatch, tmp_path):
+    """DEC-157: antes devolvía 'COP 30.000' (la columna de texto) y la página lo
+    mostraba como texto; ahora es el número que normaliza el ETL."""
+    ruta = _base(tmp_path)
+    con = sqlite3.connect(ruta)
+    _pedido(
+        con,
+        "TEST-MONTO",
+        "2026-08-01",
+        "COP 30.000",
+        [("S1", "Completado", [("Comedero PC85", 2, 1)])],
+    )
+    con.commit()
+    con.close()
+
+    monkeypatch.setattr(ddb, "DB_PATH", ruta)
+    df = ddb.get_faltantes_clasificados()
+
+    assert df.loc[df["id_pedido"] == "TEST-MONTO", "monto_diferencia"].iloc[0] == 30000.0

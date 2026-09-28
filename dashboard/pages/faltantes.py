@@ -189,7 +189,9 @@ seleccion = st.dataframe(
         "fecha": st.column_config.TextColumn("Fecha", width="small"),
         "grupo": st.column_config.TextColumn("Grupo", width="small"),
         "unidades_faltantes": st.column_config.NumberColumn("Unid. faltantes", format="%.0f"),
-        "monto_diferencia": st.column_config.TextColumn("Monto diferencia", width="medium"),
+        "monto_diferencia": st.column_config.NumberColumn(
+            "Monto diferencia", format="$%.0f", width="medium"
+        ),
         "atribuible": st.column_config.CheckboxColumn("¿Subpedido identificado?"),
         "cancelado": st.column_config.CheckboxColumn("Cancelado"),
     },
@@ -220,7 +222,9 @@ else:
             "numero_subpedido": st.column_config.TextColumn("Subpedido", width="small"),
             "grupo": st.column_config.TextColumn("Grupo", width="small"),
             "unidades_faltantes": st.column_config.NumberColumn("Unid. faltantes", format="%.0f"),
-            "monto_diferencia": st.column_config.TextColumn("Monto diferencia", width="medium"),
+            "monto_diferencia": st.column_config.NumberColumn(
+                "Monto diferencia", format="$%.0f", width="medium"
+            ),
             "atribuible": st.column_config.CheckboxColumn("¿Subpedido identificado?"),
         },
     )
