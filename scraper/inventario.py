@@ -13,10 +13,11 @@ from pathlib import Path
 
 from playwright.async_api import Download, Page
 
+from comun import ruta_bodega
 from scraper.config import CONFIG, log_event
-from scraper.extractores import SEL_LISTA_FILAS, login
+from scraper.extractores import SEL_LISTA_FILAS, login, verificar_pais_de_pagina
 
-DESTINO_DEFAULT = Path(__file__).parent.parent / "data" / "inventario" / "admin_inventario.xlsx"
+DESTINO_DEFAULT = ruta_bodega("inventario") / "admin_inventario.xlsx"
 
 
 async def descargar_inventario_admin(page: Page, destino: Path = DESTINO_DEFAULT) -> Path:
@@ -45,6 +46,8 @@ async def descargar_inventario_admin(page: Page, destino: Path = DESTINO_DEFAULT
 
     await page.get_by_role("button", name="Buscar", exact=True).click()
     await page.wait_for_selector(SEL_LISTA_FILAS, timeout=CONFIG["ELEM_TIMEOUT_MS"])
+    # DEC-163: la página que muestra la SPA, no la pedida — antes de exportar.
+    verificar_pais_de_pagina(page.url)
 
     async with page.expect_download(timeout=CONFIG["NAV_TIMEOUT_MS"]) as descarga_info:
         await page.get_by_role("button", name="Exportar", exact=True).click()

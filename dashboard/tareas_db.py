@@ -20,7 +20,22 @@ from pathlib import Path
 
 import pandas as pd
 
-DB_PATH = Path(__file__).parent.parent / "data" / "tareas.db"
+from comun import marcar_bodega, ruta_bodega
+
+# DEC-165: la base de tareas se resuelve por bodega en cada llamada (la del
+# selector del dashboard); sin `bodega`, la del proceso (DEC-163). `DB_PATH`
+# es solo un sustituto para pruebas; en producción vale None.
+DB_PATH: Path | None = None
+
+
+def _ruta(bodega: str | None) -> Path:
+    return DB_PATH if DB_PATH is not None else ruta_bodega("tareas.db", bodega)
+
+
+def ruta_base(*, bodega: str | None = None) -> Path:
+    """Dónde vive la `tareas.db` de la bodega (para nombrarla en pantalla)."""
+    return _ruta(bodega)
+
 
 ESTADOS = ["Pendiente", "En progreso", "Bloqueada", "Completada"]
 PRIORIDADES = ["Alta", "Media", "Baja"]
@@ -119,14 +134,23 @@ _SEMILLA: list[tuple[str, str, str, str, str]] = [
 ]
 
 
-def _conn() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DB_PATH, check_same_thread=False, timeout=5)
+def _conn(bodega: str | None = None) -> sqlite3.Connection:
+    ruta = _ruta(bodega)
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(ruta, check_same_thread=False, timeout=5)
+    # DEC-163: verifica la bodega y, en una base nueva o histórica sin marca,
+    # la estampa antes de crear o tocar nada.
+    try:
+        marcar_bodega(con, bodega)
+    except Exception:
+        con.close()
+        raise
+    return con
 
 
-def init_db() -> None:
+def init_db(*, bodega: str | None = None) -> None:
     """Crea la tabla si no existe y siembra el backlog la primera vez."""
-    con = _conn()
+    con = _conn(bodega)
     try:
         con.execute(_CREATE_META)
         con.execute(_CREATE)
@@ -162,15 +186,15 @@ def _ahora() -> str:
     return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
 
 
-def listar_tareas() -> pd.DataFrame:
+def listar_tareas(*, bodega: str | None = None) -> pd.DataFrame:
     """Todas las tareas, ordenadas por estado de avance y prioridad.
 
     Sin `st.cache_data` a propósito: la tabla tiene decenas de filas y
     cachearla haría que un cambio recién guardado no se viera hasta que
     expire el TTL.
     """
-    init_db()
-    con = _conn()
+    init_db(bodega=bodega)
+    con = _conn(bodega)
     try:
         df = pd.read_sql(
             """SELECT id, titulo, detalle, categoria, prioridad, estado, origen
@@ -192,7 +216,7 @@ def listar_tareas() -> pd.DataFrame:
     return df
 
 
-def guardar_tareas(df: pd.DataFrame) -> tuple[int, int, int]:
+def guardar_tareas(df: pd.DataFrame, *, bodega: str | None = None) -> tuple[int, int, int]:
     """Sincroniza la tabla con lo que quedó en el editor.
 
     Actualiza por `id` en vez de borrar y reinsertar todo, para conservar
@@ -205,9 +229,9 @@ def guardar_tareas(df: pd.DataFrame) -> tuple[int, int, int]:
     Returns:
         `(nuevas, actualizadas, borradas)`.
     """
-    init_db()
+    init_db(bodega=bodega)
     ahora = _ahora()
-    con = _conn()
+    con = _conn(bodega)
     try:
         existentes = {r[0] for r in con.execute("SELECT id FROM tareas")}
         vistos: set[int] = set()
@@ -261,9 +285,9 @@ def _texto(valor: object) -> str:
     return str(valor).strip()
 
 
-def resumen() -> dict[str, int]:
+def resumen(*, bodega: str | None = None) -> dict[str, int]:
     """Conteo por estado — para los indicadores del encabezado."""
-    df = listar_tareas()
+    df = listar_tareas(bodega=bodega)
     conteo = df["estado"].value_counts().to_dict()
     return {
         "total": len(df),
@@ -271,7 +295,7 @@ def resumen() -> dict[str, int]:
     }
 
 
-def hay_manuales_pendientes() -> bool:
+def hay_manuales_pendientes(*, bodega: str | None = None) -> bool:
     """True si queda alguna tarea manual sin completar.
 
     La usa `app.py` para decidir si el menú muestra la sección de Tareas.
@@ -280,7 +304,7 @@ def hay_manuales_pendientes() -> bool:
     vacío.
     """
     try:
-        df = listar_tareas()
+        df = listar_tareas(bodega=bodega)
     except Exception:
         return True
     return bool((df["estado"] != "Completada").any())

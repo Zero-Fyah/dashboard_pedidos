@@ -46,23 +46,37 @@ def test_config_slow_mo_es_int():
 
 
 @pytest.mark.unit
-def test_db_path_contiene_data_pedidos():
+def test_db_path_contiene_data_pedidos(tmp_path, monkeypatch):
     """BUG-007: la ruta apunta a data/pedidos.db.
     Nota: get_db_path() crea data/ como efecto secundario.
     Esto es intencional — data/ debe existir en el proyecto.
+
+    DEC-163: get_db_path() verifica la marca de bodega de una base que ya
+    existe, así que la raíz va a un temporal — la suite nunca abre la base
+    de producción, ni en solo lectura (mismo criterio que DEC-145).
     """
+    import comun
+
+    monkeypatch.delenv("BODEGA", raising=False)
+    monkeypatch.setattr(comun, "_RAIZ_PROYECTO", tmp_path)
     path = get_db_path()
-    assert "data" in path
-    assert path.endswith("pedidos.db")
+    assert path == str(tmp_path / "data" / "pedidos.db")
+    assert (tmp_path / "data").is_dir()
 
 
 @pytest.mark.unit
 def test_db_path_es_absoluto():
-    """BUG-007: la ruta es absoluta, no relativa al cwd."""
+    """BUG-007: la ruta es absoluta, no relativa al cwd.
+
+    DEC-163: get_db_path() la toma de ruta_bodega(), que se mide sobre la
+    raíz real sin abrir ninguna base.
+    """
     from pathlib import Path
 
-    path = get_db_path()
-    assert Path(path).is_absolute()
+    from comun import ruta_bodega
+
+    assert Path(ruta_bodega("pedidos.db", "miempresa")).is_absolute()
+    assert Path(ruta_bodega("pedidos.db", "bodega2")).is_absolute()
 
 
 @pytest.mark.parametrize(

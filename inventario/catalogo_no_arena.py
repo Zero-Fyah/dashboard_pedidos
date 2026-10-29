@@ -80,7 +80,13 @@ import sqlite3
 
 import pandas as pd
 
-from comun import SUFIJO_CLASE_HEREDADA, VIGENCIA_ACTIVO, familia_de
+from comun import (
+    ALMACEN_DE_BODEGA,
+    BODEGA_DEFECTO,
+    SUFIJO_CLASE_HEREDADA,
+    VIGENCIA_ACTIVO,
+    familia_de,
+)
 
 logger = logging.getLogger("inventario.catalogo_no_arena")
 
@@ -95,7 +101,10 @@ TIPO_CAMBIO_ENTRADA = "Entrada"
 # movimientos de "Entrada" en otras ciudades (343/5.859 los tienen, medido),
 # pero mezclar ciudades rompería la coherencia con "inventario actual", que
 # es Bogotá-only por construcción.
-ALMACEN_BODEGA = "Bogotá"
+# DEC-165: el almacén de la bodega que se consulta lo pasa quien llama (el
+# dashboard elige la bodega por sesión, no por proceso); este es el de la
+# histórica, que es el valor por defecto.
+ALMACEN_BODEGA = ALMACEN_DE_BODEGA[BODEGA_DEFECTO]
 
 # DEC-072: alcance de trabajo son los ID que el catálogo del admin reconoce.
 EN_CATALOGO = 1
@@ -305,7 +314,9 @@ def _vigencia_por_id(universo: pd.DataFrame, con: sqlite3.Connection) -> pd.Data
     return df.drop(columns=["_vigencia_referencia"])
 
 
-def _ultimo_ingreso_contenedor(con: sqlite3.Connection) -> pd.DataFrame:
+def _ultimo_ingreso_contenedor(
+    con: sqlite3.Connection, almacen: str = ALMACEN_BODEGA
+) -> pd.DataFrame:
     """Última fecha de un movimiento `tipo_cambio = 'Entrada'`, por ID.
 
     "Ingreso al sistema por contenedor" es lenguaje de negocio del
@@ -323,7 +334,7 @@ def _ultimo_ingreso_contenedor(con: sqlite3.Connection) -> pd.DataFrame:
            WHERE tipo_cambio = ? AND almacen = ?
            GROUP BY sku_id""",
         con,
-        params=(TIPO_CAMBIO_ENTRADA, ALMACEN_BODEGA),
+        params=(TIPO_CAMBIO_ENTRADA, almacen),
     )
     df["id_especificacion"] = df["id_especificacion"].astype(str)
     return df
@@ -381,7 +392,9 @@ def _ultima_venta(con: sqlite3.Connection) -> pd.DataFrame:
     )
 
 
-def construir_catalogo_no_arena(con: sqlite3.Connection) -> pd.DataFrame:
+def construir_catalogo_no_arena(
+    con: sqlite3.Connection, *, almacen: str = ALMACEN_BODEGA
+) -> pd.DataFrame:
     """Vista consolidada por ID no-Arena: venta, clasificación e ingreso.
 
     Una fila por `id_especificacion` (DEC-045/DEC-111 — la granularidad más
@@ -393,6 +406,8 @@ def construir_catalogo_no_arena(con: sqlite3.Connection) -> pd.DataFrame:
 
     Args:
         con: Conexión de lectura a `pedidos.db`.
+        almacen: Almacén de la bodega consultada (DEC-165); filtra los
+            ingresos de contenedor de `movimientos_inventario`.
 
     Returns:
         DataFrame con las columnas de `_COLUMNAS_SALIDA`. `abc`/`xyz`,
@@ -506,7 +521,7 @@ def construir_catalogo_no_arena(con: sqlite3.Connection) -> pd.DataFrame:
     else:
         universo["descripcion"] = universo["_nombre_catalogo"]
 
-    entradas = _ultimo_ingreso_contenedor(con)
+    entradas = _ultimo_ingreso_contenedor(con, almacen)
     universo = universo.merge(entradas, on="id_especificacion", how="left")
 
     ventas = _ultima_venta(con)

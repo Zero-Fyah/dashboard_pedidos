@@ -9,15 +9,31 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import TypedDict
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
-load_dotenv()
+from comun import BODEGA_DEFECTO, get_bodega, ruta_bodega
+
+# DEC-163: cada bodega lee SOLO su archivo, por ruta explícita — sin buscar
+# un .env hacia arriba. Fuera de la bodega por defecto el archivo además
+# prevalece sobre el entorno heredado, y `validar_config()` exige que las
+# variables estén en ese archivo: un valor de la otra bodega no se cuela.
+BODEGA: str = get_bodega()
+RUTA_ENV: Path = ruta_bodega("env", BODEGA)
+load_dotenv(RUTA_ENV, override=BODEGA != BODEGA_DEFECTO)
+_DEFINIDAS_EN_ARCHIVO: frozenset[str] = frozenset(
+    k for k, v in dotenv_values(RUTA_ENV).items() if v
+)
+
+# DEC-163: país de la bodega por defecto, cuando su .env no declara
+# SCRAPER_PAIS. Las demás bodegas tienen que declararlo.
+PAIS_DEFECTO = "CO"
 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN
@@ -54,6 +70,7 @@ def _env_int(nombre: str, default: int) -> int:
 
 
 class ConfigDict(TypedDict):
+    pais: str
     url_login: str
     url_post_login: str
     url_pedidos: str
@@ -83,6 +100,7 @@ class ConfigDict(TypedDict):
     INCREMENTAL_LOOKBACK_MAX_DIAS: int
     NUM_WORKERS: int
     REEXTRACCION_POR_CICLO: int
+    CIERRE_TURNOS: int
     PAGINA_NUEVA_CADA_N: int
     BLOQUEAR_IMAGENES: bool
     V8_OPTIMIZAR_TAMANO: bool
@@ -100,6 +118,10 @@ class ConfigDict(TypedDict):
 
 
 CONFIG: ConfigDict = {
+    # DEC-163: país de la bodega — arma la ruta interna del detalle y contra
+    # él se validan las URLs y las páginas del origen que traen país.
+    "pais": os.environ.get("SCRAPER_PAIS", "").strip().upper()
+    or (PAIS_DEFECTO if BODEGA == BODEGA_DEFECTO else ""),
     # URLs (configuradas via variables de entorno)
     "url_login": os.environ.get("SCRAPER_URL_LOGIN", ""),
     "url_post_login": os.environ.get("SCRAPER_URL_POST_LOGIN", ""),
@@ -163,6 +185,9 @@ CONFIG: ConfigDict = {
     # del mismo ciclo (sin segundo proceso sobre el lock ni RAM extra,
     # DEC-139). 500 ≈ +6-7 min por ciclo al ritmo de DEC-124. 0 lo apaga.
     "REEXTRACCION_POR_CICLO": _env_int("SCRAPER_REEXTRACCION_POR_CICLO", 500),
+    # DEC-164: en `--modo cierre` los pedidos activos se reparten en N turnos
+    # por hora; cada uno se revisa (en completo, con pagos) cada N horas.
+    "CIERRE_TURNOS": _env_int("SCRAPER_CIERRE_TURNOS", 3),
     # DEC-148: cada worker abre una página nueva cada N pedidos. La SPA del
     # origen retiene ~13 MB de DOM por navegación interna y solo los suelta
     # al descartar el documento (medido 2026-09-26). 0 = apagado.
@@ -189,9 +214,10 @@ CONFIG: ConfigDict = {
     # Observabilidad
     "MAX_SCREENSHOTS": 50,
     "MAX_HTML_DEBUG": 50,
-    "LOG_FILE": str(Path(__file__).parent.parent / "logs" / "scraper.log"),
-    "ERRORS_DIR": str(Path(__file__).parent.parent / "data" / "errors"),
-    "DEBUG_DIR": str(Path(__file__).parent.parent / "data" / "debug"),
+    # DEC-163: por bodega; la por defecto conserva logs/, data/errors/ y data/debug/.
+    "LOG_FILE": str(ruta_bodega("logs", BODEGA) / "scraper.log"),
+    "ERRORS_DIR": str(ruta_bodega("errors", BODEGA)),
+    "DEBUG_DIR": str(ruta_bodega("debug", BODEGA)),
     # AUD-M11: configurables via .env. Los defaults preservan el
     # comportamiento histórico (headed + 50ms) — el modo headless se activa
     # explícitamente con SCRAPER_HEADLESS=true tras validarlo contra la SPA
@@ -345,11 +371,62 @@ def log_event(
 # ─────────────────────────────────────────────
 
 
+_RE_PAIS_EN_RUTA = re.compile(r"/country/([A-Za-z]{2})(?:/|$)")
+
+
+def pais_de_url(url: str) -> str | None:
+    """País de una URL del origen (`/country/XX/...`), en mayúsculas.
+
+    Returns:
+        El código de país, o None si la ruta no lo trae (login, post-login).
+    """
+    m = _RE_PAIS_EN_RUTA.search(url)
+    return m.group(1).upper() if m else None
+
+
+def urls_fuera_de_pais() -> list[str]:
+    """URLs configuradas que no corresponden al país de la bodega (DEC-163).
+
+    Toda URL que trae país tiene que traer el de la bodega. Fuera de la
+    bodega por defecto, el listado y el detalle además tienen que traerlo:
+    sin país en la ruta no hay cómo comprobar a qué operación apuntan.
+
+    Returns:
+        Una descripción por URL fuera de país; vacía si todas corresponden.
+    """
+    urls = {
+        "SCRAPER_URL_LOGIN": CONFIG["url_login"],
+        "SCRAPER_URL_POST_LOGIN": CONFIG["url_post_login"],
+        "SCRAPER_URL_PEDIDOS": CONFIG["url_pedidos"],
+        "SCRAPER_URL_DETALLE": CONFIG["url_detalle"],
+        "SCRAPER_URL_INVENTARIO": CONFIG["url_inventario"],
+        "SCRAPER_URL_CAMBIOS_INVENTARIO": CONFIG["url_cambios_inventario"],
+    }
+    exigen_pais = (
+        {"SCRAPER_URL_PEDIDOS", "SCRAPER_URL_DETALLE"} if BODEGA != BODEGA_DEFECTO else set()
+    )
+    errores: list[str] = []
+    for env_key, url in urls.items():
+        if not url:
+            continue
+        pais = pais_de_url(url)
+        if pais is None and env_key in exigen_pais:
+            errores.append(f"{env_key} no trae país en la ruta")
+        elif pais is not None and pais != CONFIG["pais"]:
+            errores.append(f"{env_key} apunta al país {pais}")
+    return errores
+
+
 def validar_config() -> None:
-    """Falla rápido si faltan variables críticas de entorno.
+    """Falla rápido si faltan variables críticas o una URL es de otro país.
+
+    DEC-163: fuera de la bodega por defecto, una variable cuenta como
+    definida solo si está en el archivo de esa bodega (`RUTA_ENV`), no si
+    llegó heredada del entorno.
 
     Raises:
-        RuntimeError: Con la lista completa de variables faltantes.
+        RuntimeError: Con la lista completa de variables faltantes, o de
+            URLs que no corresponden al país de la bodega.
     """
     faltantes: list[str] = []
     checks = {
@@ -359,12 +436,19 @@ def validar_config() -> None:
         "SCRAPER_URL_DETALLE": CONFIG["url_detalle"],
         "SCRAPER_USUARIO": USUARIO,
         "SCRAPER_PASSWORD": CLAVE,
+        "SCRAPER_PAIS": CONFIG["pais"],
     }
     for env_key, value in checks.items():
-        if not value:
+        if not value or (BODEGA != BODEGA_DEFECTO and env_key not in _DEFINIDAS_EN_ARCHIVO):
             faltantes.append(env_key)
     if faltantes:
         raise RuntimeError(
             f"Variables de entorno faltantes: {', '.join(faltantes)}. "
-            "Defínalas en un archivo .env antes de ejecutar."
+            f"Defínalas en un archivo {RUTA_ENV.name} antes de ejecutar."
+        )
+    fuera_de_pais = urls_fuera_de_pais()
+    if fuera_de_pais:
+        raise RuntimeError(
+            f"La bodega {BODEGA} es del país {CONFIG['pais']} y su configuración no: "
+            f"{'; '.join(fuera_de_pais)}. Revisa {RUTA_ENV.name} (DEC-163)."
         )

@@ -27,7 +27,12 @@ import logging
 
 import pandas as pd
 
-from comun import ARENA_CIUDADES, ARENA_REFERENCIAS_EXCLUIDAS, clasificar_modalidad_arena
+from comun import (
+    ALMACEN_DE_BODEGA,
+    ARENA_CIUDADES,
+    ARENA_REFERENCIAS_EXCLUIDAS,
+    clasificar_modalidad_arena,
+)
 
 logger = logging.getLogger("inventario.arena")
 
@@ -115,7 +120,10 @@ def calcular_arena(catalogo_completo: pd.DataFrame) -> pd.DataFrame:
     if negativos.any():
         logger.warning("calcular_arena: %d filas con inventario negativo", int(negativos.sum()))
 
-    almacen_desconocido = ~clasificada["almacen"].isin(ARENA_CIUDADES)
+    # DEC-164: el almacén de una bodega escrito como lo publica su operación
+    # (`Bogota`, sin tilde, en `bodega2`) es conocido, no una ciudad nueva.
+    conocidos = set(ARENA_CIUDADES) | set(ALMACEN_DE_BODEGA.values())
+    almacen_desconocido = ~clasificada["almacen"].isin(conocidos)
     if almacen_desconocido.any():
         logger.warning(
             "calcular_arena: %d filas con almacén fuera de las %d ciudades conocidas: %s",

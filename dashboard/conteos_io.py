@@ -18,10 +18,16 @@ import shutil
 import unicodedata
 from pathlib import Path
 
+from comun import BODEGA_DEFECTO, get_bodega, ruta_bodega
+
 logger = logging.getLogger("conteos_io")
 
-CARPETA_CONTEOS = Path(__file__).parent.parent / "data" / "conteos"
-CARPETA_ANULADOS = CARPETA_CONTEOS / "anulados"
+# DEC-165: las carpetas se resuelven por bodega en cada llamada (la del
+# selector del dashboard); sin `bodega`, la del proceso (DEC-163). Las tres
+# constantes CARPETA_* son solo sustitutos para pruebas; en producción, None.
+CARPETA_CONTEOS: Path | None = None
+CARPETA_ANULADOS: Path | None = None
+CARPETA_RESPALDO: Path | None = None
 
 # Respaldo a disco externo dedicado (EJPC-RESPALDO, montado por udisks2 en
 # /media/<usuario>/EJPC-RESPALDO): antes de esto, data/conteos/ no tenía
@@ -31,9 +37,31 @@ CARPETA_ANULADOS = CARPETA_CONTEOS / "anulados"
 # hay reemplazo todavía (2026-09-28)** — sin conteos reales aún, no protege
 # nada en la práctica, pero cuando lo reemplacen esto vuelve a funcionar
 # solo, sin tocar código.
-CARPETA_RESPALDO = (
-    Path("/media") / Path.home().name / "EJPC-RESPALDO" / "dashboard_pedidos_respaldo" / "conteos"
-)
+# DEC-163: la bodega por defecto conserva su carpeta; otra bodega va en una
+# subcarpeta con su nombre, así una copia nunca mezcla conteos de las dos.
+_RAIZ_RESPALDO = Path("/media") / Path.home().name / "EJPC-RESPALDO" / "dashboard_pedidos_respaldo"
+
+
+def carpeta_conteos(*, bodega: str | None = None) -> Path:
+    """Donde quedan las hojas activas de la bodega."""
+    return CARPETA_CONTEOS if CARPETA_CONTEOS is not None else ruta_bodega("conteos", bodega)
+
+
+def _carpeta_anulados(bodega: str | None) -> Path:
+    return (
+        CARPETA_ANULADOS
+        if CARPETA_ANULADOS is not None
+        else carpeta_conteos(bodega=bodega) / "anulados"
+    )
+
+
+def _carpeta_respaldo(bodega: str | None) -> Path:
+    if CARPETA_RESPALDO is not None:
+        return CARPETA_RESPALDO
+    bodega = bodega or get_bodega()
+    raiz = _RAIZ_RESPALDO if bodega == BODEGA_DEFECTO else _RAIZ_RESPALDO / bodega
+    return raiz / "conteos"
+
 
 EXTENSION = ".xlsx"
 
@@ -67,12 +95,12 @@ def nombre_seguro(nombre: str) -> str:
     return base
 
 
-def existe(nombre: str) -> bool:
+def existe(nombre: str, *, bodega: str | None = None) -> bool:
     """True si ya hay una hoja activa con ese nombre."""
-    return (CARPETA_CONTEOS / nombre_seguro(nombre)).exists()
+    return (carpeta_conteos(bodega=bodega) / nombre_seguro(nombre)).exists()
 
 
-def _respaldar() -> None:
+def _respaldar(bodega: str | None = None) -> None:
     """Copia `data/conteos/` completa a `CARPETA_RESPALDO`, best-effort.
 
     Nunca debe tumbar el flujo de subida/anulación: el archivo ya quedó a
@@ -80,28 +108,27 @@ def _respaldar() -> None:
     (DEC-058). Si el disco de respaldo no está conectado, la copia falla
     con `OSError` y acá solo se registra — no se propaga.
     """
+    respaldo = _carpeta_respaldo(bodega)
     try:
-        shutil.copytree(CARPETA_CONTEOS, CARPETA_RESPALDO, dirs_exist_ok=True)
+        shutil.copytree(carpeta_conteos(bodega=bodega), respaldo, dirs_exist_ok=True)
     except OSError as exc:
-        logger.warning(
-            "Respaldo de conteos a %s falló (¿disco desconectado?): %s", CARPETA_RESPALDO, exc
-        )
+        logger.warning("Respaldo de conteos a %s falló (¿disco desconectado?): %s", respaldo, exc)
 
 
-def guardar(nombre: str, contenido: bytes) -> Path:
+def guardar(nombre: str, contenido: bytes, *, bodega: str | None = None) -> Path:
     """Deja la hoja en `data/conteos/`, lista para la próxima corrida.
 
     Sobrescribe si ya existe: es el flujo de "corregir una hoja" de
     DEC-058, donde el valor nuevo reemplaza al anterior.
     """
-    destino = CARPETA_CONTEOS / nombre_seguro(nombre)
+    destino = carpeta_conteos(bodega=bodega) / nombre_seguro(nombre)
     destino.parent.mkdir(parents=True, exist_ok=True)
     destino.write_bytes(contenido)
-    _respaldar()
+    _respaldar(bodega)
     return destino
 
 
-def anular(nombre: str) -> Path:
+def anular(nombre: str, *, bodega: str | None = None) -> Path:
     """Mueve una hoja a `anulados/`: sale del cálculo sin borrarse.
 
     Es la operación de deshacer de DEC-058, acá para no tener que ir al
@@ -111,25 +138,25 @@ def anular(nombre: str) -> Path:
         FileNotFoundError: si la hoja no está activa.
     """
     seguro = nombre_seguro(nombre)
-    origen = CARPETA_CONTEOS / seguro
+    origen = carpeta_conteos(bodega=bodega) / seguro
     if not origen.exists():
         raise FileNotFoundError(seguro)
-    CARPETA_ANULADOS.mkdir(parents=True, exist_ok=True)
-    destino = CARPETA_ANULADOS / seguro
+    anulados = _carpeta_anulados(bodega)
+    anulados.mkdir(parents=True, exist_ok=True)
+    destino = anulados / seguro
     # Si ya se anuló una hoja con ese nombre antes, no se pisa: se numera.
     contador = 1
     while destino.exists():
-        destino = CARPETA_ANULADOS / f"{Path(seguro).stem}_{contador}{EXTENSION}"
+        destino = anulados / f"{Path(seguro).stem}_{contador}{EXTENSION}"
         contador += 1
     origen.replace(destino)
-    _respaldar()
+    _respaldar(bodega)
     return destino
 
 
-def listar_activas() -> list[str]:
+def listar_activas(*, bodega: str | None = None) -> list[str]:
     """Hojas que hoy están alimentando el cálculo."""
-    if not CARPETA_CONTEOS.exists():
+    carpeta = carpeta_conteos(bodega=bodega)
+    if not carpeta.exists():
         return []
-    return sorted(
-        p.name for p in CARPETA_CONTEOS.glob(f"*{EXTENSION}") if not p.name.startswith("~$")
-    )
+    return sorted(p.name for p in carpeta.glob(f"*{EXTENSION}") if not p.name.startswith("~$"))

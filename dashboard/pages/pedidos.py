@@ -19,7 +19,7 @@ import sqlite3
 
 import pandas as pd
 import streamlit as st
-from filtros import aviso_alcance, barra_lateral, recortar
+from filtros import aviso_alcance, barra_lateral, bodega_seleccionada, recortar
 from tz import a_hora_colombia
 
 from db import (
@@ -30,6 +30,9 @@ from db import (
     get_rango_fechas,
     get_ultima_actualizacion,
 )
+
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
 
 # Tope de filas traídas a la tabla. El universo completo son ~840.000
 # líneas: volcarlas todas colgaría el navegador sin aportar nada, porque
@@ -53,9 +56,9 @@ st.title("📦 Consolidado de pedidos")
 
 # ── Frescura y rango disponible ────────────────────────────────────────────────
 try:
-    _ultima = get_ultima_actualizacion()
-    _min_fecha, _max_fecha = get_rango_fechas()
-    _, _, opciones_almacen, _ = get_opciones_filtro()
+    _ultima = get_ultima_actualizacion(bodega=bodega)
+    _min_fecha, _max_fecha = get_rango_fechas(bodega=bodega)
+    _, _, opciones_almacen, _ = get_opciones_filtro(bodega=bodega)
 except FileNotFoundError as e:
     st.error(str(e))
     st.stop()
@@ -78,7 +81,7 @@ if _ultima:
 # DEC-101: el rango sale del filtro global; los controles propios de esta página
 # son los que ninguna otra usa (almacén y el subfiltro de picking).
 _f = barra_lateral(
-    _min_fecha, _max_fecha, get_opciones_comerciales(), dias_por_defecto=DIAS_INICIALES
+    _min_fecha, _max_fecha, get_opciones_comerciales(bodega=bodega), dias_por_defecto=DIAS_INICIALES
 )
 # Esta es la única página que consulta a nivel de línea sobre las 875.059 de
 # `lineas_pedido`: medido, 7 días cuestan 4,4 s y el histórico completo 42,7 s.
@@ -143,6 +146,7 @@ try:
             almacenes_key,
             solo_previos,
             LIMITE_FILAS,
+            bodega=bodega,
         )
 except FileNotFoundError as e:
     st.error(str(e))
@@ -206,7 +210,7 @@ st.caption(
 )
 
 try:
-    comp = get_comprometido()
+    comp = get_comprometido(bodega=bodega)
 except sqlite3.OperationalError as e:
     st.error(f"La base está ocupada momentáneamente ({e}).")
     comp = pd.DataFrame()
@@ -239,12 +243,12 @@ else:
     )
 
     st.warning(
-        "**Esta cifra no sale de `v_inventario_comprometido`, y es a propósito.** Esa "
-        "VIEW resta `cantidad_entregada` a `cantidad_comprada`, pero el origen puebla "
-        "las dos iguales mientras el subpedido está abierto —99,3% de las líneas, con "
-        "`cantidades_definitivas = 0` en 2.081 de 2.085 subpedidos activos—. La resta da "
-        "**251 unidades** cuando lo realmente comprometido son **497.929**. Acá se usa "
-        "`cantidad_comprada`, que es lo que la bodega tiene reservado."
+        "**Esta cifra usa `cantidad_comprada`, no la resta contra lo entregado, y es a "
+        "propósito.** El origen puebla `cantidad_entregada` igual a `cantidad_comprada` "
+        "mientras el subpedido está abierto, así que la resta da casi cero: en la "
+        "operación histórica, **251 unidades** cuando lo comprometido eran **497.929** "
+        "(DEC-098; la VIEW que restaba se retiró en DEC-103). `cantidad_comprada` es lo "
+        "que la bodega tiene reservado."
     )
 
     if not sin_cubrir.empty:

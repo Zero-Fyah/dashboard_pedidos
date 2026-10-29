@@ -25,7 +25,7 @@ import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from filtros import aplicar, aviso_alcance, barra_lateral
+from filtros import aplicar, aviso_alcance, barra_lateral, bodega_seleccionada
 
 from db import (
     get_ciclo_pedidos,
@@ -41,6 +41,9 @@ from theme import (
     TEXT_PRIMARY,
     TEXT_SECONDARY,
 )
+
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
 
 # Un pedido abierto que lleva más de esto en la misma etapa dejó de estar "en
 # proceso". No es un umbral de negocio —nadie lo definió— sino un corte de
@@ -63,7 +66,7 @@ st.info(
 )
 
 try:
-    _min_fecha, _max_fecha = get_rango_fechas()
+    _min_fecha, _max_fecha = get_rango_fechas(bodega=bodega)
 except (FileNotFoundError, sqlite3.OperationalError) as e:
     st.error(f"No se pudo leer la base ({e}).")
     st.stop()
@@ -72,11 +75,11 @@ if not _min_fecha:
     st.info("Todavía no hay pedidos en la base de datos.")
     st.stop()
 
-_f = barra_lateral(_min_fecha, _max_fecha, get_opciones_comerciales())
+_f = barra_lateral(_min_fecha, _max_fecha, get_opciones_comerciales(bodega=bodega))
 aviso_alcance(_f)
 
 try:
-    df = aplicar(get_ciclo_pedidos(_f.desde, _f.hasta), _f)
+    df = aplicar(get_ciclo_pedidos(_f.desde, _f.hasta, bodega=bodega), _f)
 except sqlite3.OperationalError as e:
     st.error(f"La base está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()
@@ -236,7 +239,7 @@ st.markdown(
 )
 
 try:
-    trans = get_ciclo_transiciones(_f.desde, _f.hasta)
+    trans = get_ciclo_transiciones(_f.desde, _f.hasta, bodega=bodega)
 except sqlite3.OperationalError:
     trans = pd.DataFrame()
 

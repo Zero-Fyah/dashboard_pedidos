@@ -26,7 +26,7 @@ import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from filtros import aplicar, aviso_alcance, barra_lateral
+from filtros import aplicar, aviso_alcance, barra_lateral, bodega_seleccionada
 
 from comun.entregas import (
     A_TIEMPO,
@@ -47,6 +47,9 @@ from theme import (
     TEXT_SECONDARY,
 )
 
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
+
 st.markdown('<p class="dp-breadcrumb">Dashboard / Fuera del alcance</p>', unsafe_allow_html=True)
 st.title("🚚 Cumplimiento de entrega")
 # DEC-104: esta página vive en «Fuera del alcance», que NO quiere decir fuera
@@ -63,7 +66,7 @@ st.info(
 )
 
 try:
-    _min_fecha, _max_fecha = get_rango_fechas()
+    _min_fecha, _max_fecha = get_rango_fechas(bodega=bodega)
 except (FileNotFoundError, sqlite3.OperationalError) as e:
     st.error(f"No se pudo leer la base ({e}).")
     st.stop()
@@ -72,11 +75,11 @@ if not _min_fecha:
     st.info("Todavía no hay pedidos en la base de datos.")
     st.stop()
 
-_f = barra_lateral(_min_fecha, _max_fecha, get_opciones_comerciales())
+_f = barra_lateral(_min_fecha, _max_fecha, get_opciones_comerciales(bodega=bodega))
 aviso_alcance(_f)
 
 try:
-    df = aplicar(get_entregas(_f.desde, _f.hasta), _f)
+    df = aplicar(get_entregas(_f.desde, _f.hasta, bodega=bodega), _f)
 except sqlite3.OperationalError as e:
     st.error(f"La base está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()

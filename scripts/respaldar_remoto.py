@@ -38,14 +38,21 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+from comun import BODEGA_DEFECTO, get_bodega, ruta_bodega
+
+# DEC-163: el archivo de la bodega del proceso, por ruta explícita; fuera de
+# la bodega por defecto prevalece sobre el entorno heredado.
+load_dotenv(ruta_bodega("env"), override=get_bodega() != BODEGA_DEFECTO)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("respaldar_remoto")
 
 _TIMEOUT_S = 120
-RAIZ = Path(__file__).resolve().parent.parent
-CARPETA_BACKUPS = RAIZ / "data" / "backups"
+CARPETA_BACKUPS = ruta_bodega("backups")
+# DEC-163: los respaldos de las dos bodegas se llaman igual
+# (`pedidos_<fecha>.db`); en el destino remoto, la que no es la por defecto
+# va en una subcarpeta con su nombre para que nunca se pisen.
+SUBCARPETA_REMOTA = "" if get_bodega() == BODEGA_DEFECTO else get_bodega()
 
 
 def _archivos_de_hoy() -> list[Path]:
@@ -79,6 +86,8 @@ def copiar() -> bool:
 
     usuario = os.environ.get("RESPALDO_REMOTO_USUARIO", "")
     puerto = os.environ.get("RESPALDO_REMOTO_PUERTO", "22")
+    if SUBCARPETA_REMOTA:
+        ruta_remota = f"{ruta_remota.rstrip('/')}/{SUBCARPETA_REMOTA}/"
     destino = f"{usuario}@{host}:{ruta_remota}" if usuario else f"{host}:{ruta_remota}"
 
     comando = [

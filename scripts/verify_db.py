@@ -1,9 +1,12 @@
 import sqlite3
-from pathlib import Path
 
-# Ruta anclada a la raíz del proyecto, no al CWD (patrón BUG-007)
-db = Path(__file__).parent.parent / "data" / "pedidos.db"
+from comun import ruta_bodega, verificar_bodega_db
+
+# Ruta anclada a la raíz del proyecto, no al CWD (patrón BUG-007); la base
+# es la de la bodega del proceso (variable BODEGA, DEC-163).
+db = ruta_bodega("pedidos.db")
 assert db.exists(), f"DB no encontrada en {db.resolve()}"
+verificar_bodega_db(db)
 
 con = sqlite3.connect(db)
 

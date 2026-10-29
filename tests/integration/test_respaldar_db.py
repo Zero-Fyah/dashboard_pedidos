@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+import comun
+
 pytestmark = pytest.mark.integration
 
 _RUTA = Path(__file__).resolve().parents[2] / "scripts" / "respaldar_db.py"
@@ -102,7 +104,8 @@ def test_main_respalda_ambas_bases_y_reporta_fallo(tmp_path, monkeypatch):
     (tmp_path / "data").mkdir()
     _base(tmp_path / "data" / "pedidos.db")
     _base(tmp_path / "data" / "tareas.db")
-    monkeypatch.setattr(respaldo, "RAIZ", tmp_path)
+    # DEC-163: las rutas salen de comun.ruta_bodega(), anclada a la raíz del proyecto.
+    monkeypatch.setattr(comun, "_RAIZ_PROYECTO", tmp_path)
 
     assert respaldo.main() == 0
     hechos = sorted(p.name for p in (tmp_path / "data" / "backups").iterdir())

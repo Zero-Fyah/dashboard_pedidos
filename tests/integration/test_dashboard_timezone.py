@@ -76,7 +76,7 @@ def _base(tmp_path, fecha):
 
 def _dias_de(monkeypatch, tmp_path, fecha):
     monkeypatch.setattr(ddb, "DB_PATH", _base(tmp_path, fecha))
-    monkeypatch.setattr(ddb, "_num_cols_exist", lambda: True)
+    monkeypatch.setattr(ddb, "_num_cols_exist", lambda *_a, **_k: True)
     ddb.get_pedidos_impagos.clear()
     df = ddb.get_pedidos_impagos()
     assert len(df) == 1, "el pedido de prueba tiene que aparecer como impago"

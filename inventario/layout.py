@@ -20,9 +20,11 @@ from pathlib import Path
 
 import pandas as pd
 
+from comun import ruta_bodega
+
 logger = logging.getLogger("inventario.layout")
 
-RUTA_LAYOUT_DEFAULT = Path(__file__).parent.parent / "data" / "inventario" / "layout_bodega.xlsx"
+RUTA_LAYOUT_DEFAULT = ruta_bodega("inventario") / "layout_bodega.xlsx"
 
 HOJA_LAYOUT = "layout"
 
@@ -354,6 +356,29 @@ def clasificar_ubicaciones(df_bochica: pd.DataFrame, df_layout: pd.DataFrame) ->
     # Solo reclasifica lo que quedó fuera del layout: si el layout llegara a
     # declarar uno de estos racks, manda el layout.
     anotado.loc[es_virtual & (anotado["tipo"] == TIPO_FUERA), "tipo"] = TIPO_VIRTUAL
+    return anotado
+
+
+def clasificar_por_reservas(df_bochica: pd.DataFrame, reservas: tuple[str, ...]) -> pd.DataFrame:
+    """Anota cada fila de Bochica como altura o picking según una lista de reservas.
+
+    Para una bodega sin layout propio (DEC-164): la regla del Arquitecto es
+    que sus alturas son exactamente `reservas` —las ubicaciones de reserva
+    más el puerto, `comun.ALTURAS_BODEGA2`— y todo lo demás cuenta como
+    picking. No usa el layout de la histórica: es otra bodega, aunque sus
+    ubicaciones usen la misma nomenclatura (rack_posición_nivel).
+
+    Args:
+        df_bochica: Resultado de `inventario.normalizador.cargar_bochica()`.
+        reservas: Ubicaciones que cuentan como altura, escritas como en Bochica.
+
+    Returns:
+        `df_bochica` con la columna `tipo` (`TIPO_ALTURA` o `TIPO_PICKING`).
+    """
+    anotado = df_bochica.copy()
+    es_reserva = anotado["ubicacion"].astype(str).isin(reservas)
+    anotado["tipo"] = TIPO_PICKING
+    anotado.loc[es_reserva, "tipo"] = TIPO_ALTURA
     return anotado
 
 

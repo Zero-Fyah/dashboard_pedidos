@@ -27,17 +27,20 @@ import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from filtros import aviso_alcance, barra_lateral
+from filtros import aviso_alcance, barra_lateral, bodega_seleccionada
 
 from db import get_faltantes_clasificados, get_rango_fechas
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
+
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
 
 st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_html=True)
 st.title("📉 Faltantes de inventario")
 
 try:
-    df = get_faltantes_clasificados()
-    _min_fecha, _max_fecha = get_rango_fechas()
+    df = get_faltantes_clasificados(bodega=bodega)
+    _min_fecha, _max_fecha = get_rango_fechas(bodega=bodega)
 except sqlite3.OperationalError as e:
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()

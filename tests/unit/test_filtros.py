@@ -126,3 +126,15 @@ def test_hay_dimensiones_detecta_cualquiera(campo, esperado):
 
 def test_sin_nada_puesto_no_hay_dimensiones():
     assert TODOS.hay_dimensiones is False
+
+
+# ── Contenido de la operación histórica (DEC-165) ──────────────────────────────
+
+
+def test_es_historica_distingue_la_bodega_por_defecto():
+    """Los hallazgos medidos en la histórica (ejemplos con referencias concretas)
+    se muestran solo ahí: en la otra bodega se leerían como datos propios."""
+    from dashboard.filtros import es_historica
+
+    assert es_historica("miempresa")
+    assert not es_historica("bodega2")

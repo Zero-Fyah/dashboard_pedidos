@@ -17,7 +17,13 @@ from pathlib import Path
 
 import pandas as pd
 
-from comun import VIGENCIA_ACTIVO, VIGENCIA_DESCONTINUADO
+from comun import (
+    ALMACEN_DE_BODEGA,
+    VIGENCIA_ACTIVO,
+    VIGENCIA_DESCONTINUADO,
+    get_bodega,
+    ruta_bodega,
+)
 
 logger = logging.getLogger("inventario.normalizador")
 
@@ -40,7 +46,9 @@ CATEGORIA_RECIBIDA_POR_PESO = "Arena"
 # CEDI Mosquera = almacén Bogotá del sistema administrativo (confirmado
 # por el Arquitecto, DEC-041). Excluida `Arena`, Bogotá concentra el
 # 99,76% de las unidades: el filtro es correcto y de bajo impacto.
-ALMACEN_BODEGA = "Bogotá"
+# DEC-164: el almacén depende de la bodega del proceso (cada operación tiene
+# la suya y la escribe a su manera: `bodega2` sin tilde).
+ALMACEN_BODEGA = ALMACEN_DE_BODEGA[get_bodega()]
 
 # Definición operativa de avería (DEC-041, confirmada por el Arquitecto).
 # Medido sobre el catálogo real: hoy el patrón de referencia está
@@ -167,9 +175,7 @@ def cargar_admin(path: Path) -> pd.DataFrame:
 # el resto de `data/inventario/` (DEC-039). Si no existe (clon nuevo, CI),
 # `aplicar_nombres_canonicos_arena()` no hace nada y el pipeline sigue con
 # el texto crudo del origen, como antes de esto existir.
-RUTA_NOMBRES_CANONICOS_ARENA = (
-    Path(__file__).parent.parent / "data" / "inventario" / "arena_nombres_canonicos.xlsx"
-)
+RUTA_NOMBRES_CANONICOS_ARENA = ruta_bodega("inventario") / "arena_nombres_canonicos.xlsx"
 
 
 def _cargar_nombres_canonicos_arena(ruta: Path = RUTA_NOMBRES_CANONICOS_ARENA) -> dict[str, str]:

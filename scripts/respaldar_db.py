@@ -32,9 +32,10 @@ import sys
 from datetime import date
 from pathlib import Path
 
+from comun import ruta_bodega, verificar_bodega_db
+
 logger = logging.getLogger("respaldo")
 
-RAIZ = Path(__file__).resolve().parent.parent
 BASES: tuple[str, ...] = ("pedidos", "tareas")
 # Solo los archivos que genera este script: `<base>_AAAA-MM-DD.db`. Los
 # respaldos manuales (`pedidos_pre-reindex_…`, `pedidos_pre_DEC140_…`) no
@@ -119,16 +120,19 @@ def purgar(destino_dir: Path, base: str, conservar: int) -> list[Path]:
 
 
 def main() -> int:
-    destino_dir = RAIZ / "data" / "backups"
+    # DEC-163: cada bodega respalda sus bases en su propia carpeta, así la
+    # purga de una nunca toca los respaldos de la otra.
+    destino_dir = ruta_bodega("backups")
     conservar = _dias_retencion()
     hoy = date.today()
     codigo = 0
     for base in BASES:
-        origen = RAIZ / "data" / f"{base}.db"
+        origen = ruta_bodega(f"{base}.db")
         if not origen.exists():
             logger.warning("respaldo: %s no existe — se omite", origen.name)
             continue
         try:
+            verificar_bodega_db(origen)
             nuevo = respaldar(origen, destino_dir, hoy)
         except Exception as exc:  # noqa: BLE001 — se reporta y el ciclo sigue
             logger.error("respaldo: %s falló: %s", origen.name, exc)

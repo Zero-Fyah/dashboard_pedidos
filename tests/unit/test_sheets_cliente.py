@@ -44,18 +44,39 @@ class _Hoja:
 
 
 class _Libro:
-    def __init__(self, hoja):
-        self.sheet1 = hoja
+    """Archivo de Sheets con pestañas por nombre; la primera es `sheet1`."""
+
+    def __init__(self, hoja, nombre="Hoja 1", otras=None):
+        self._pestanas = {nombre: hoja, **(otras or {})}
+        self.creadas: list[str] = []
+
+    @property
+    def sheet1(self):
+        return next(iter(self._pestanas.values()))
+
+    def worksheets(self):
+        return list(self._pestanas.values())
+
+    def worksheet(self, nombre):
+        if nombre not in self._pestanas:
+            raise sc.gspread.WorksheetNotFound(nombre)
+        return self._pestanas[nombre]
+
+    def add_worksheet(self, title, rows, cols):
+        self.creadas.append(title)
+        self._pestanas[title] = _Hoja(filas=rows, columnas=cols)
+        return self._pestanas[title]
 
 
 class _Cliente:
-    def __init__(self, hoja=None):
+    def __init__(self, hoja=None, libro=None):
         self.hoja = hoja or _Hoja()
+        self.libro = libro or _Libro(self.hoja)
         self.abiertas: list[str] = []
 
     def open_by_key(self, clave):
         self.abiertas.append(clave)
-        return _Libro(self.hoja)
+        return self.libro
 
 
 def test_escribe_marca_encabezado_y_datos(monkeypatch):
@@ -107,3 +128,44 @@ def test_hoja_justa_no_limpia_nada():
     gc = _Cliente(_Hoja(filas=4, columnas=2))
     sc.escribir_hoja(gc, "ID", pd.DataFrame({"A": [1, 2], "B": [3, 4]}))
     assert gc.hoja.acciones == ["update"]
+
+
+# ─────────────────────────────────────────────
+# Una pestaña por bodega en los mismos archivos (DEC-164)
+# ─────────────────────────────────────────────
+
+
+def _df():
+    return pd.DataFrame({"Ciudad": ["Cali"], "Disponible para venta": [3.0]})
+
+
+def test_con_nombre_escribe_en_esa_pestana_aunque_no_sea_la_primera():
+    primera, segunda = _Hoja(), _Hoja()
+    gc = _Cliente(libro=_Libro(primera, "Hist", otras={"Nueva": segunda}))
+
+    sc.escribir_hoja(gc, "ID", _df(), pestana="Nueva")
+
+    assert segunda.acciones == ["update", "batch_clear"]
+    assert primera.acciones == []  # la de la otra bodega, intacta
+
+
+def test_sin_nombre_y_con_varias_pestanas_no_escribe_en_ninguna():
+    primera, segunda = _Hoja(), _Hoja()
+    gc = _Cliente(libro=_Libro(primera, "Hist", otras={"Nueva": segunda}))
+
+    with pytest.raises(sc.PestanaAmbiguaError):
+        sc.escribir_hoja(gc, "ID", _df())
+    assert primera.acciones == segunda.acciones == []
+
+
+def test_la_pestana_que_falta_se_crea_solo_si_se_pide():
+    libro = _Libro(_Hoja(), "Hist")
+    gc = _Cliente(libro=libro)
+
+    with pytest.raises(sc.gspread.WorksheetNotFound):
+        sc.escribir_hoja(gc, "ID", _df(), pestana="Nueva")
+    assert libro.creadas == []
+
+    sc.escribir_hoja(gc, "ID", _df(), pestana="Nueva", crear=True)
+    assert libro.creadas == ["Nueva"]
+    assert libro.worksheet("Nueva").escrito[1] == ["Ciudad", "Disponible para venta"]

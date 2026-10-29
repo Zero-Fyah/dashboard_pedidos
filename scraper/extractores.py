@@ -28,6 +28,7 @@ from scraper.config import (
     HTML_LOCK,
     SCREENSHOT_LOCK,
     log_event,
+    pais_de_url,
 )
 
 # ─────────────────────────────────────────────
@@ -176,6 +177,34 @@ _JS_ESPERA_LOGIN = """([destino, selUsuario, selClave]) => {
 }"""
 
 
+class PaisIncorrectoError(RuntimeError):
+    """La SPA mostró un país distinto al de la bodega (DEC-163).
+
+    No es un fallo transitorio: ningún reintento lo corrige y seguir
+    escribiría datos de una operación en la base de la otra. Las capas de
+    reintento lo dejan pasar.
+    """
+
+
+def verificar_pais_de_pagina(url: str) -> None:
+    """Detiene el run si `url` trae un país distinto al de la bodega.
+
+    Se llama en la primera página con país de cada flujo (listado de
+    pedidos, inventario y cambios de inventario), no al terminar `login()`:
+    medido el 2026-10-21, tras el login la SPA queda en `/platform`, sin
+    país, y esa página es de la cuenta —la misma para las dos bodegas—, no
+    de la bodega. Una URL sin país no prueba nada y pasa.
+
+    Raises:
+        PaisIncorrectoError: si el país de la URL no es `CONFIG["pais"]`.
+    """
+    pais = pais_de_url(url)
+    if pais is not None and pais != CONFIG["pais"]:
+        raise PaisIncorrectoError(
+            f"La SPA está en el país {pais} y la bodega es del país {CONFIG['pais']} (DEC-163)"
+        )
+
+
 async def _llenar_formulario_login(
     page: Page, usuario: str, clave: str, max_rellenos: int = 5
 ) -> int:
@@ -315,7 +344,8 @@ async def login(page: Page, usuario: str, clave: str) -> None:
 # NAVEGACIÓN INTERNA DE LA SPA (Vue Router)
 # ─────────────────────────────────────────────
 
-_RUTA_DETALLE_PEDIDO = "/country/CO/orders/parent-orders/detail/{id_pedido}"
+# DEC-163: el país sale de la configuración de la bodega, no del código.
+_RUTA_DETALLE_PEDIDO = "/country/{pais}/orders/parent-orders/detail/{id_pedido}"
 
 _JS_ROUTER_PUSH = """async (ruta) => {
     const app = document.querySelector('#app').__vue_app__;
@@ -374,7 +404,7 @@ async def navegar_a_detalle_via_router(page: Page, id_pedido: str) -> bool:
         True si la navegación interna funcionó y el ID quedó confirmado
         en pantalla. False ante cualquier fallo — sin excepción.
     """
-    ruta = _RUTA_DETALLE_PEDIDO.format(id_pedido=id_pedido)
+    ruta = _RUTA_DETALLE_PEDIDO.format(pais=CONFIG["pais"], id_pedido=id_pedido)
     try:
         await page.evaluate(_JS_ROUTER_PUSH, ruta)
         await page.wait_for_function(
@@ -614,6 +644,9 @@ async def _configurar_listado(page: Page, fecha_desde: str, fecha_hasta: str) ->
         "button.el-button.is-link.expand-toggle",
         timeout=CONFIG["ELEM_TIMEOUT_MS"],
     )
+    # DEC-163: primera página con país en la ruta — la que muestra la SPA,
+    # no la pedida (una redirección a otro país se ve acá).
+    verificar_pais_de_pagina(page.url)
 
     await page.click("button.el-button.is-link.expand-toggle span")
     await asyncio.sleep(1)
@@ -892,6 +925,8 @@ async def obtener_lista_pedidos_con_retry(
     for intento in range(1, max_intentos + 1):
         try:
             return await obtener_lista_pedidos(page, fecha_desde, fecha_hasta)
+        except PaisIncorrectoError:
+            raise
         except Exception as exc:
             if intento >= max_intentos:
                 log_event(

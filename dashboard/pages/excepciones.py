@@ -18,16 +18,19 @@ import sqlite3
 
 import pandas as pd
 import streamlit as st
-from filtros import aplicar, aviso_alcance, barra_lateral
+from filtros import aplicar, aviso_alcance, barra_lateral, bodega_seleccionada
 
 from db import get_excepciones, get_opciones_comerciales, get_rango_fechas
 from theme import STATUS_CRITICAL
+
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
 
 st.markdown('<p class="dp-breadcrumb">Dashboard / Operación</p>', unsafe_allow_html=True)
 st.title("⚠️ Excepciones del proceso")
 
 try:
-    _min_fecha, _max_fecha = get_rango_fechas()
+    _min_fecha, _max_fecha = get_rango_fechas(bodega=bodega)
 except (FileNotFoundError, sqlite3.OperationalError) as e:
     st.error(f"No se pudo leer la base ({e}).")
     st.stop()
@@ -36,11 +39,11 @@ if not _min_fecha:
     st.info("Todavía no hay pedidos en la base de datos.")
     st.stop()
 
-_f = barra_lateral(_min_fecha, _max_fecha, get_opciones_comerciales())
+_f = barra_lateral(_min_fecha, _max_fecha, get_opciones_comerciales(bodega=bodega))
 aviso_alcance(_f)
 
 try:
-    df = aplicar(get_excepciones(_f.desde, _f.hasta), _f)
+    df = aplicar(get_excepciones(_f.desde, _f.hasta, bodega=bodega), _f)
 except sqlite3.OperationalError as e:
     st.error(f"La base está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()

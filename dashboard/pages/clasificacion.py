@@ -14,6 +14,7 @@ import sqlite3
 
 import plotly.graph_objects as go
 import streamlit as st
+from filtros import bodega_seleccionada
 
 from db import get_inventario_abc
 from theme import (
@@ -25,6 +26,9 @@ from theme import (
     TEXT_SECONDARY,
 )
 
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
+
 FILAS_ABC = ["A", "B", "C"]
 COLUMNAS_XYZ = ["X", "Y", "Z"]
 
@@ -32,7 +36,7 @@ st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_
 st.title("🗂 Clasificación ABC-XYZ")
 
 try:
-    df = get_inventario_abc()
+    df = get_inventario_abc(bodega=bodega)
 except sqlite3.OperationalError as e:
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()

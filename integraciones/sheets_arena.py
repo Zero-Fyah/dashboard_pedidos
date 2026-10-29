@@ -24,12 +24,21 @@ import sqlite3
 
 import pandas as pd
 
-from comun import ARENA_CIUDADES, ARENA_MODALIDADES_NUCLEO, ESTADOS_PREVIOS_PICKING
+from comun import (
+    ALMACEN_DE_BODEGA,
+    ARENA_CIUDADES,
+    ARENA_MODALIDADES_NUCLEO,
+    ESTADOS_PREVIOS_PICKING,
+)
 
 # DEC-143: los dos Sheets se comparten para las 12 ciudades (seguimiento
 # nacional). Bogotá entra aparte de `CIUDADES_SOLO_ARENA` a propósito: esa
 # constante significa "ciudades que solo almacenan Arena", y Bogotá no lo es.
-CIUDADES_SHEETS: tuple[str, ...] = ARENA_CIUDADES
+# DEC-164: más el almacén de cada bodega tal como lo escribe su operación
+# (`bodega2` publica `Bogota`, sin tilde).
+CIUDADES_SHEETS: tuple[str, ...] = ARENA_CIUDADES + tuple(
+    a for a in dict.fromkeys(ALMACEN_DE_BODEGA.values()) if a not in ARENA_CIUDADES
+)
 
 COLUMNAS_INVENTARIO = [
     "Ciudad",

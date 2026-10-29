@@ -20,6 +20,7 @@ import sqlite3
 
 import plotly.graph_objects as go
 import streamlit as st
+from filtros import bodega_seleccionada
 
 from comun import (
     COBERTURA_ALTA_D,
@@ -36,14 +37,17 @@ from comun.reposicion import (
 from db import get_inventario_abc, get_inventario_corrida, get_inventario_salud
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
 
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
+
 st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_html=True)
 st.title("🩺 Salud de inventario")
 
 try:
-    df = get_inventario_salud()
-    corrida = get_inventario_corrida()
+    df = get_inventario_salud(bodega=bodega)
+    corrida = get_inventario_corrida(bodega=bodega)
     # DEC-071: aporta la clase y el `cv` de la demanda para el punto de reorden.
-    abc = get_inventario_abc()
+    abc = get_inventario_abc(bodega=bodega)
 except sqlite3.OperationalError as e:
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()

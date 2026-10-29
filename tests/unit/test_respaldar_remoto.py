@@ -35,6 +35,27 @@ def _resultado(rc=0, stderr=""):
     return subprocess.CompletedProcess(args=[], returncode=rc, stdout="", stderr=stderr)
 
 
+@pytest.mark.parametrize(
+    "subcarpeta,destino",
+    [
+        ("", "backup.ejemplo.com:/srv/respaldos"),
+        ("bodega2", "backup.ejemplo.com:/srv/respaldos/bodega2/"),
+    ],
+)
+def test_destino_remoto_por_bodega(monkeypatch, con_respaldo_de_hoy, subcarpeta, destino):
+    """DEC-163: los respaldos de las dos bodegas se llaman igual; la que no es
+    la por defecto va en su subcarpeta remota para que nunca se pisen."""
+    monkeypatch.setenv("RESPALDO_REMOTO_HOST", "backup.ejemplo.com")
+    monkeypatch.setenv("RESPALDO_REMOTO_RUTA", "/srv/respaldos")
+    monkeypatch.delenv("RESPALDO_REMOTO_USUARIO", raising=False)
+    monkeypatch.setattr(rr, "SUBCARPETA_REMOTA", subcarpeta)
+    llamados = []
+    monkeypatch.setattr(rr.subprocess, "run", lambda cmd, **k: llamados.append(cmd) or _resultado())
+
+    assert rr.copiar() is True
+    assert llamados[0][-1] == destino
+
+
 @pytest.mark.parametrize("faltante", ["RESPALDO_REMOTO_HOST", "RESPALDO_REMOTO_RUTA"])
 def test_sin_host_o_ruta_no_intenta_copiar(monkeypatch, faltante, con_respaldo_de_hoy):
     variables = {

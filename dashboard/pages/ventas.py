@@ -20,7 +20,7 @@ import sqlite3
 
 import plotly.graph_objects as go
 import streamlit as st
-from filtros import aplicar, aviso_alcance, barra_lateral
+from filtros import aplicar, aviso_alcance, barra_lateral, bodega_seleccionada
 
 from db import (
     get_descuentos_por_tipo,
@@ -36,6 +36,9 @@ from theme import (
     TEXT_PRIMARY,
     TEXT_SECONDARY,
 )
+
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
 
 
 def _mm(valor: float) -> str:
@@ -68,7 +71,7 @@ st.info(
 )
 
 try:
-    _min_fecha, _max_fecha = get_rango_fechas()
+    _min_fecha, _max_fecha = get_rango_fechas(bodega=bodega)
 except (FileNotFoundError, sqlite3.OperationalError) as e:
     st.error(f"No se pudo leer la base ({e}).")
     st.stop()
@@ -77,16 +80,16 @@ if not _min_fecha:
     st.info("Todavía no hay pedidos en la base de datos.")
     st.stop()
 
-_f = barra_lateral(_min_fecha, _max_fecha, get_opciones_comerciales())
+_f = barra_lateral(_min_fecha, _max_fecha, get_opciones_comerciales(bodega=bodega))
 aviso_alcance(_f)
 
 try:
-    df = aplicar(get_ventas(_f.desde, _f.hasta), _f)
+    df = aplicar(get_ventas(_f.desde, _f.hasta, bodega=bodega), _f)
     # El mix y los descuentos se agregan en SQL y no traen las dimensiones
     # comerciales, así que solo respetan la fecha. La página lo advierte en vez
     # de dar a entender que el recorte por vendedor también los alcanza.
-    por_linea = get_ventas_por_linea(_f.desde, _f.hasta)
-    descuentos = get_descuentos_por_tipo(_f.desde, _f.hasta)
+    por_linea = get_ventas_por_linea(_f.desde, _f.hasta, bodega=bodega)
+    descuentos = get_descuentos_por_tipo(_f.desde, _f.hasta, bodega=bodega)
 except sqlite3.OperationalError as e:
     st.error(f"La base está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()
@@ -236,8 +239,9 @@ else:
         st.caption(
             "El mix sale de `lineas_pedido.tipo`, que trae las tres categorías al 100%. "
             "**No se derivó del IVA**, que parecía la vía natural: los conceptos `IVA "
-            "arena para gatos` / `accesorios` / `alimentos` solo cubren el 75,4% de la "
-            "base gravable — el resto es producto sin IVA que no queda atribuido."
+            "arena para gatos` / `accesorios` / `alimentos` no cubren el producto sin IVA, "
+            "que quedaría sin atribuir (en la operación histórica cubrían solo el 75,4% "
+            "de la base gravable)."
         )
 
 # ── Descuentos ─────────────────────────────────────────────────────────────────

@@ -335,3 +335,95 @@ class TestArchivarSnapshotBochica:
         archivar_snapshot_bochica(date(2026, 8, 25), origen=vivo, carpeta_historico=historico)
 
         assert ajeno.exists()
+
+
+# ─────────────────────────────────────────────
+# Días sin movimientos (DEC-164): dos descargas vacías y no se vuelve a pedir
+# ─────────────────────────────────────────────
+
+
+class _NavegadorFalso:
+    async def close(self):
+        pass
+
+
+class _PlaywrightFalso:
+    def __init__(self):
+        self.chromium = self
+
+    async def launch(self, **_k):
+        return _NavegadorFalso()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return False
+
+
+@pytest.fixture
+def ciclo(db, tmp_path, monkeypatch):
+    """`main()` real con la descarga reemplazada: cada llamada escribe el
+    archivo del día con las filas que diga `respuestas` (una lista por llamada)."""
+    import asyncio
+
+    import playwright.async_api
+
+    import scraper.movimientos_bochica as mb
+
+    respuestas: list[list[dict]] = []
+    descargas: list[date] = []
+
+    async def _descargar(_page, fecha, destino):
+        descargas.append(fecha)
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        filas = respuestas.pop(0)
+        pd.DataFrame(filas, columns=_COLUMNAS_FUENTE).to_excel(destino, index=False)
+        return destino
+
+    async def _nada(*_a, **_k):
+        return object()
+
+    monkeypatch.setattr(mb, "get_db_path", lambda: db)
+    monkeypatch.setattr(mb, "DESTINO_DIR_DIARIO", tmp_path / "diarios")
+    monkeypatch.setattr(mb, "archivar_snapshot_bochica", lambda *_a, **_k: None)
+    monkeypatch.setattr(mb, "pagina_con_sesion_guardada", _nada)
+    monkeypatch.setattr(mb, "login_app_bochica", _nada)
+    monkeypatch.setattr(mb, "descargar_movimientos_bochica", _descargar)
+    monkeypatch.setattr(mb, "log_event", lambda *_a, **_k: None)
+    monkeypatch.setattr(playwright.async_api, "async_playwright", _PlaywrightFalso)
+
+    def correr(*filas_por_llamada):
+        respuestas.extend(filas_por_llamada)
+        return [asyncio.run(mb.main()) for _ in filas_por_llamada]
+
+    return correr, descargas, tmp_path / "diarios"
+
+
+def test_un_dia_vacio_se_pide_dos_veces_y_despues_no(ciclo):
+    correr, descargas, carpeta = ciclo
+    assert correr([], []) == [0, 0]
+    assert len(descargas) == 2
+    ayer = date.today() - timedelta(days=1)
+    assert (carpeta / f"movimientos_bochica_{ayer.isoformat()}.vacio").exists()
+
+    # La tercera corrida ni siquiera abre el navegador.
+    assert correr() == []
+    import asyncio
+
+    import scraper.movimientos_bochica as mb
+
+    assert asyncio.run(mb.main()) == 0
+    assert len(descargas) == 2
+
+
+def test_una_descarga_vacia_seguida_de_otra_con_filas_carga_el_dia(ciclo, db):
+    """Si la primera vacía era falsa (la tabla no terminó de cargar), el día
+    no se pierde: la segunda trae las filas y no queda marca de vacío."""
+    correr, descargas, carpeta = ciclo
+    ayer = date.today() - timedelta(days=1)
+    fecha = f"{ayer.day}/{ayer.month}/{ayer.year}, 9:15:00 a. m."
+    assert correr([], [_fila(fecha=fecha)]) == [0, 0]
+    assert ya_cargado(db, ayer)
+    assert not (carpeta / f"movimientos_bochica_{ayer.isoformat()}.vacio").exists()
+    assert len(descargas) == 2

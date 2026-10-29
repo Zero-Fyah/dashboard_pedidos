@@ -25,11 +25,11 @@ from pathlib import Path
 import pandas as pd
 from playwright.async_api import Download, Page
 
-from comun import get_db_path
+from comun import get_db_path, ruta_bodega
 from scraper.config import CONFIG, log_event
-from scraper.extractores import SEL_BTN_BUSCAR, SEL_LISTA_FILAS, login
+from scraper.extractores import SEL_BTN_BUSCAR, SEL_LISTA_FILAS, login, verificar_pais_de_pagina
 
-DESTINO_DIR = Path(__file__).parent.parent / "data" / "inventario" / "cambios_diarios"
+DESTINO_DIR = ruta_bodega("inventario") / "cambios_diarios"
 
 # almacen es nullable: 4 de 1.134.916 filas del histórico lo traen vacío
 # (hallazgo del análisis previo). antes_ajuste también: ~0,73% de los
@@ -274,6 +274,8 @@ async def descargar_cambios_inventario(page: Page, fecha: date, destino: Path) -
             f"El filtro de fecha no quedó aplicado (esperado {[fecha_str, fecha_str]}, "
             f"leído {valores}) — abortando para no descargar el histórico completo."
         )
+    # DEC-163: la página que muestra la SPA, no la pedida — antes de exportar.
+    verificar_pais_de_pagina(page.url)
 
     await page.locator(SEL_BTN_BUSCAR).click()
     await page.wait_for_selector(SEL_LISTA_FILAS, timeout=CONFIG["ELEM_TIMEOUT_MS"])
@@ -307,8 +309,11 @@ async def main() -> int:
     """
     from playwright.async_api import async_playwright
 
-    from scraper.config import CLAVE, USUARIO
+    from scraper.config import CLAVE, USUARIO, validar_config
 
+    # DEC-163: este paso navega a una URL de su .env y escribe en la base de
+    # la bodega — con una URL de otro país, mezclaría operaciones.
+    validar_config()
     db_path = get_db_path()
     init_schema(db_path)
 

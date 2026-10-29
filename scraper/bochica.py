@@ -14,10 +14,13 @@ from pathlib import Path
 from playwright.async_api import Download, Frame, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from comun import ruta_bodega
 from scraper.config import CONFIG, flags_v8, log_event
 
-DESTINO_DEFAULT = Path(__file__).parent.parent / "data" / "inventario" / "bochica_inventario.xlsx"
-SESION_DEFAULT = Path(__file__).parent.parent / "data" / "sesiones" / "bochica_storage_state.json"
+DESTINO_DEFAULT = ruta_bodega("inventario") / "bochica_inventario.xlsx"
+# DEC-164: la sesión de Google es una sola para las dos bodegas
+# (`sesiones` es recurso compartido); la operación la elige el botón de país.
+SESION_DEFAULT = ruta_bodega("sesiones") / "bochica_storage_state.json"
 
 
 async def login_bochica(page: Page, usuario: str, clave: str) -> None:
@@ -176,8 +179,12 @@ async def login_app_bochica(page: Page, usuario: str, clave: str) -> None:
 
     Distinta del login de Google: es un usuario/clave propios de la app
     (el "usuario de miempresa"). Tras un login válido aparece un selector
-    de país (Colombia/Chile) antes de que se muestre #appContent — el
-    proyecto solo opera Colombia (btnPais_CO), Chile queda fuera de alcance.
+    de operación, un botón por país (`btnPais_CO`, `btnPais_CL`,
+    `btnPais_CA`), antes de que se muestre #appContent. Se elige el de la
+    bodega del proceso, `CONFIG["pais"]` (DEC-164: antes era `CO` fijo);
+    los códigos son los mismos del sistema administrativo. Si la app no
+    ofrece ese botón, el clic vence y la descarga no ocurre: nunca cae en
+    la operación de otra bodega.
     Asume que `page` ya pasó por login_bochica().
 
     Args:
@@ -185,15 +192,20 @@ async def login_app_bochica(page: Page, usuario: str, clave: str) -> None:
         usuario: Usuario de la app (BOCHICA_APP_USUARIO).
         clave: Contraseña de ese usuario (BOCHICA_APP_PASSWORD).
     """
+    pais = CONFIG["pais"]
+    if not pais:
+        raise RuntimeError(
+            "SCRAPER_PAIS no está definido: no se sabe qué operación elegir en BOCHICA (DEC-164)"
+        )
     frame = await frame_con_selector(page, "#loginEmail", CONFIG["ELEM_TIMEOUT_MS"])
     await frame.locator("#loginEmail").fill(usuario)
     await frame.locator("#loginPassword").fill(clave)
     await frame.locator("#loginButton").click()
 
-    await frame.locator("#btnPais_CO").click(timeout=CONFIG["ELEM_TIMEOUT_MS"])
+    await frame.locator(f"#btnPais_{pais}").click(timeout=CONFIG["ELEM_TIMEOUT_MS"])
 
     await frame.locator("#appContent").wait_for(state="visible", timeout=CONFIG["ELEM_TIMEOUT_MS"])
-    log_event("login_bochica_app_ok", msg="Autenticación exitosa en Bochica (app, país CO)")
+    log_event("login_bochica_app_ok", msg=f"Autenticación exitosa en Bochica (app, país {pais})")
 
 
 async def descargar_inventario_global(page: Page, destino: Path = DESTINO_DEFAULT) -> Path:

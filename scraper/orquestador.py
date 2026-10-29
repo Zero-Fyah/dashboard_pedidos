@@ -14,6 +14,7 @@ import asyncio
 import json
 import re
 import time
+import zlib
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -357,6 +358,36 @@ _CAMPOS_ENTREGA = ("despachador", "hora_entrega", "obs_entrega")
 MANTENIMIENTO_MESES_ATRAS = 4
 
 
+def turno_de_cierre(ids_activos: list[str], turnos: int, hora: int) -> list[str]:
+    """Los pedidos activos que le tocan a esta hora en `--modo cierre` (DEC-164).
+
+    La operación histórica terminó pero tiene ~1.300 pedidos abiertos, y
+    revisarlos todos cada hora costaba 15-17 min del ciclo. En cierre se
+    reparten en `turnos` grupos fijos por `id_pedido % turnos`, y cada hora
+    toca el grupo `hora % turnos`: cada pedido se revisa cada `turnos` horas.
+    Sin estado en la base — el reparto sale del ID y la hora. Un ID no
+    numérico se reparte por su CRC32, que también es estable.
+
+    Args:
+        ids_activos: Salida de `obtener_ids_activos()`.
+        turnos: Cantidad de grupos (`CONFIG["CIERRE_TURNOS"]`); 1 o menos
+            devuelve todos.
+        hora: Hora local del run (0-23).
+
+    Returns:
+        Los IDs del turno, en el mismo orden.
+    """
+    if turnos <= 1:
+        return list(ids_activos)
+    turno = hora % turnos
+
+    def _grupo(id_pedido: str) -> int:
+        clave = int(id_pedido) if id_pedido.isdigit() else zlib.crc32(id_pedido.encode())
+        return clave % turnos
+
+    return [i for i in ids_activos if _grupo(i) == turno]
+
+
 def ventana_mantenimiento(hoy: date | None = None) -> tuple[str, str]:
     """Rango de fechas de pedido que cubre la pasada de mantenimiento.
 
@@ -678,7 +709,9 @@ async def main(args: argparse.Namespace) -> int:
         # DEC-142: pedidos que van a `completo` sin importar lo que diga la
         # base — re-extracción (DEC-140) y mantenimiento (DEC-092).
         ids_forzar_completo: frozenset[str] = frozenset()
-        if args.modo == "incremental":
+        # DEC-164: `cierre` es el incremental de la operación histórica — mismos
+        # carriles, con los activos repartidos por turno y forzados a completo.
+        if args.modo in ("incremental", "cierre"):
             # AUD-M8 (auditoría 2026-07-01): estados cerrados parametrizados
             # desde la constante del módulo común — sin literales inline.
             _cerr_ph = ",".join("?" * len(ESTADOS_CERRADOS))
@@ -686,6 +719,24 @@ async def main(args: argparse.Namespace) -> int:
             # Proceso 1 — Actualizar pedidos activos (sin recorrer páginas)
             # BUG-024: ver obtener_ids_activos().
             ids_activos = await obtener_ids_activos(db_path)
+            n_activos_total = len(ids_activos)
+            if args.modo == "cierre":
+                # DEC-164: solo el turno de esta hora, y en completo (abajo):
+                # `solo_estado` no lee la tarjeta de pago ni los comprobantes
+                # (DEC-152), y la cartera de la histórica se actualiza hasta el
+                # cierre.
+                ids_activos = turno_de_cierre(
+                    ids_activos, CONFIG["CIERRE_TURNOS"], datetime.now().hour
+                )
+                if n_activos_total == 0:
+                    log_event(
+                        "cierre_sin_pedidos_abiertos",
+                        msg=(
+                            "No queda ningún pedido abierto: la operación cumple el "
+                            "criterio de cierre (DEC-163, respuesta 4). Apagarla es "
+                            "decisión del Arquitecto (CICLO_ACTIVO=0)."
+                        ),
+                    )
 
             # Proceso 2 — Reintentar pedidos con error
             # BUG-024: mismo criterio de "necesita atención" que Proceso 1,
@@ -749,6 +800,8 @@ async def main(args: argparse.Namespace) -> int:
                 ids_activos, ids_error, ids_nuevos, ids_reextraccion_candidatos
             )
             n_reextraccion_ya_en_otro_carril = len(ids_forzar_completo) - n_reextraccion_nuevos
+            if args.modo == "cierre":
+                ids_forzar_completo = ids_forzar_completo | frozenset(ids_activos)
             # HAL-005: desglose por carril para el resumen JSON final.
             carriles: dict[str, int] | None = {
                 "activos": len(ids_activos),
@@ -759,7 +812,14 @@ async def main(args: argparse.Namespace) -> int:
             log_event(
                 "ids_filtrados",
                 msg=(
-                    f"Activos: {len(ids_activos)} | "
+                    f"Activos: {len(ids_activos)}"
+                    + (
+                        f" (turno de cierre: {len(ids_activos)} de {n_activos_total}, "
+                        f"{CONFIG['CIERRE_TURNOS']} turnos, en completo)"
+                        if args.modo == "cierre"
+                        else ""
+                    )
+                    + " | "
                     f"Errores: {len(ids_error)} | "
                     f"Nuevos: {len(ids_nuevos)} | "
                     f"Re-extracción DEC-140: {n_reextraccion_nuevos} nuevos en cola "
@@ -1176,11 +1236,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--modo",
-        choices=["completo", "incremental", "mantenimiento"],
+        choices=["completo", "incremental", "cierre", "mantenimiento"],
         default="completo",
         help=(
             "completo: encola todos los IDs | incremental: omite "
-            "scraping_completo=1 | mantenimiento: re-extrae los pedidos "
+            "scraping_completo=1 | cierre: incremental de una operación que "
+            "terminó — los activos por turnos, en completo con pagos (DEC-164) | "
+            "mantenimiento: re-extrae los pedidos "
             "entregados a los que les falta la información de entrega, antes "
             "de que el origen deje de mostrarla (DEC-092)"
         ),

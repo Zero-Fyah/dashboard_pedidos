@@ -12,12 +12,16 @@ import streamlit as st
 # del script.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from comun import (
+    ALMACEN_DE_BODEGA,
     ESTADOS_CERRADOS,
     ESTADOS_DESPACHADOS,
     ESTADOS_PREVIOS_PICKING,
     PRODUCTOS_RELLENO,
     VIGENCIA_ACTIVO,
     clasificar_modalidad_arena,
+    get_bodega,
+    ruta_bodega,
+    verificar_bodega,
 )
 
 # DEC-132: `construir_catalogo_no_arena()` es una excepción deliberada al
@@ -31,7 +35,24 @@ from comun import (
 # páginas siguen leyendo solo `dashboard/db.py`, que es la capa de datos.
 from inventario.catalogo_no_arena import construir_catalogo_no_arena
 
-DB_PATH = Path(__file__).parent.parent / "data" / "pedidos.db"
+# DEC-165: la base se resuelve por bodega en cada llamada — la que eligió el
+# selector del dashboard. Toda función pública recibe `bodega` (solo por
+# palabra clave): como es argumento, entra en la clave de `st.cache_data` y la
+# caché nunca cruza bodegas. Sin `bodega`, la del proceso (DEC-163).
+# `DB_PATH` es solo un sustituto para pruebas; en producción vale None.
+DB_PATH: Path | None = None
+
+
+def _ruta_db(bodega: str | None) -> Path:
+    """La `pedidos.db` de la bodega (la del proceso si es None)."""
+    return DB_PATH if DB_PATH is not None else ruta_bodega("pedidos.db", bodega)
+
+
+def base_existe(*, bodega: str | None = None) -> bool:
+    """True si la bodega ya tiene `pedidos.db` (DEC-165: el selector solo ofrece esas)."""
+    return _ruta_db(bodega).exists()
+
+
 # Lista de estados de cierre lista para interpolar en IN (...) / NOT IN (...).
 # sorted() para SQL determinístico (frozenset no garantiza orden).
 _cerr = ",".join(f"'{e}'" for e in sorted(ESTADOS_CERRADOS))
@@ -73,46 +94,47 @@ _CACHE_TTL_S = 600
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def _num_cols_exist() -> bool:
-    if not DB_PATH.exists():
-        return False
-    try:
-        # AUD-M6 (defensa secundaria): timeout=5 — la causa raíz de la
-        # ventana "no such view" quedó resuelta en el ETL (DEC-019); esto
-        # cubre residuales tipo "database is locked" por contención normal
-        # con el ETL/scraper escribiendo, en vez de fallar de inmediato.
-        con = sqlite3.connect(DB_PATH, timeout=5)
-        cols = [r[1] for r in con.execute("PRAGMA table_info(lineas_pedido)")]
-        con.close()
-        return "monto_pagar_num" in cols
-    except Exception:
-        return False
+def _num_cols_exist(bodega: str | None = None) -> bool:
+    # AUD-M6 (defensa secundaria): timeout=5 en `_consulta_auxiliar` — la causa
+    # raíz de la ventana "no such view" quedó resuelta en el ETL (DEC-019);
+    # esto cubre residuales tipo "database is locked" por contención normal
+    # con el ETL/scraper escribiendo, en vez de fallar de inmediato.
+    cols = [r[1] for r in _consulta_auxiliar(bodega, "PRAGMA table_info(lineas_pedido)")]
+    return "monto_pagar_num" in cols
 
 
-def _check_db() -> None:
-    if not DB_PATH.exists():
+def _check_db(ruta: Path) -> None:
+    if not ruta.exists():
         raise FileNotFoundError(
-            f"Base de datos no encontrada: {DB_PATH.resolve()}\n"
+            f"Base de datos no encontrada: {ruta.resolve()}\n"
             "Ejecuta el scraper primero: py scraper/scraper_principal.py --desde 2026-01-01"
         )
 
 
-def _conn() -> sqlite3.Connection:
-    _check_db()
+def _conn(bodega: str | None = None) -> sqlite3.Connection:
+    ruta = _ruta_db(bodega)
+    _check_db(ruta)
     # AUD-M6 (defensa secundaria): timeout=5 — espera hasta 5s si la DB
     # está momentáneamente bloqueada (ETL/scraper escribiendo) en vez de
     # lanzar "database is locked" de inmediato. La causa raíz de la
     # ventana "no such view" ya quedó resuelta en el ETL (DEC-019); esto
     # cubre el residual de contención normal entre lector y escritor.
-    return sqlite3.connect(DB_PATH, check_same_thread=False, timeout=5)
+    con = sqlite3.connect(ruta, check_same_thread=False, timeout=5)
+    # DEC-163: nunca mostrar la base de una bodega bajo el nombre de otra.
+    try:
+        verificar_bodega(con, bodega)
+    except Exception:
+        con.close()
+        raise
+    return con
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_ultima_actualizacion() -> str | None:
+def get_ultima_actualizacion(*, bodega: str | None = None) -> str | None:
     """MAX(actualizado_en) de pedidos — AUD-M12: indicador de frescura de
     datos para el header del dashboard, dado que no hay botón de refresco
     manual y el caché puede mostrar datos de hasta ~70 min de antigüedad."""
-    con = _conn()
+    con = _conn(bodega)
     try:
         row = con.execute("SELECT MAX(actualizado_en) FROM pedidos").fetchone()
     finally:
@@ -121,8 +143,10 @@ def get_ultima_actualizacion() -> str | None:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_opciones_filtro() -> tuple[list[str], list[str], list[str], list[str]]:
-    con = _conn()
+def get_opciones_filtro(
+    *, bodega: str | None = None
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    con = _conn(bodega)
     try:
         estados = [
             r[0]
@@ -152,7 +176,7 @@ def get_opciones_filtro() -> tuple[list[str], list[str], list[str], list[str]]:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_opciones_comerciales() -> dict[str, list[str]]:
+def get_opciones_comerciales(*, bodega: str | None = None) -> dict[str, list[str]]:
     """Valores disponibles para los filtros globales (DEC-101).
 
     Se excluyen los placeholders del origen (`-`, vacío) porque ofrecerlos como
@@ -163,7 +187,7 @@ def get_opciones_comerciales() -> dict[str, list[str]]:
         Un dict listo para `filtros.barra_lateral()`, con las cuatro
         dimensiones ordenadas alfabéticamente.
     """
-    con = _conn()
+    con = _conn(bodega)
     try:
         columnas = {
             "vendedores": "vendedor",
@@ -186,34 +210,63 @@ def get_opciones_comerciales() -> dict[str, list[str]]:
     return salida
 
 
-def _objeto_existe(nombre: str, tipo: str = "table") -> bool:
-    """True si existe la tabla o VIEW indicada."""
-    if not DB_PATH.exists():
-        return False
+def _consulta_auxiliar(bodega: str | None, sql: str, params: tuple = ()) -> list[tuple]:
+    """Consulta de comprobación (existencia, columnas) sobre la base de la bodega.
+
+    `[]` si la base no existe o SQLite falla (bloqueada, por ejemplo): el que
+    llama lo lee como «no hay». Una base de otra bodega no es «no hay»: la
+    marca se verifica y `BodegaIncorrectaError` se propaga (DEC-165).
+    """
+    ruta = _ruta_db(bodega)
+    if not ruta.exists():
+        return []
     try:
-        con = sqlite3.connect(DB_PATH, timeout=5)
-        existe = (
-            con.execute(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type=? AND name=?", (tipo, nombre)
-            ).fetchone()[0]
-            > 0
-        )
-        con.close()
-        return existe
-    except Exception:
-        return False
+        con = sqlite3.connect(ruta, timeout=5)
+        try:
+            verificar_bodega(con, bodega)
+            return con.execute(sql, params).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+
+
+def _objeto_existe(nombre: str, tipo: str = "table", *, bodega: str | None = None) -> bool:
+    """True si existe la tabla o VIEW indicada."""
+    filas = _consulta_auxiliar(
+        bodega, "SELECT COUNT(*) FROM sqlite_master WHERE type=? AND name=?", (tipo, nombre)
+    )
+    return bool(filas) and filas[0][0] > 0
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_inventario_corrida() -> dict | None:
+def fuente_disponible(nombre: str, *, bodega: str | None = None) -> bool:
+    """True si la tabla o VIEW `nombre` existe y tiene al menos una fila (DEC-165).
+
+    Es lo que decide si una página o sección se muestra o queda «no
+    disponible» en una bodega: hoy, las que dependen del layout en `bodega2`.
+    El nombre se valida contra `sqlite_master` antes de interpolarlo.
+    """
+    existe = _consulta_auxiliar(
+        bodega,
+        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name=?",
+        (nombre,),
+    )
+    if not existe:
+        return False
+    return bool(_consulta_auxiliar(bodega, f'SELECT 1 FROM "{existe[0][0]}" LIMIT 1'))
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
+def get_inventario_corrida(*, bodega: str | None = None) -> dict | None:
     """Metadatos de la última corrida del cruce de inventario (DEC-043).
 
     Trae la frescura de las tres fuentes y los agregados, para el encabezado
     de la vista. `None` si el cruce nunca corrió.
     """
-    if not _objeto_existe("v_inventario_corridas", "view"):
+    if not _objeto_existe("v_inventario_corridas", "view", bodega=bodega):
         return None
-    con = _conn()
+    con = _conn(bodega)
     try:
         df = pd.read_sql("SELECT * FROM v_inventario_corridas ORDER BY id DESC LIMIT 1", con)
     finally:
@@ -222,7 +275,7 @@ def get_inventario_corrida() -> dict | None:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_inventario_tendencia() -> pd.DataFrame:
+def get_inventario_tendencia(*, bodega: str | None = None) -> pd.DataFrame:
     """Sobrante en altura por día, para seguir si crece o se estabiliza (DEC-052).
 
     Una fila por día, con la **última corrida** de cada uno. El scheduler
@@ -233,9 +286,9 @@ def get_inventario_tendencia() -> pd.DataFrame:
     guarda en UTC, y sin convertir las corridas de la noche caerían en el
     día siguiente.
     """
-    if not _objeto_existe("v_inventario_corridas", "view"):
+    if not _objeto_existe("v_inventario_corridas", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """SELECT DATE(ejecutado_en, '-5 hours') AS dia,
@@ -256,7 +309,7 @@ def get_inventario_tendencia() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_inventario_comparacion() -> pd.DataFrame:
+def get_inventario_comparacion(*, bodega: str | None = None) -> pd.DataFrame:
     """Comparación por referencia: teórico vs. lo que reporta Bochica (DEC-041).
 
     `picking_estimado` = `inventario_teorico` − `bochica_altura`. Negativo
@@ -264,9 +317,9 @@ def get_inventario_comparacion() -> pd.DataFrame:
     contar picking — es un hallazgo a explicar, no una métrica cerrada
     (decisión del Arquitecto, DEC-043).
     """
-    if not _objeto_existe("v_inventario_comparacion", "view"):
+    if not _objeto_existe("v_inventario_comparacion", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_inventario_comparacion", con)
     finally:
@@ -274,7 +327,7 @@ def get_inventario_comparacion() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_inventario_salud() -> pd.DataFrame:
+def get_inventario_salud(*, bodega: str | None = None) -> pd.DataFrame:
     """Cobertura, movimiento y riesgo por referencia (DEC-049).
 
     Lo calcula el scheduler porque agregar la demanda sobre 840.000 líneas
@@ -287,9 +340,9 @@ def get_inventario_salud() -> pd.DataFrame:
     que degrade al comportamiento previo a DEC-065 (catálogo completo) en
     vez de mostrar una página vacía.
     """
-    if not _objeto_existe("v_inventario_salud", "view"):
+    if not _objeto_existe("v_inventario_salud", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         df = pd.read_sql("SELECT * FROM v_inventario_salud", con)
     finally:
@@ -302,11 +355,11 @@ def get_inventario_salud() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_arena_inventario() -> pd.DataFrame:
+def get_arena_inventario(*, bodega: str | None = None) -> pd.DataFrame:
     """Inventario de la categoría Arena por código de barras/modalidad/ciudad (DEC-118)."""
-    if not _objeto_existe("v_arena_inventario", "view"):
+    if not _objeto_existe("v_arena_inventario", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_arena_inventario", con)
     finally:
@@ -314,7 +367,7 @@ def get_arena_inventario() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_arena_balance() -> pd.DataFrame:
+def get_arena_balance(*, bodega: str | None = None) -> pd.DataFrame:
     """Proporción histórica de bolsas vendidas por modalidad (DEC-118) — medida, no asumida.
 
     Se mide sobre `lineas_pedido`, que trae `referencia` con el esquema
@@ -329,9 +382,9 @@ def get_arena_balance() -> pd.DataFrame:
         (fracción de líneas que el clasificador reconoció) repetida en
         cada fila, para que la página la declare junto a la cifra.
     """
-    if not _objeto_existe("arena_inventario"):
+    if not _objeto_existe("arena_inventario", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         codigos = pd.read_sql("SELECT DISTINCT codigo_barras FROM arena_inventario", con)
         if codigos.empty:
@@ -364,7 +417,7 @@ def get_arena_balance() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_arena_movimiento() -> pd.DataFrame:
+def get_arena_movimiento(*, bodega: str | None = None) -> pd.DataFrame:
     """Líneas de venta de Arena con fecha/ciudad/estado (DEC-119).
 
     Filtro `codigo_barras IN (arena_inventario)` igual que
@@ -378,9 +431,9 @@ def get_arena_movimiento() -> pd.DataFrame:
     sin condición) y el cruce lo hace pandas — **medido en 3,8-4,0 s** sobre
     114.190 líneas (3 corridas), dentro del caché de 10 min.
     """
-    if not _objeto_existe("arena_inventario"):
+    if not _objeto_existe("arena_inventario", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         codigos = pd.read_sql("SELECT DISTINCT codigo_barras FROM arena_inventario", con)
         if codigos.empty:
@@ -407,7 +460,7 @@ def get_arena_movimiento() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_despacho_diario() -> pd.DataFrame:
+def get_despacho_diario(*, bodega: str | None = None) -> pd.DataFrame:
     """Cumplimiento de despacho por día — la mitad "in full" de E.1 (DEC-065).
 
     La auditoría del 2026-07-29 dio E.1 por bloqueada "sin fecha
@@ -424,9 +477,9 @@ def get_despacho_diario() -> pd.DataFrame:
         Una fila por fecha con pedidos, pedidos con faltante y el monto
         que no se despachó. Vacío si el ETL todavía no creó la VIEW.
     """
-    if not _objeto_existe("v_diferencias_resumen", "view"):
+    if not _objeto_existe("v_diferencias_resumen", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         # DEC-067: el monto entra por un LEFT JOIN contra una subconsulta ya
         # agregada. La versión anterior usaba una subconsulta **correlacionada**
@@ -456,7 +509,9 @@ def get_despacho_diario() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_despacho_faltantes(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+def get_despacho_faltantes(
+    fecha_desde: str, fecha_hasta: str, *, bodega: str | None = None
+) -> pd.DataFrame:
     """Detalle línea a línea de lo que no se despachó (DEC-069).
 
     **Sale de `lineas_pedido`, no de `detalle_diferencias`.** La versión de
@@ -482,9 +537,9 @@ def get_despacho_faltantes(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
         barras para cruzar contra el catálogo, el ABC y las ubicaciones.
         Vacío si el scraper todavía no creó las tablas.
     """
-    if not _objeto_existe("lineas_pedido"):
+    if not _objeto_existe("lineas_pedido", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             f"""SELECT p.fecha,
@@ -518,7 +573,9 @@ def get_despacho_faltantes(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_despacho_lineas_diario(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+def get_despacho_lineas_diario(
+    fecha_desde: str, fecha_hasta: str, *, bodega: str | None = None
+) -> pd.DataFrame:
     """Fill rate por línea y por unidad, por fecha (DEC-069).
 
     El indicador por pedido es el más exigente —una sola línea corta arruina
@@ -535,9 +592,9 @@ def get_despacho_lineas_diario(fecha_desde: str, fecha_hasta: str) -> pd.DataFra
         unidades pedidas y unidades faltantes. Vacío si el scraper todavía
         no creó las tablas.
     """
-    if not _objeto_existe("lineas_pedido"):
+    if not _objeto_existe("lineas_pedido", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             f"""SELECT p.fecha,
@@ -566,7 +623,7 @@ def get_despacho_lineas_diario(fecha_desde: str, fecha_hasta: str) -> pd.DataFra
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_entregas(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+def get_entregas(fecha_desde: str, fecha_hasta: str, *, bodega: str | None = None) -> pd.DataFrame:
     """Compromiso de entrega contra entrega real — la mitad *on time* (DEC-095).
 
     `CLAUDE.md` daba esta mitad de E.1 por imposible "sin fecha comprometida en
@@ -598,9 +655,9 @@ def get_entregas(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
         Una fila por pedido con el compromiso sin parsear, el momento de
         entrega (NaN si no hay), las reprogramaciones y el valor del pedido.
     """
-    if not _objeto_existe("registro_operaciones"):
+    if not _objeto_existe("registro_operaciones", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """SELECT p.id_pedido,
@@ -643,7 +700,7 @@ def get_entregas(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_scorecard() -> dict[str, float | None]:
+def get_scorecard(*, bodega: str | None = None) -> dict[str, float | None]:
     """Cifras de pedidos, servicio y caja para la portada (DEC-102).
 
     El scorecard tenía **siete métricas y las siete eran de inventario**,
@@ -669,7 +726,7 @@ def get_scorecard() -> dict[str, float | None]:
     Returns:
         Dict con las cifras. Un valor `None` significa "no medible", nunca cero.
     """
-    con = _conn()
+    con = _conn(bodega)
     try:
         fila = con.execute(
             f"""SELECT
@@ -720,7 +777,7 @@ def get_scorecard() -> dict[str, float | None]:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_riesgo_por_referencia() -> pd.DataFrame:
+def get_riesgo_por_referencia(*, bodega: str | None = None) -> pd.DataFrame:
     """Venta diaria en riesgo por referencia, para valorizar las alertas (DEC-102).
 
     **El precio no puede salir de `inventario_salud`.** Ahí `valor_venta` es el
@@ -738,9 +795,9 @@ def get_riesgo_por_referencia() -> pd.DataFrame:
     Returns:
         Una fila por referencia con demanda diaria, precio medio y riesgo diario.
     """
-    if not _objeto_existe("inventario_salud"):
+    if not _objeto_existe("inventario_salud", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """SELECT s.referencia,
@@ -758,7 +815,9 @@ def get_riesgo_por_referencia() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_excepciones(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+def get_excepciones(
+    fecha_desde: str, fecha_hasta: str, *, bodega: str | None = None
+) -> pd.DataFrame:
     """Excepciones del proceso: faltantes, entregas fallidas y ajustes (DEC-099).
 
     `registro_operaciones` emite 19 acciones distintas y el dashboard leía
@@ -790,9 +849,9 @@ def get_excepciones(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
         Una fila por pedido con las marcas de tiempo de cada excepción, el monto
         de la diferencia y si lo hizo el cliente.
     """
-    if not _objeto_existe("v_gestion_diferencias_num", "view"):
+    if not _objeto_existe("v_gestion_diferencias_num", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """WITH ev AS (
@@ -851,7 +910,7 @@ def get_excepciones(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_comprometido() -> pd.DataFrame:
+def get_comprometido(*, bodega: str | None = None) -> pd.DataFrame:
     """Mercancía comprometida en pedidos abiertos, contra el stock (DEC-098).
 
     Es la "Vista de inventario comprometido" que `integral.md` pide desde el
@@ -878,9 +937,9 @@ def get_comprometido() -> pd.DataFrame:
         Una fila por referencia con lo comprometido, el stock disponible, el
         faltante para cubrirlo y su estado de salud. Vacío si falta el ETL.
     """
-    if not _objeto_existe("v_lineas_pedido_num", "view"):
+    if not _objeto_existe("v_lineas_pedido_num", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             f"""WITH comprometido AS (
@@ -917,7 +976,7 @@ def get_comprometido() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_ventas(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+def get_ventas(fecha_desde: str, fecha_hasta: str, *, bodega: str | None = None) -> pd.DataFrame:
     """Facturación por pedido, con su descomposición monetaria (DEC-097).
 
     Sale de `v_estadisticas_monto_num`, una de las dos VIEWs que DEC-065 dejó
@@ -943,9 +1002,9 @@ def get_ventas(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
         Una fila por pedido con vendedor, cliente, canal y los cinco montos que
         componen la factura.
     """
-    if not _objeto_existe("v_estadisticas_monto_num", "view"):
+    if not _objeto_existe("v_estadisticas_monto_num", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """WITH cancelado AS (
@@ -987,7 +1046,9 @@ def get_ventas(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_ventas_por_linea(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+def get_ventas_por_linea(
+    fecha_desde: str, fecha_hasta: str, *, bodega: str | None = None
+) -> pd.DataFrame:
     """Mix por línea de producto, desde `lineas_pedido.tipo` (DEC-097).
 
     **No se deriva del IVA.** Esa vía parecía natural —el origen publica `IVA
@@ -1008,9 +1069,9 @@ def get_ventas_por_linea(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
     Returns:
         Una fila por fecha y línea, con líneas, unidades y valor.
     """
-    if not _num_cols_exist():
+    if not _num_cols_exist(bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """WITH cancelado AS (
@@ -1039,7 +1100,9 @@ def get_ventas_por_linea(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_descuentos_por_tipo(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+def get_descuentos_por_tipo(
+    fecha_desde: str, fecha_hasta: str, *, bodega: str | None = None
+) -> pd.DataFrame:
     """Descuento concedido por tipo, a nivel de línea (DEC-097).
 
     Sale de `v_descuentos_lineas` (DEC-035), la otra VIEW que el ETL
@@ -1055,9 +1118,9 @@ def get_descuentos_por_tipo(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
     Returns:
         Una fila por tipo de descuento, con líneas afectadas y monto concedido.
     """
-    if not _objeto_existe("v_descuentos_lineas", "view"):
+    if not _objeto_existe("v_descuentos_lineas", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """SELECT descuento_tipo,
@@ -1076,7 +1139,9 @@ def get_descuentos_por_tipo(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_ciclo_pedidos(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+def get_ciclo_pedidos(
+    fecha_desde: str, fecha_hasta: str, *, bodega: str | None = None
+) -> pd.DataFrame:
     """Ciclo de vida de cada pedido, leído del timeline (DEC-096).
 
     `timeline_pedido` tenía **172.954 filas y cero consumidores** hasta la
@@ -1105,9 +1170,9 @@ def get_ciclo_pedidos(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
         Una fila por pedido con su estado actual, cuándo entró en él, cuántos
         pasos lleva, si sigue abierto y cuándo se entregó (NaN si no).
     """
-    if not _objeto_existe("timeline_pedido"):
+    if not _objeto_existe("timeline_pedido", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             f"""WITH resumen AS (
@@ -1165,7 +1230,9 @@ def get_ciclo_pedidos(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_ciclo_transiciones(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+def get_ciclo_transiciones(
+    fecha_desde: str, fecha_hasta: str, *, bodega: str | None = None
+) -> pd.DataFrame:
     """Cuánto tarda cada salto entre dos estados consecutivos (DEC-096).
 
     Responde "dónde se va el tiempo", que es distinto de "cuánto tarda el
@@ -1187,9 +1254,9 @@ def get_ciclo_transiciones(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
     Returns:
         Una fila por salto entre pasos consecutivos, con origen, destino y horas.
     """
-    if not _objeto_existe("timeline_pedido"):
+    if not _objeto_existe("timeline_pedido", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """SELECT a.titulo AS origen,
@@ -1208,7 +1275,9 @@ def get_ciclo_transiciones(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_auditoria_pago(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+def get_auditoria_pago(
+    fecha_desde: str, fecha_hasta: str, *, bodega: str | None = None
+) -> pd.DataFrame:
     """Ciclo comprobante → auditoría, por pedido (DEC-082).
 
     Sale **de datos que ya estaban**: `registro_operaciones` registra
@@ -1244,9 +1313,9 @@ def get_auditoria_pago(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
         auditó, las horas entre ambos (NaN si sigue sin auditar) y el conteo
         de auditorías, rechazos y aprobaciones.
     """
-    if not _objeto_existe("registro_operaciones"):
+    if not _objeto_existe("registro_operaciones", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """WITH subidas AS (
@@ -1290,7 +1359,9 @@ def get_auditoria_pago(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_motivos_cancelacion(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+def get_motivos_cancelacion(
+    fecha_desde: str, fecha_hasta: str, *, bodega: str | None = None
+) -> pd.DataFrame:
     """Pedidos cancelados con su motivo escrito a mano (DEC-085).
 
     No confundir con `get_cancelaciones()`, que es de DEC-063 y mira otra
@@ -1315,9 +1386,9 @@ def get_motivos_cancelacion(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
         Una fila por pedido cancelado, con el motivo crudo, el valor del
         pedido y los días que pasaron entre el pedido y su cancelación.
     """
-    if not _objeto_existe("registro_operaciones"):
+    if not _objeto_existe("registro_operaciones", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """WITH primera AS (
@@ -1354,7 +1425,7 @@ def get_motivos_cancelacion(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_pedidos_impagos() -> pd.DataFrame:
+def get_pedidos_impagos(*, bodega: str | None = None) -> pd.DataFrame:
     """Pedidos vivos de pago inmediato con saldo pendiente (DEC-085).
 
     Es la mitad accionable del análisis de cancelaciones. Medido: el 94% de
@@ -1381,9 +1452,9 @@ def get_pedidos_impagos() -> pd.DataFrame:
         Una fila por pedido vivo impago, con antigüedad en días, la mercancía
         comprometida (líneas, unidades, referencias) y el origen del saldo.
     """
-    if not _num_cols_exist():
+    if not _num_cols_exist(bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             f"""WITH montos AS (
@@ -1452,7 +1523,9 @@ def get_pedidos_impagos() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_estado_pago(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+def get_estado_pago(
+    fecha_desde: str, fecha_hasta: str, *, bodega: str | None = None
+) -> pd.DataFrame:
     """Estado y saldo de pago **calculados por el origen** (DEC-089).
 
     Sale de la tarjeta «Operación de pago», que el scraper captura desde
@@ -1484,9 +1557,9 @@ def get_estado_pago(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
         Una fila por pedido con tarjeta, con estado, montos y el número de
         comprobantes registrados.
     """
-    if not _num_cols_exist():
+    if not _num_cols_exist(bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """SELECT p.id_pedido,
@@ -1525,7 +1598,9 @@ def get_estado_pago(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_comprobantes(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+def get_comprobantes(
+    fecha_desde: str, fecha_hasta: str, *, bodega: str | None = None
+) -> pd.DataFrame:
     """Comprobantes de pago, uno por fila (DEC-090).
 
     **No es una conciliación bancaria** y conviene decirlo: hay una sola
@@ -1546,9 +1621,9 @@ def get_comprobantes(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
     Returns:
         Una fila por comprobante, con canal, cuenta, montos, revisor y estado.
     """
-    if not _objeto_existe("registros_pago"):
+    if not _objeto_existe("registros_pago", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """SELECT r.id_pedido,
@@ -1579,7 +1654,7 @@ def get_comprobantes(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_credito_abierto() -> pd.DataFrame:
+def get_credito_abierto(*, bodega: str | None = None) -> pd.DataFrame:
     """Crédito que el sistema sigue mostrando abierto, con su vencimiento (DEC-086).
 
     **No usa `Monto pagado`.** Para crédito ese campo no discrimina: la
@@ -1608,9 +1683,9 @@ def get_credito_abierto() -> pd.DataFrame:
         Una fila por pedido con crédito abierto, con los días de atraso
         (negativos si todavía no vence) y el valor del pedido.
     """
-    if not _num_cols_exist():
+    if not _num_cols_exist(bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """WITH pagados AS (
@@ -1651,7 +1726,9 @@ def get_credito_abierto() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_saldo_a_favor(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
+def get_saldo_a_favor(
+    fecha_desde: str, fecha_hasta: str, *, bodega: str | None = None
+) -> pd.DataFrame:
     """Saldo a favor del cliente, calculado por el origen (DEC-084).
 
     Mecanismo: el cliente paga primero; si el pedido sale corto, el monto
@@ -1674,9 +1751,9 @@ def get_saldo_a_favor(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
         Una fila por pedido con saldo distinto de cero, con el signo en
         `saldo` (positivo = a favor del cliente) y la marca `anomalo`.
     """
-    if not _objeto_existe("gestion_diferencias"):
+    if not _objeto_existe("gestion_diferencias", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """SELECT g.id_pedido,
@@ -1706,15 +1783,15 @@ def get_saldo_a_favor(fecha_desde: str, fecha_hasta: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_sin_ubicacion() -> pd.DataFrame:
+def get_sin_ubicacion(*, bodega: str | None = None) -> pd.DataFrame:
     """Producto que el admin declara y que no está en ninguna posición (DEC-073).
 
     Es lo que el plan de conteo por construcción no puede descubrir: la cola
     manda gente a posiciones donde el sistema **ya dice que hay algo**.
     """
-    if not _objeto_existe("v_inventario_sin_ubicacion", "view"):
+    if not _objeto_existe("v_inventario_sin_ubicacion", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_inventario_sin_ubicacion ORDER BY inventario DESC", con)
     finally:
@@ -1722,11 +1799,11 @@ def get_sin_ubicacion() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_inventario_abc() -> pd.DataFrame:
+def get_inventario_abc(*, bodega: str | None = None) -> pd.DataFrame:
     """Clasificación ABC-XYZ por referencia (DEC-050)."""
-    if not _objeto_existe("v_inventario_abc", "view"):
+    if not _objeto_existe("v_inventario_abc", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_inventario_abc", con)
     finally:
@@ -1734,11 +1811,11 @@ def get_inventario_abc() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_operacion_ciclos() -> pd.DataFrame:
+def get_operacion_ciclos(*, bodega: str | None = None) -> pd.DataFrame:
     """Tiempos de ciclo y carga por subpedido (DEC-054)."""
-    if not _objeto_existe("v_operacion_ciclos", "view"):
+    if not _objeto_existe("v_operacion_ciclos", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_operacion_ciclos", con)
     finally:
@@ -1746,11 +1823,11 @@ def get_operacion_ciclos() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_operacion_ventanas() -> pd.DataFrame:
+def get_operacion_ventanas(*, bodega: str | None = None) -> pd.DataFrame:
     """Ventana activa por alistador y día (DEC-055)."""
-    if not _objeto_existe("v_operacion_ventanas", "view"):
+    if not _objeto_existe("v_operacion_ventanas", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_operacion_ventanas", con)
     finally:
@@ -1758,11 +1835,11 @@ def get_operacion_ventanas() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_cancelaciones() -> pd.DataFrame:
+def get_cancelaciones(*, bodega: str | None = None) -> pd.DataFrame:
     """Subpedidos alistados que después se cancelaron (DEC-063)."""
-    if not _objeto_existe("v_cancelaciones_alistadas", "view"):
+    if not _objeto_existe("v_cancelaciones_alistadas", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_cancelaciones_alistadas", con)
     finally:
@@ -1770,11 +1847,11 @@ def get_cancelaciones() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_alertas() -> pd.DataFrame:
+def get_alertas(*, bodega: str | None = None) -> pd.DataFrame:
     """Excepciones abiertas y resueltas, con su antigüedad (DEC-059)."""
-    if not _objeto_existe("v_alertas", "view"):
+    if not _objeto_existe("v_alertas", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_alertas", con)
     finally:
@@ -1782,7 +1859,7 @@ def get_alertas() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_faltantes_clasificados() -> pd.DataFrame:
+def get_faltantes_clasificados(*, bodega: str | None = None) -> pd.DataFrame:
     """Pedidos/subpedidos con diferencia registrada, clasificados en 3 grupos
     (DEC-115/DEC-117): "Interno" (relleno de monto mínimo, sin faltante
     real), "Real" (faltante físico de unidades) y "Monetario" (diferencia
@@ -1804,9 +1881,11 @@ def get_faltantes_clasificados() -> pd.DataFrame:
     `cancelado` (algún subpedido del pedido en estado Cancelado),
     `atribuible` (False solo para "Monetario" con varios subpedidos).
     """
-    if not _objeto_existe("gestion_diferencias") or not _objeto_existe("lineas_pedido"):
+    if not _objeto_existe("gestion_diferencias", bodega=bodega) or not _objeto_existe(
+        "lineas_pedido", bodega=bodega
+    ):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         crudo = pd.read_sql(
             f"""
@@ -1927,11 +2006,11 @@ def get_faltantes_clasificados() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_inventario_corridas() -> pd.DataFrame:
+def get_inventario_corridas(*, bodega: str | None = None) -> pd.DataFrame:
     """Historial de corridas, para las tendencias del scorecard (DEC-059)."""
-    if not _objeto_existe("v_inventario_corridas", "view"):
+    if not _objeto_existe("v_inventario_corridas", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_inventario_corridas ORDER BY id", con)
     finally:
@@ -1939,11 +2018,11 @@ def get_inventario_corridas() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_conteos_archivos() -> pd.DataFrame:
+def get_conteos_archivos(*, bodega: str | None = None) -> pd.DataFrame:
     """Hojas de conteo vistas alguna vez, activas o anuladas (DEC-058)."""
-    if not _objeto_existe("v_conteos_archivos", "view"):
+    if not _objeto_existe("v_conteos_archivos", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_conteos_archivos", con)
     finally:
@@ -1951,11 +2030,11 @@ def get_conteos_archivos() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_ira() -> pd.DataFrame:
+def get_ira(*, bodega: str | None = None) -> pd.DataFrame:
     """IRA por clase, calculado por el pipeline sobre los conteos (DEC-058)."""
-    if not _objeto_existe("v_conteos_ira", "view"):
+    if not _objeto_existe("v_conteos_ira", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_conteos_ira", con)
     finally:
@@ -1963,11 +2042,11 @@ def get_ira() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_ira_periodo() -> pd.DataFrame:
+def get_ira_periodo(*, bodega: str | None = None) -> pd.DataFrame:
     """Serie temporal del IRA por clase (DEC-062)."""
-    if not _objeto_existe("v_conteos_ira_periodo", "view"):
+    if not _objeto_existe("v_conteos_ira_periodo", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_conteos_ira_periodo ORDER BY periodo", con)
     finally:
@@ -1975,11 +2054,11 @@ def get_ira_periodo() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_conformidad() -> pd.DataFrame:
+def get_conformidad(*, bodega: str | None = None) -> pd.DataFrame:
     """Conformidad por posición, separada por tipo de ubicación (DEC-062)."""
-    if not _objeto_existe("v_conteos_conformidad", "view"):
+    if not _objeto_existe("v_conteos_conformidad", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_conteos_conformidad", con)
     finally:
@@ -1987,11 +2066,11 @@ def get_conformidad() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_conteos() -> pd.DataFrame:
+def get_conteos(*, bodega: str | None = None) -> pd.DataFrame:
     """Historial de conteos físicos ingeridos desde Excel (DEC-058)."""
-    if not _objeto_existe("v_conteos", "view"):
+    if not _objeto_existe("v_conteos", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_conteos", con)
     finally:
@@ -1999,11 +2078,11 @@ def get_conteos() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_inventario_posiciones() -> pd.DataFrame:
+def get_inventario_posiciones(*, bodega: str | None = None) -> pd.DataFrame:
     """Posiciones activas del layout, ocupadas y vacías (DEC-061)."""
-    if not _objeto_existe("v_inventario_posiciones", "view"):
+    if not _objeto_existe("v_inventario_posiciones", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_inventario_posiciones", con)
     finally:
@@ -2011,11 +2090,11 @@ def get_inventario_posiciones() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_inventario_ubicaciones() -> pd.DataFrame:
+def get_inventario_ubicaciones(*, bodega: str | None = None) -> pd.DataFrame:
     """Líneas SKU-posición con su prioridad de conteo (DEC-057)."""
-    if not _objeto_existe("v_inventario_ubicaciones", "view"):
+    if not _objeto_existe("v_inventario_ubicaciones", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql("SELECT * FROM v_inventario_ubicaciones", con)
     finally:
@@ -2023,7 +2102,7 @@ def get_inventario_ubicaciones() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_catalogo_productos() -> pd.DataFrame:
+def get_catalogo_productos(*, bodega: str | None = None) -> pd.DataFrame:
     """Puente `id_especificacion` → código de barras / ID de producto (DEC-045).
 
     Una fila por `id_especificacion` cuando el par `(referencia, código de
@@ -2032,9 +2111,9 @@ def get_catalogo_productos() -> pd.DataFrame:
     agregada en sus ID concretos en cualquier página que ya tenga
     `id_especificacion` (DEC-048, adición 2026-09-12).
     """
-    if not _objeto_existe("catalogo_productos"):
+    if not _objeto_existe("catalogo_productos", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             "SELECT id_especificacion, id_producto, codigo_barras "
@@ -2046,11 +2125,11 @@ def get_catalogo_productos() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_inventario_anomalias() -> pd.DataFrame:
+def get_inventario_anomalias(*, bodega: str | None = None) -> pd.DataFrame:
     """Stock ubicado donde el layout dice que no debería haber (DEC-041)."""
-    if not _objeto_existe("v_inventario_anomalias", "view"):
+    if not _objeto_existe("v_inventario_anomalias", "view", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """SELECT motivo, ubicacion, id_especificacion, cantidad
@@ -2061,25 +2140,12 @@ def get_inventario_anomalias() -> pd.DataFrame:
         con.close()
 
 
-def _tabla_existe(nombre: str) -> bool:
+def _tabla_existe(nombre: str, *, bodega: str | None = None) -> bool:
     """True si la tabla existe. Sin caché: se consulta al abrir la app."""
-    if not DB_PATH.exists():
-        return False
-    try:
-        con = sqlite3.connect(DB_PATH, timeout=5)
-        existe = (
-            con.execute(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", (nombre,)
-            ).fetchone()[0]
-            > 0
-        )
-        con.close()
-        return existe
-    except Exception:
-        return False
+    return _objeto_existe(nombre, "table", bodega=bodega)
 
 
-def get_hallazgos() -> pd.DataFrame:
+def get_hallazgos(*, bodega: str | None = None) -> pd.DataFrame:
     """Inconsistencias detectadas en la última corrida del scheduler (DEC-047).
 
     Solo trae las que **todavía tienen casos**: `inventario/persistencia.py`
@@ -2091,7 +2157,7 @@ def get_hallazgos() -> pd.DataFrame:
     10 minutos el reflejo de una corrección recién hecha en el origen,
     que es justo lo que el módulo promete mostrar al día.
     """
-    if not _tabla_existe("tareas_hallazgos"):
+    if not _tabla_existe("tareas_hallazgos", bodega=bodega):
         return pd.DataFrame(
             columns=[
                 "clave",
@@ -2105,7 +2171,7 @@ def get_hallazgos() -> pd.DataFrame:
                 "medido_en",
             ]
         )
-    con = _conn()
+    con = _conn(bodega)
     try:
         return pd.read_sql(
             """SELECT clave, titulo, explicacion, categoria, prioridad, origen,
@@ -2119,7 +2185,7 @@ def get_hallazgos() -> pd.DataFrame:
         con.close()
 
 
-def get_detalle_hallazgo(clave: str) -> pd.DataFrame:
+def get_detalle_hallazgo(clave: str, *, bodega: str | None = None) -> pd.DataFrame:
     """Listado de casos concretos de un hallazgo — el detalle de la tarea.
 
     El detalle se guarda serializado porque cada detector tiene sus
@@ -2128,9 +2194,9 @@ def get_detalle_hallazgo(clave: str) -> pd.DataFrame:
     completo es barato y evita inventar un esquema genérico que no le
     quede bien a ninguno.
     """
-    if not _tabla_existe("tareas_hallazgos"):
+    if not _tabla_existe("tareas_hallazgos", bodega=bodega):
         return pd.DataFrame()
-    con = _conn()
+    con = _conn(bodega)
     try:
         fila = con.execute(
             "SELECT detalle FROM tareas_hallazgos WHERE clave = ?", (clave,)
@@ -2143,9 +2209,9 @@ def get_detalle_hallazgo(clave: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_rango_fechas() -> tuple[str | None, str | None]:
+def get_rango_fechas(*, bodega: str | None = None) -> tuple[str | None, str | None]:
     """Primera y última fecha con pedidos — para acotar el selector de rango."""
-    con = _conn()
+    con = _conn(bodega)
     try:
         row = con.execute(
             "SELECT MIN(fecha), MAX(fecha) FROM pedidos WHERE fecha IS NOT NULL AND fecha != ''"
@@ -2163,6 +2229,8 @@ def get_pedidos_consolidado(
     almacenes: tuple[str, ...],
     solo_previos_picking: bool,
     limite: int,
+    *,
+    bodega: str | None = None,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """Tabla consolidada de líneas de pedido, una fila por línea (DEC-045).
 
@@ -2232,7 +2300,7 @@ def get_pedidos_consolidado(
         WHERE {where}
     """
 
-    con = _conn()
+    con = _conn(bodega)
     try:
         fila = con.execute(
             f"""SELECT COUNT(*),
@@ -2277,7 +2345,7 @@ def get_pedidos_consolidado(
 
 
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False)
-def get_catalogo_no_arena() -> pd.DataFrame:
+def get_catalogo_no_arena(*, bodega: str | None = None) -> pd.DataFrame:
     """Catálogo no-Arena, una fila por ID (`id_especificacion`), con venta,
     clasificación ABC-XYZ, inventario actual, vigencia e ingreso por
     contenedor (DEC-132).
@@ -2287,8 +2355,9 @@ def get_catalogo_no_arena() -> pd.DataFrame:
     la conexión y se aplica el TTL de 600s (AUD-M12), igual que el resto de
     `get_*` de este módulo.
     """
-    con = _conn()
+    con = _conn(bodega)
     try:
-        return construir_catalogo_no_arena(con)
+        # DEC-165: el almacén de la bodega consultada, no el del proceso.
+        return construir_catalogo_no_arena(con, almacen=ALMACEN_DE_BODEGA[bodega or get_bodega()])
     finally:
         con.close()

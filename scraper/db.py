@@ -5,12 +5,15 @@ init_db() crea las 10 tablas si no existen; las columnas nuevas se agregan
 con ALTER TABLE tolerante para bases existentes (DEC-013).
 """
 
+import sqlite3
+
 import aiosqlite
 
 from comun import (
     DDL_ERROR_COLUMNA_DUPLICADA,
     DDL_ERROR_COLUMNA_INEXISTENTE,
     ejecutar_ddl_idempotente,
+    marcar_bodega,
 )
 from scraper.config import log_event
 
@@ -28,7 +31,18 @@ async def init_db(db_path: str) -> None:
 
     Args:
         db_path: Ruta al archivo SQLite (se crea si no existe).
+
+    Raises:
+        BodegaIncorrectaError: si la base es de otra bodega (DEC-163).
     """
+    # DEC-163: la marca de bodega va antes del esquema — una base nueva nunca
+    # queda con tablas y sin marca, y una de otra bodega se rechaza sin tocarla.
+    con = sqlite3.connect(db_path, timeout=5)
+    try:
+        marcar_bodega(con)
+    finally:
+        con.close()
+
     async with aiosqlite.connect(db_path) as db:
         await db.execute("PRAGMA journal_mode = WAL")
         await db.execute("PRAGMA busy_timeout = 5000")

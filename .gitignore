@@ -20,11 +20,20 @@ data/credenciales/
 logs/
 *.log
 
-# Entorno virtual
-.venv/
+# Entorno virtual. Sin barra final: un sandbox (worktree, DEC-166) enlaza el
+# .venv del árbol principal, y un enlace no es directorio — `.venv/` no lo cubre.
+.venv
 
 # Credenciales
 .env
+# DEC-163: archivo de configuración de cada bodega adicional (.env.bodega2,
+# …) — trae credenciales igual que .env. La plantilla sí se versiona.
+.env.*
+!.env.example
+
+# DEC-163: todo lo de la segunda bodega — base, sesiones, conteos,
+# respaldos, logs, debug con PII.
+data/bodega2/
 
 # Términos confidenciales del gate pre-commit (DEC-042) — contiene los
 # valores reales; la plantilla `.confidencial.example` sí se versiona

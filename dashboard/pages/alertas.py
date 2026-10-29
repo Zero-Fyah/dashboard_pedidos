@@ -20,17 +20,21 @@ import sqlite3
 
 import pandas as pd
 import streamlit as st
+from filtros import bodega_seleccionada, es_historica
 
 from db import get_alertas, get_riesgo_por_referencia
+
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
 
 st.markdown('<p class="dp-breadcrumb">Dashboard / Principal</p>', unsafe_allow_html=True)
 st.title("🚨 Centro de alertas")
 
 try:
-    df = get_alertas()
+    df = get_alertas(bodega=bodega)
     # DEC-102: el peso económico de cada alerta, para ordenar por lo que
     # protege y no por unidades.
-    riesgo = get_riesgo_por_referencia()
+    riesgo = get_riesgo_por_referencia(bodega=bodega)
 except sqlite3.OperationalError as e:
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()
@@ -105,12 +109,18 @@ else:
             "modulo": st.column_config.TextColumn("Ver en", width="small"),
         },
     )
+    # DEC-165: el ejemplo es una medición de la operación histórica; en la otra
+    # bodega se leería como sus propias alertas.
+    ejemplo = (
+        " En la operación histórica, por unidades la primera alerta de quiebre era "
+        "`PS03-85G` (3.104); por plata, `PS13-60U`, con **$1,57 M diarios** — tres veces "
+        "la siguiente. Y `PP129`, que vende 0,3 unidades al día a $374 mil cada una, "
+        "entraba al top 3 siendo invisible en cualquier ranking por volumen."
+        if es_historica(bodega)
+        else ""
+    )
     st.caption(
-        "**La venta en riesgo reordena la lista, no solo la decora.** Por unidades la "
-        "primera alerta de quiebre es `PS03-85G` (3.104); por plata es `PS13-60U`, con "
-        "**$1,57 M diarios** — tres veces la siguiente. Y `PP129`, que vende 0,3 unidades "
-        "al día a $374 mil cada una, entra al top 3 siendo invisible en cualquier ranking "
-        "por volumen.\n\n"
+        "**La venta en riesgo reordena la lista, no solo la decora.**" + ejemplo + "\n\n"
         "Se calcula como `demanda diaria × precio medio de venta`. **El precio sale de "
         "`lineas_pedido`, no del valor del stock**: una referencia en quiebre tiene stock "
         "cero, así que su `valor_venta` también es cero y no sirve para nada. Las alertas "

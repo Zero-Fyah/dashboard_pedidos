@@ -54,4 +54,4 @@ def test_todos_los_pasos_del_ciclo_pasan_por_paso():
     texto = _SCRIPT.read_text(encoding="utf-8")
     assert "|| FALLO=1" not in texto
     for nombre in ("scraper", "bochica", "sheets", "etl", "respaldo"):
-        assert re.search(rf"^\s*paso {nombre} ", texto, flags=re.M), nombre
+        assert re.search(rf"^\s*paso_bodega {nombre} ", texto, flags=re.M), nombre

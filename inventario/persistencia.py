@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from comun import get_db_path
+from comun import ALTURAS_BODEGA2, BODEGA_DEFECTO, get_bodega, get_db_path
 
 logger = logging.getLogger("inventario.persistencia")
 
@@ -1391,17 +1391,124 @@ def _normalizar(fila: tuple) -> tuple:
     return tuple(valores)
 
 
-def main() -> int:
-    """Carga las tres fuentes, calcula la comparación y la persiste.
+def main_por_reservas() -> int:
+    """Perfil para una bodega sin layout propio (DEC-164).
 
-    Composition root del paso: es lo único que `actualizar_pedidos.sh`
-    necesita invocar. AUD-B7: retorna el exit code, `sys.exit` vive en
-    `__main__`.
+    Persiste el puente de nombres (DEC-045), Arena (la hoja de Google,
+    DEC-143), la comparación con su picking estimado — disponible del
+    almacén de la bodega más vendido no alistado, menos lo que Bochica
+    tiene en sus alturas: las ubicaciones de reserva más el puerto
+    (`comun.ALTURAS_BODEGA2`) — y los cinco cálculos que no dependen del
+    layout: hallazgos de calidad (sin los dos que leen ubicaciones), salud y
+    cobertura, ABC-XYZ, tiempos de operación y cancelaciones alistadas
+    (autorizados por el Arquitecto el 2026-10-28). Con pocas semanas de
+    historia, ABC-XYZ y cobertura son poco confiables: miden sobre la
+    demanda que hay. Las alertas corren sin las de conteo; el sobrante se
+    lee como inventario no habilitado para la venta.
+
+    No corren layout, anomalías, ubicaciones, plan de conteo, mapa ni
+    conteos: dependen del layout, que esta bodega no tiene. Sus tablas
+    quedan sin tocar (vacías en una base nueva) para que el dashboard las
+    muestre como no disponibles.
 
     Returns:
         0 si la corrida se persistió, 1 si faltó una fuente o falló la
         escritura.
     """
+    from inventario.alertas import generar_alertas
+    from inventario.arena import calcular_arena
+    from inventario.cancelaciones import calcular_cancelaciones
+    from inventario.clasificacion import calcular_clasificacion
+    from inventario.comparacion import calcular_vendido_no_alistado, comparar
+    from inventario.hallazgos import detectar_todos
+    from inventario.layout import RUTA_LAYOUT_DEFAULT, clasificar_por_reservas
+    from inventario.normalizador import (
+        ALMACEN_BODEGA,
+        aplicar_nombres_canonicos_arena,
+        cargar_admin,
+        cargar_bochica,
+        filtrar_alcance_admin,
+    )
+    from inventario.operacion import calcular_operacion, calcular_ventanas
+    from inventario.salud import calcular_salud
+    from scraper.bochica import DESTINO_DEFAULT as BOCHICA_XLSX
+    from scraper.inventario import DESTINO_DEFAULT as ADMIN_XLSX
+
+    try:
+        # El layout no existe para esta bodega: queda registrado como ausente
+        # y no cuenta para la frescura (solo cuentan las dos descargas).
+        frescura = medir_frescura(ADMIN_XLSX, BOCHICA_XLSX, RUTA_LAYOUT_DEFAULT)
+        catalogo_completo = aplicar_nombres_canonicos_arena(cargar_admin(ADMIN_XLSX))
+        catalogo = construir_catalogo_productos(catalogo_completo)
+        arena = calcular_arena(catalogo_completo)
+        admin = filtrar_alcance_admin(catalogo_completo)
+        bochica = clasificar_por_reservas(cargar_bochica(BOCHICA_XLSX), ALTURAS_BODEGA2)
+        comparacion = comparar(admin, bochica, calcular_vendido_no_alistado())
+        with sqlite3.connect(get_db_path(), timeout=30) as lectura:
+            hallazgos = detectar_todos(catalogo_completo, lectura, con_ubicaciones=False)
+            # El almacén de esta bodega, no el default de la histórica.
+            salud = calcular_salud(admin, lectura, almacen=ALMACEN_BODEGA)
+            abc = calcular_clasificacion(admin, lectura, almacen=ALMACEN_BODEGA)
+            operacion = calcular_operacion(lectura)
+            ventanas = calcular_ventanas(lectura)
+            cancelaciones = calcular_cancelaciones(lectura, admin)
+        corrida_id = persistir(
+            comparacion,
+            pd.DataFrame(columns=list(_COLUMNAS_ANOMALIAS)),
+            frescura,
+            catalogo=catalogo,
+            arena=arena,
+            hallazgos=hallazgos,
+            salud=salud,
+            abc=abc,
+            operacion=operacion,
+            ventanas=ventanas,
+            cancelaciones=cancelaciones,
+            # Sin ubicaciones ni conteos: no salen las alertas de conteo.
+            alertas=generar_alertas(
+                salud,
+                comparacion,
+                pd.DataFrame(),
+                None,
+                abc,
+                frescura,
+                hallazgos,
+                cancelaciones,
+                sobrante_sin_habilitar=True,
+            ),
+        )
+    except FileNotFoundError as e:
+        logger.error("inventario: falta una fuente — %s", e)
+        return 1
+    except Exception:
+        logger.exception("inventario: la corrida falló sin persistir nada")
+        return 1
+
+    logger.info(
+        "inventario: corrida %d persistida (perfil por reservas, %d referencias, "
+        "picking estimado %.0f unidades, %d hallazgos de calidad)",
+        corrida_id,
+        len(comparacion),
+        float(comparacion["picking_estimado"].sum()),
+        len(hallazgos),
+    )
+    return 0
+
+
+def main() -> int:
+    """Carga las tres fuentes, calcula la comparación y la persiste.
+
+    Composition root del paso: es lo único que `actualizar_pedidos.sh`
+    necesita invocar. AUD-B7: retorna el exit code, `sys.exit` vive en
+    `__main__`. Fuera de la bodega por defecto corre el perfil reducido
+    (`main_por_reservas()`, DEC-164).
+
+    Returns:
+        0 si la corrida se persistió, 1 si faltó una fuente o falló la
+        escritura.
+    """
+    if get_bodega() != BODEGA_DEFECTO:
+        return main_por_reservas()
     from inventario.alertas import generar_alertas
     from inventario.arena import calcular_arena
     from inventario.cancelaciones import calcular_cancelaciones

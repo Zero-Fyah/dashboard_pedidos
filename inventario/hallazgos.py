@@ -32,6 +32,7 @@ from comun import (
     ESTADOS_CONOCIDOS,
     TIMELINE_CONOCIDO,
     VEREDICTOS_AUDITORIA,
+    ruta_bodega,
 )
 
 logger = logging.getLogger("inventario.hallazgos")
@@ -330,9 +331,7 @@ def referencias_con_espacios(df_admin: pd.DataFrame) -> Hallazgo:
 # Es una lista acotada por construcción: el histórico no cambia, así que no
 # hace falta mantenerla salvo que aparezca un producto de Arena nuevo con
 # historial propio bajo una grafía vieja no contemplada todavía.
-RUTA_VARIANTES_HISTORICAS_ARENA = (
-    Path(__file__).parent.parent / "data" / "inventario" / "arena_variantes_historicas.xlsx"
-)
+RUTA_VARIANTES_HISTORICAS_ARENA = ruta_bodega("inventario") / "arena_variantes_historicas.xlsx"
 
 
 def _variantes_historicas_aceptadas_arena(
@@ -1196,7 +1195,9 @@ def arena_referencias_no_reconocidas(df_admin: pd.DataFrame) -> Hallazgo:
     )
 
 
-def detectar_todos(df_admin: pd.DataFrame, con: sqlite3.Connection) -> list[Hallazgo]:
+def detectar_todos(
+    df_admin: pd.DataFrame, con: sqlite3.Connection, *, con_ubicaciones: bool = True
+) -> list[Hallazgo]:
     """Corre todos los detectores y devuelve solo los que encontraron algo.
 
     Que un detector sin casos no se devuelva **es la mecánica por la que
@@ -1210,10 +1211,18 @@ def detectar_todos(df_admin: pd.DataFrame, con: sqlite3.Connection) -> list[Hall
     Args:
         df_admin: Catálogo del admin, sin filtrar por alcance.
         con: Conexión de lectura a pedidos.db.
+        con_ubicaciones: False para una bodega sin layout (DEC-164): los dos
+            detectores que leen `inventario_ubicaciones` no corren, porque
+            sin esa tabla poblada darían siempre cero casos y eso se leería
+            como «sin problemas» cuando es «no medido».
 
     Returns:
         Los hallazgos con al menos un caso.
     """
+    detectores_de_ubicaciones = [
+        lambda: productos_en_bodega_sin_precio(df_admin, con),
+        lambda: sku_en_bodega_fuera_de_catalogo(df_admin, con),
+    ]
     detectores = [
         lambda: codigos_barras_multiples_ids(df_admin),
         lambda: averia_fuera_de_outlet(df_admin),
@@ -1223,8 +1232,7 @@ def detectar_todos(df_admin: pd.DataFrame, con: sqlite3.Connection) -> list[Hall
         lambda: estados_sin_clasificar(con),
         lambda: lineas_sin_id_producto(con),
         lambda: personal_duplicado(con),
-        lambda: productos_en_bodega_sin_precio(df_admin, con),
-        lambda: sku_en_bodega_fuera_de_catalogo(df_admin, con),
+        *(detectores_de_ubicaciones if con_ubicaciones else []),
         lambda: vocabulario_nuevo_en_origen(con),
         lambda: cobertura_de_campos_cayendo(con),
         lambda: peso_en_observaciones_de_linea(con),

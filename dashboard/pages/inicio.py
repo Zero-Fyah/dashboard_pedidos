@@ -24,10 +24,12 @@ import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from filtros import bodega_seleccionada
 from tz import a_hora_colombia
 
 from comun import META_IRA_POR_CLASE, VIGENCIA_ACTIVO
 from db import (
+    fuente_disponible,
     get_alertas,
     get_inventario_corrida,
     get_inventario_corridas,
@@ -38,19 +40,24 @@ from db import (
 )
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
 
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
+
 st.markdown('<p class="dp-breadcrumb">Dashboard / Principal</p>', unsafe_allow_html=True)
 st.title("📊 Estado del área")
 
 try:
-    alertas = get_alertas()
-    ira = get_ira()
-    salud = get_inventario_salud()
-    ubicaciones = get_inventario_ubicaciones()
-    corrida = get_inventario_corrida()
-    corridas = get_inventario_corridas()
+    alertas = get_alertas(bodega=bodega)
+    ira = get_ira(bodega=bodega)
+    salud = get_inventario_salud(bodega=bodega)
+    ubicaciones = get_inventario_ubicaciones(bodega=bodega)
+    corrida = get_inventario_corrida(bodega=bodega)
+    corridas = get_inventario_corridas(bodega=bodega)
     # DEC-102: las cifras de pedidos, servicio y caja. Consulta propia por
     # rendimiento; su consistencia con las páginas de detalle está testeada.
-    tarjeta = get_scorecard()
+    tarjeta = get_scorecard(bodega=bodega)
+    # DEC-165: el IRA y la cobertura de conteo salen del layout de la bodega.
+    hay_layout = fuente_disponible("inventario_ubicaciones", bodega=bodega)
 except sqlite3.OperationalError as e:
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()
@@ -140,7 +147,11 @@ if ira_global is not None:
         c3.caption("Bajo meta: " + ", ".join(incumple))
 else:
     c3.metric("🎯 IRA global", "—")
-    c3.caption("Aparece con el primer conteo físico ingerido")
+    c3.caption(
+        "Aparece con el primer conteo físico ingerido"
+        if hay_layout
+        else "Requiere el layout de bodega, que esta operación todavía no tiene"
+    )
 
 
 # ─────────────────────────────────────────────
@@ -189,11 +200,15 @@ d3.metric(
     f"{sobrante_uni:,}".replace(",", "."),
     help=f"Por encima del teórico, en {sobrante_ref} referencias.",
 )
-d4.metric(
-    "Posiciones A/B sin contar",
-    f"{ab_pendientes:,}".replace(",", "."),
-    help=f"De {posiciones:,} posiciones de altura ocupadas.".replace(",", "."),
-)
+if hay_layout:
+    d4.metric(
+        "Posiciones A/B sin contar",
+        f"{ab_pendientes:,}".replace(",", "."),
+        help=f"De {posiciones:,} posiciones de altura ocupadas.".replace(",", "."),
+    )
+else:
+    d4.metric("Posiciones A/B sin contar", "—")
+    d4.caption("Requiere el layout de bodega, que esta operación todavía no tiene")
 
 
 # ─────────────────────────────────────────────

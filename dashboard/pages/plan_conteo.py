@@ -34,6 +34,7 @@ import conteos_io
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from filtros import bodega_seleccionada, exigir_fuente, ruta_visible
 
 from comun import (
     CAUSAS_DISCREPANCIA,
@@ -60,11 +61,17 @@ from db import (
 )
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
 
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
+
 st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_html=True)
 st.title("📋 Plan de conteo")
+# DEC-165: la cola de conteo sale de las ubicaciones del layout.
+exigir_fuente(bodega, ["inventario_ubicaciones"], "El plan de conteo")
+carpeta_conteos = ruta_visible(conteos_io.carpeta_conteos(bodega=bodega))
 
 try:
-    df = get_inventario_ubicaciones()
+    df = get_inventario_ubicaciones(bodega=bodega)
 except sqlite3.OperationalError as e:
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()
@@ -467,7 +474,7 @@ if tab_reg.open:
         st.divider()
         # ── Lo que el sistema no ve (DEC-073) ────────────────────────────────
         try:
-            sin_ubic = get_sin_ubicacion()
+            sin_ubic = get_sin_ubicacion(bodega=bodega)
         except sqlite3.OperationalError:
             sin_ubic = pd.DataFrame()
 
@@ -578,7 +585,7 @@ if tab_reg.open:
                         "sistema. Se ingieren igual y salen como **sobrante** con cantidad "
                         "esperada cero, que es lo correcto si apareció producto donde no debía."
                     )
-                if conteos_io.existe(archivo.name):
+                if conteos_io.existe(archivo.name, bodega=bodega):
                     st.warning(
                         f"Ya existe una hoja llamada `{archivo.name}`. Guardarla la **reemplaza** "
                         "— que es lo correcto si estás corrigiendo esa misma hoja."
@@ -586,7 +593,9 @@ if tab_reg.open:
 
                 if st.button(f"💾 Guardar «{archivo.name}»", key=f"guardar_{archivo.name}"):
                     try:
-                        destino = conteos_io.guardar(archivo.name, archivo.getvalue())
+                        destino = conteos_io.guardar(
+                            archivo.name, archivo.getvalue(), bodega=bodega
+                        )
                     except ValueError as e:
                         st.error(str(e))
                     else:
@@ -598,14 +607,14 @@ if tab_reg.open:
 
         with st.expander("¿Y si una hoja se cargó mal?"):
             st.markdown(
-                "La carpeta manda: lo que está en `data/conteos/` es lo que cuenta.\n\n"
+                f"La carpeta manda: lo que está en `{carpeta_conteos}/` es lo que cuenta.\n\n"
                 "- **Deshacer una hoja entera** → el botón *Anular* en la lista de hojas, "
                 "al final de esta pestaña. Sale del cálculo y **el archivo no se borra**.\n"
                 "- **Corregir una fila** → editar el Excel y volver a subirlo con el mismo "
                 "nombre. El valor nuevo reemplaza al anterior, no se suma.\n"
                 "- **Recontar la misma posición otro día** → hoja nueva. Los dos conteos "
                 "conviven, que es lo que necesita la doble verificación.\n\n"
-                "⚠️ `data/conteos/` es el único original de los conteos y no está "
+                f"⚠️ `{carpeta_conteos}/` es el único original de los conteos y no está "
                 "versionada: conviene respaldarla aparte."
             )
 
@@ -613,17 +622,17 @@ if tab_reg.open:
         st.subheader("3 · Resultado")
 
         try:
-            conteos = get_conteos()
+            conteos = get_conteos(bodega=bodega)
         except sqlite3.OperationalError:
             conteos = pd.DataFrame()
 
         if conteos.empty:
             st.info(
                 "Todavía no se ha ingerido ningún conteo. Apenas aparezca el primer archivo "
-                "en `data/conteos/`, acá salen el IRA por clase y la cobertura."
+                f"en `{carpeta_conteos}/`, acá salen el IRA por clase y la cobertura."
             )
         else:
-            ira = get_ira()
+            ira = get_ira(bodega=bodega)
             global_ = ira[ira["clase"] == "Global"].iloc[0]
 
             k1, k2, k3, k4 = st.columns(4)
@@ -749,7 +758,7 @@ if tab_reg.open:
             )
 
             # ── Evolución del IRA ──────────────────────────────────────
-            serie = get_ira_periodo()
+            serie = get_ira_periodo(bodega=bodega)
             if len(serie["periodo"].unique()) > 1:
                 st.markdown("##### Cómo evoluciona la exactitud")
                 fig_ira = go.Figure()
@@ -839,7 +848,7 @@ if tab_reg.open:
                 )
 
             # ── Conformidad por tipo ───────────────────────────────────
-            conformidad = get_conformidad()
+            conformidad = get_conformidad(bodega=bodega)
             if len(conformidad):
                 st.markdown("##### Conformidad por posición")
                 st.markdown(
@@ -864,7 +873,7 @@ if tab_reg.open:
 
             # ── Antigüedad del último conteo ───────────────────────────
             try:
-                posiciones = get_inventario_posiciones()
+                posiciones = get_inventario_posiciones(bodega=bodega)
             except sqlite3.OperationalError:
                 posiciones = pd.DataFrame()
             if len(posiciones) and posiciones["dias_desde_conteo"].notna().any():
@@ -933,7 +942,7 @@ if tab_reg.open:
         st.divider()
         st.markdown("##### Hojas registradas")
         try:
-            hojas = get_conteos_archivos()
+            hojas = get_conteos_archivos(bodega=bodega)
         except sqlite3.OperationalError:
             hojas = pd.DataFrame()
         if hojas.empty:
@@ -960,13 +969,13 @@ if tab_reg.open:
                 "carpeta la excluye del cálculo, no borra que existió."
             )
 
-            anulables = conteos_io.listar_activas()
+            anulables = conteos_io.listar_activas(bodega=bodega)
             if anulables:
                 a1, a2 = st.columns([3, 1])
                 elegida = a1.selectbox("Anular una hoja", anulables, key="anular_hoja")
                 if a2.button("🚫 Anular", key="btn_anular"):
                     try:
-                        destino = conteos_io.anular(elegida)
+                        destino = conteos_io.anular(elegida, bodega=bodega)
                     except FileNotFoundError:
                         st.error(f"`{elegida}` ya no está activa.")
                     else:

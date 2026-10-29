@@ -23,6 +23,7 @@ import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from filtros import bodega_seleccionada, exigir_fuente
 from tz import a_hora_colombia
 
 from db import (
@@ -36,6 +37,9 @@ from db import (
 )
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
 
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
+
 # Con menos días la variación es indistinguible del ruido: la tendencia se
 # muestra como tabla hasta que haya historia suficiente.
 DIAS_MINIMOS_TENDENCIA = 3
@@ -44,9 +48,9 @@ st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_
 st.title("📦 Bodega vs. sistema administrativo")
 
 try:
-    corrida = get_inventario_corrida()
-    df = get_inventario_comparacion()
-    anomalias = get_inventario_anomalias()
+    corrida = get_inventario_corrida(bodega=bodega)
+    df = get_inventario_comparacion(bodega=bodega)
+    anomalias = get_inventario_anomalias(bodega=bodega)
 except sqlite3.OperationalError as e:
     # AUD-M6: contención normal con el ETL/scraper escribiendo.
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
@@ -145,7 +149,7 @@ st.divider()
 # estable, el desfase es histórico y no se está agravando.
 st.subheader("Cómo evoluciona el sobrante")
 
-tendencia = get_inventario_tendencia()
+tendencia = get_inventario_tendencia(bodega=bodega)
 
 if tendencia.empty:
     st.info("Todavía no hay corridas registradas para construir la tendencia.")
@@ -398,8 +402,10 @@ else:
             "el origen no permite partirlos por ID."
         ),
     )
-    if referencia_desglose:
-        ubicaciones = get_inventario_ubicaciones()
+    if referencia_desglose and exigir_fuente(
+        bodega, ["inventario_ubicaciones"], "El desglose por ubicación", seccion=True
+    ):
+        ubicaciones = get_inventario_ubicaciones(bodega=bodega)
         # .strip() en ambos lados: el Excel del admin (origen de `vista`/`referencia_desglose`)
         # y el de Bochica (origen de `ubicaciones`) no siempre coinciden en espacios
         # finales para la misma referencia nominal — comparar sin normalizar deja
@@ -438,7 +444,7 @@ else:
             )
             pivote["bochica_total"] = pivote["bochica_altura"] + pivote["bochica_picking"]
 
-            puente = get_catalogo_productos()
+            puente = get_catalogo_productos(bodega=bodega)
             pivote["id_especificacion"] = pivote["id_especificacion"].astype(str)
             if not puente.empty:
                 puente = puente.copy()
@@ -486,7 +492,10 @@ st.divider()
 # ── Anomalías de ubicación ─────────────────────────────────────────────────────
 st.subheader("Stock donde el layout dice que no debería haber")
 
-if anomalias.empty:
+# DEC-165: sin layout no se midió nada — un «✅ sin stock» sería falso.
+if not exigir_fuente(bodega, ["inventario_ubicaciones"], "Esta revisión", seccion=True):
+    pass
+elif anomalias.empty:
     st.success("✅ Sin stock en ubicaciones que el layout marca como no disponibles.")
 else:
     resumen = (
@@ -529,7 +538,7 @@ st.divider()
 st.subheader("🚚 Mercancía alistada que terminó cancelada")
 
 try:
-    cancelaciones = get_cancelaciones()
+    cancelaciones = get_cancelaciones(bodega=bodega)
 except sqlite3.OperationalError:
     cancelaciones = pd.DataFrame()
 
@@ -601,8 +610,9 @@ else:
             },
         )
     st.caption(
-        "Alcance del plan: excluye arena por tonelada y otros almacenes. Sin ese "
-        "filtro serían 147.435 unidades, pero el 79% es arena y tapa la señal real."
+        "Alcance del plan: excluye arena por tonelada y otros almacenes, que taparían "
+        "la señal real (en la operación histórica, sin ese filtro serían 147.435 "
+        "unidades, el 79% arena)."
     )
 
 

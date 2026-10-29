@@ -81,7 +81,7 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(ddb, "DB_PATH", ruta)
     for fn in (ddb.get_ventas, ddb.get_ventas_por_linea, ddb.get_descuentos_por_tipo):
         fn.clear()
-    monkeypatch.setattr(ddb, "_num_cols_exist", lambda: True)
+    monkeypatch.setattr(ddb, "_num_cols_exist", lambda *_a, **_k: True)
     yield con
     con.close()
 

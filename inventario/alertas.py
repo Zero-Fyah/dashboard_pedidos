@@ -112,7 +112,7 @@ def _quiebres(salud: pd.DataFrame, abc: pd.DataFrame) -> list[dict]:
     return filas
 
 
-def _sobrantes(comparacion: pd.DataFrame) -> list[dict]:
+def _sobrantes(comparacion: pd.DataFrame, *, sin_habilitar: bool = False) -> list[dict]:
     """Altura por encima del teórico: hubo movimiento físico sin registrar.
 
     **Agregado, no una alerta por referencia.** El primer intento las listó
@@ -124,6 +124,10 @@ def _sobrantes(comparacion: pd.DataFrame) -> list[dict]:
     tendencia. Y atender uno individualmente es ir a contar esa posición,
     que es justo lo que la cola de conteo ya prioriza por clase y valor.
     Duplicarlo acá no agrega una decisión, agrega ruido.
+
+    `sin_habilitar` (DEC-164, bodega sin layout): ahí la altura incluye el
+    puerto, y el sobrante significa otra cosa — mercancía que llegó y no se
+    sumó ni se habilitó para la venta en el sistema administrativo.
     """
     if comparacion.empty or "sobrante_altura" not in comparacion.columns:
         return []
@@ -131,16 +135,26 @@ def _sobrantes(comparacion: pd.DataFrame) -> list[dict]:
     if sobra.empty:
         return []
     unidades = sobra["sobrante_altura"].sum()
+    mayor = sobra.loc[sobra["sobrante_altura"].idxmax(), "referencia"]
+    if sin_habilitar:
+        entidad = "Alturas y puerto"
+        detalle = (
+            f"{len(sobra):,} referencias con {unidades:,.0f} unidades en bodega que no se "
+            f"sumaron ni se habilitaron para la venta · mayor: {mayor}"
+        )
+    else:
+        entidad = "Altura"
+        detalle = (
+            f"{len(sobra):,} referencias con {unidades:,.0f} unidades por encima del "
+            f"teórico · mayor: {mayor}"
+        )
     return [
         _fila(
             "sobrante:total",
             "Sobrante físico",
             ALTA,
-            "Altura",
-            f"{len(sobra):,} referencias con {unidades:,.0f} unidades por encima del "
-            f"teórico · mayor: {sobra.loc[sobra['sobrante_altura'].idxmax(), 'referencia']}".replace(
-                ",", "."
-            ),
+            entidad,
+            detalle.replace(",", "."),
             unidades,
             "Inventario",
         )
@@ -337,6 +351,8 @@ def generar_alertas(
     frescura: dict | None = None,
     hallazgos: list | None = None,
     cancelaciones: pd.DataFrame | None = None,
+    *,
+    sobrante_sin_habilitar: bool = False,
 ) -> pd.DataFrame:
     """Recorre el estado del sistema y devuelve lo que requiere acción.
 
@@ -350,6 +366,8 @@ def generar_alertas(
         hallazgos: Resultado de `hallazgos.detectar_todos()`.
         cancelaciones: Resultado de
             `cancelaciones.calcular_cancelaciones()` (DEC-063).
+        sobrante_sin_habilitar: True en una bodega sin layout (DEC-164): el
+            sobrante se lee como inventario no habilitado para la venta.
 
     Returns:
         Una fila por alerta, ordenada por severidad y magnitud.
@@ -361,7 +379,7 @@ def generar_alertas(
         *_frescura(frescura or {}),
         *_quiebres(salud, abc),
         *_discrepancias(conteos),
-        *_sobrantes(comparacion),
+        *_sobrantes(comparacion, sin_habilitar=sobrante_sin_habilitar),
         *_cobertura_de_conteo(ubicaciones, conteos),
         *_inmovilizado(salud),
         *_cancelaciones(cancelaciones),

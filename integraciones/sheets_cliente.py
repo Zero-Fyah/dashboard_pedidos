@@ -17,23 +17,26 @@ from __future__ import annotations
 import datetime as dt
 import os
 import sqlite3
-from pathlib import Path
 
 import gspread
 import pandas as pd
 from dotenv import load_dotenv
 from gspread.utils import rowcol_to_a1
 
+from comun import BODEGA_DEFECTO, get_bodega, ruta_bodega, verificar_bodega
 from integraciones.sheets_arena import (
     inventario_disponible_arena,
     pedidos_previos_picking_arena,
 )
 
-load_dotenv()
+# DEC-163: el archivo de la bodega del proceso, por ruta explícita; fuera de
+# la bodega por defecto prevalece sobre el entorno heredado (los ID de las
+# hojas de una bodega nunca deben llegar a otra).
+load_dotenv(ruta_bodega("env"), override=get_bodega() != BODEGA_DEFECTO)
 
 _ALCANCES = ["https://www.googleapis.com/auth/spreadsheets"]
 _OFFSET_CO_H = 5
-DB_PATH = Path(__file__).parent.parent / "data" / "pedidos.db"
+DB_PATH = ruta_bodega("pedidos.db")
 
 
 def _hoy_colombia_str() -> str:
@@ -46,8 +49,46 @@ def _cliente() -> gspread.Client:
     return gspread.service_account(filename=ruta, scopes=_ALCANCES)
 
 
-def escribir_hoja(gc: gspread.Client, id_hoja: str, df: pd.DataFrame) -> int:
-    """Reemplaza la primera pestaña de la hoja `id_hoja` con `df`.
+class PestanaAmbiguaError(RuntimeError):
+    """El archivo tiene varias pestañas y no se dijo en cuál escribir (DEC-164)."""
+
+
+def _pestana(libro: gspread.Spreadsheet, nombre: str | None, crear: bool) -> gspread.Worksheet:
+    """La pestaña donde escribe esta bodega (DEC-164).
+
+    Las dos bodegas escriben en los mismos archivos, una pestaña cada una.
+    Con nombre, se busca por nombre —el orden de las pestañas no importa— y
+    se crea si falta y `crear` lo permite. Sin nombre se usa la primera,
+    como antes de DEC-164, **solo si es la única**: con dos o más, la primera
+    podría ser la de la otra bodega, y escribir ahí la borraría.
+
+    Raises:
+        PestanaAmbiguaError: sin nombre y con más de una pestaña.
+        gspread.WorksheetNotFound: con nombre, si no existe y no se puede crear.
+    """
+    if nombre:
+        try:
+            return libro.worksheet(nombre)
+        except gspread.WorksheetNotFound:
+            if not crear:
+                raise
+            return libro.add_worksheet(title=nombre, rows=100, cols=26)
+    if len(libro.worksheets()) > 1:
+        raise PestanaAmbiguaError(
+            "El archivo tiene varias pestañas: define SHEETS_PESTANA en el archivo de "
+            "configuración de la bodega para no escribir sobre la de otra (DEC-164)."
+        )
+    return libro.sheet1
+
+
+def escribir_hoja(
+    gc: gspread.Client,
+    id_hoja: str,
+    df: pd.DataFrame,
+    pestana: str | None = None,
+    crear: bool = False,
+) -> int:
+    """Reemplaza el contenido de una pestaña de la hoja `id_hoja` con `df`.
 
     Fila 1: marca de tiempo de captura (hora Colombia). Fila 2: encabezados
     (nombres de columna de `df`). Desde la fila 3: los datos. NaN se
@@ -60,11 +101,14 @@ def escribir_hoja(gc: gspread.Client, id_hoja: str, df: pd.DataFrame) -> int:
         id_hoja: ID de la hoja de cálculo (el segmento largo de su URL).
         df: Datos a escribir — se usa tal cual, con sus nombres de columna
             actuales como encabezado.
+        pestana: Nombre de la pestaña (DEC-164). None: la primera, solo si
+            el archivo tiene una sola.
+        crear: Crear la pestaña `pestana` si no existe.
 
     Returns:
         Cantidad de filas de datos escritas (sin contar timestamp/encabezado).
     """
-    hoja = gc.open_by_key(id_hoja).sheet1
+    hoja = _pestana(gc.open_by_key(id_hoja), pestana, crear)
     marca = [f"Actualizado: {_hoy_colombia_str()} (hora Colombia, UTC-5)"]
     encabezado = df.columns.tolist()
     datos = df.where(df.notna(), "").values.tolist()
@@ -87,19 +131,38 @@ def escribir_hoja(gc: gspread.Client, id_hoja: str, df: pd.DataFrame) -> int:
 
 
 def main() -> None:
+    # DEC-164: cada bodega escribe en su pestaña de los mismos dos archivos.
+    # Fuera de la bodega por defecto el nombre es obligatorio y la pestaña se
+    # crea si falta; la histórica, sin nombre, sigue en la primera mientras
+    # sea la única.
+    otra_bodega = get_bodega() != BODEGA_DEFECTO
+    pestana = os.environ.get("SHEETS_PESTANA", "").strip() or None
+    if otra_bodega and pestana is None:
+        raise RuntimeError(
+            f"SHEETS_PESTANA no está definida en {ruta_bodega('env').name}: sin ella, "
+            "esta bodega escribiría sobre la pestaña de otra (DEC-164)."
+        )
+
     con = sqlite3.connect(DB_PATH)
     try:
+        verificar_bodega(con)  # DEC-163
         inventario = inventario_disponible_arena(con)
         pedidos = pedidos_previos_picking_arena(con)
     finally:
         con.close()
 
     gc = _cliente()
-    n_inv = escribir_hoja(gc, os.environ["SHEETS_ID_INVENTARIO_ARENA"], inventario)
-    n_ped = escribir_hoja(gc, os.environ["SHEETS_ID_PEDIDOS_PREVIOS_PICKING"], pedidos)
+    n_inv = escribir_hoja(
+        gc, os.environ["SHEETS_ID_INVENTARIO_ARENA"], inventario, pestana, crear=otra_bodega
+    )
+    n_ped = escribir_hoja(
+        gc, os.environ["SHEETS_ID_PEDIDOS_PREVIOS_PICKING"], pedidos, pestana, crear=otra_bodega
+    )
     print(
         f"Sheets actualizados — inventario: {n_inv} filas · "
-        f"pedidos previos a picking: {n_ped} filas."
+        f"pedidos previos a picking: {n_ped} filas"
+        # El nombre de la pestaña es el de la operación (confidencial): no va al log.
+        + (" (pestaña por nombre)." if pestana else " (primera pestaña).")
     )
 
 

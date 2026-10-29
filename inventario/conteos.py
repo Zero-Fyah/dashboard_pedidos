@@ -60,11 +60,12 @@ from comun import (
     ESTADOS_CICLO_CONTEO,
     TOLERANCIA_CONTEO_DEFECTO,
     TOLERANCIA_POR_CLASE,
+    ruta_bodega,
 )
 
 logger = logging.getLogger("inventario.conteos")
 
-RUTA_CONTEOS_DEFAULT = Path(__file__).parent.parent / "data" / "conteos"
+RUTA_CONTEOS_DEFAULT = ruta_bodega("conteos")
 
 HOJA_CONTEO = "conteo"
 

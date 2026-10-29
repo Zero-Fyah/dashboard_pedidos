@@ -32,6 +32,7 @@ import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from filtros import bodega_seleccionada
 
 from db import (
     get_despacho_diario,
@@ -44,17 +45,20 @@ from db import (
 )
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
 
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
+
 st.markdown('<p class="dp-breadcrumb">Dashboard / Operación</p>', unsafe_allow_html=True)
 st.title("⏱ Capacidad y tiempos de ciclo")
 
 try:
-    ciclos = get_operacion_ciclos()
-    ventanas = get_operacion_ventanas()
-    despacho = get_despacho_diario()
+    ciclos = get_operacion_ciclos(bodega=bodega)
+    ventanas = get_operacion_ventanas(bodega=bodega)
+    despacho = get_despacho_diario(bodega=bodega)
     # DEC-069: el detalle trae `referencia`, así que se cruza con la clase ABC
     # y con el stock actual.
-    _abc = get_inventario_abc()
-    _salud = get_inventario_salud()
+    _abc = get_inventario_abc(bodega=bodega)
+    _salud = get_inventario_salud(bodega=bodega)
 except sqlite3.OperationalError as e:
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()
@@ -305,8 +309,8 @@ if tab_carga.open:
         st.warning(
             "**Esto mide reparto de trabajo, no rendimiento.** El alistamiento se hace por "
             "familia y un subpedido puede tener varios alistadores, pero el sistema registra "
-            "un solo usuario al cerrarlo: el **83,8% de las líneas** queda acreditado a quien "
-            "cerró, no a quien picó. Además, el ritmo diario de una misma persona varía tanto "
+            "un solo usuario al cerrarlo: la mayoría de las líneas queda acreditada a quien "
+            "cerró, no a quien picó (el **83,8%** en la operación histórica). Además, el ritmo diario de una misma persona varía tanto "
             "como su propio promedio. Comparar personas con esta base daría conclusiones "
             "equivocadas.",
             icon="⚖️",
@@ -393,8 +397,8 @@ if tab_despacho.open:
                 # DEC-069: se acotan por rango en SQL, no en pandas — traer los 7
                 # meses cuesta 5,4 s contra 1,3 s del mes que se muestra.
                 try:
-                    lineas_p = get_despacho_faltantes(rango[0], rango[1])
-                    lineas_periodo = get_despacho_lineas_diario(rango[0], rango[1])
+                    lineas_p = get_despacho_faltantes(rango[0], rango[1], bodega=bodega)
+                    lineas_periodo = get_despacho_lineas_diario(rango[0], rango[1], bodega=bodega)
                 except sqlite3.OperationalError as e:
                     st.error(
                         f"La base está ocupada momentáneamente ({e}). Recarga en unos segundos."
@@ -579,11 +583,11 @@ if tab_despacho.open:
 
                 st.caption(
                     "**Es la mitad de E.1, no E.1 completo.** Mide *in full* (salió todo lo "
-                    "que se pidió), no *on time*: el sistema origen no expone una fecha "
-                    "comprometida de entrega, así que la puntualidad no se puede calcular "
-                    "con los datos actuales. **375 de los pedidos con faltante traen la "
-                    "diferencia solo en la cabecera, sin detalle por producto** — por eso "
-                    "el conteo de pedidos y el de líneas no son proporcionales."
+                    "que se pidió); la mitad *on time*, contra la franja de «Hora de "
+                    "entrega», está en **Fuera del alcance → Cumplimiento de entrega** "
+                    "(DEC-095). Algunos pedidos con faltante traen la diferencia solo en la "
+                    "cabecera, sin detalle por producto (375 en la operación histórica) — "
+                    "por eso el conteo de pedidos y el de líneas no son proporcionales."
                 )
 
 st.caption(
@@ -591,5 +595,6 @@ st.caption(
     "registro de horas trabajadas), *dock-to-stock* (no hay datos de recepción) y "
     "exactitud de *put-away*. El rendimiento individual queda pendiente de que se "
     "registre qué familia tomó cada alistador dentro del subpedido — con ese único "
-    "campo, el 83,8% de líneas hoy inatribuibles pasaría a ser atribuible."
+    "campo, las líneas hoy inatribuibles (83,8% en la operación histórica) pasarían a "
+    "ser atribuibles."
 )

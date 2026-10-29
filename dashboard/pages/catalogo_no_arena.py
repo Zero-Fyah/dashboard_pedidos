@@ -23,10 +23,14 @@ import sqlite3
 
 import plotly.graph_objects as go
 import streamlit as st
+from filtros import bodega_seleccionada
 
 from comun import SUFIJO_CLASE_HEREDADA
 from db import get_catalogo_no_arena
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
+
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
 
 st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_html=True)
 st.title("🏷️ Catálogo no-Arena")
@@ -37,7 +41,7 @@ try:
     # show_spinner=False a propósito para operaciones rápidas, pero acá
     # esa convención deja ~7 s de pantalla en blanco sin ningún indicador.
     with st.spinner("Calculando catálogo no-Arena..."):
-        df = get_catalogo_no_arena()
+        df = get_catalogo_no_arena(bodega=bodega)
 except sqlite3.OperationalError as e:
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()

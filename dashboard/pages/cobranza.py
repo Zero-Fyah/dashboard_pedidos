@@ -26,7 +26,7 @@ import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from filtros import aplicar, aviso_alcance, barra_lateral
+from filtros import aplicar, aviso_alcance, barra_lateral, bodega_seleccionada, es_historica
 
 from comun import formato_miles
 from comun.motivos import CAUSA_FALTA_DE_PAGO, DIAS_LIMITE_PAGO, clasificar_motivo
@@ -42,6 +42,9 @@ from db import (
     get_saldo_a_favor,
 )
 from theme import BG_DEEP, GRAFICO_GRID, GRAFICO_SERIES, TEXT_PRIMARY, TEXT_SECONDARY
+
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
 
 st.markdown('<p class="dp-breadcrumb">Dashboard / Fuera del alcance</p>', unsafe_allow_html=True)
 st.title("💳 Cobranza y cartera")
@@ -59,7 +62,7 @@ st.info(
 )
 
 try:
-    _min_fecha, _max_fecha = get_rango_fechas()
+    _min_fecha, _max_fecha = get_rango_fechas(bodega=bodega)
 except (FileNotFoundError, sqlite3.OperationalError) as e:
     st.error(f"No se pudo leer la base ({e}).")
     st.stop()
@@ -73,19 +76,19 @@ if not _min_fecha:
 # Cuando esta página vivía dentro de Operación heredaba la lista de días con
 # actividad de bodega, que no es lo mismo que las fechas de pedido por las que
 # filtran todas estas consultas.
-_f = barra_lateral(_min_fecha, _max_fecha, get_opciones_comerciales())
+_f = barra_lateral(_min_fecha, _max_fecha, get_opciones_comerciales(bodega=bodega))
 aviso_alcance(_f)
 
 try:
-    pagos = aplicar(get_auditoria_pago(_f.desde, _f.hasta), _f)
-    saldos = aplicar(get_saldo_a_favor(_f.desde, _f.hasta), _f)
-    motivos = aplicar(get_motivos_cancelacion(_f.desde, _f.hasta), _f)
+    pagos = aplicar(get_auditoria_pago(_f.desde, _f.hasta, bodega=bodega), _f)
+    saldos = aplicar(get_saldo_a_favor(_f.desde, _f.hasta, bodega=bodega), _f)
+    motivos = aplicar(get_motivos_cancelacion(_f.desde, _f.hasta, bodega=bodega), _f)
     # DEC-085/086: los impagos y el crédito NO dependen del rango — son el
     # estado vivo de hoy. Sí respetan las dimensiones comerciales.
-    impagos = aplicar(get_pedidos_impagos(), _f)
-    credito = aplicar(get_credito_abierto(), _f)
-    estado_pago = aplicar(get_estado_pago(_f.desde, _f.hasta), _f)
-    comprobantes = aplicar(get_comprobantes(_f.desde, _f.hasta), _f)
+    impagos = aplicar(get_pedidos_impagos(bodega=bodega), _f)
+    credito = aplicar(get_credito_abierto(bodega=bodega), _f)
+    estado_pago = aplicar(get_estado_pago(_f.desde, _f.hasta, bodega=bodega), _f)
+    comprobantes = aplicar(get_comprobantes(_f.desde, _f.hasta, bodega=bodega), _f)
 except sqlite3.OperationalError as e:
     st.error(f"La base está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()
@@ -178,8 +181,13 @@ if tab_pago.open:
 
         if pagos.empty:
             st.info(
-                "No hay comprobantes de pago registrados en el periodo. El registro de "
-                "operaciones del sistema origen arranca el 2026-01-23."
+                "No hay comprobantes de pago registrados en el periodo."
+                # DEC-165: la fecha de arranque es de la operación histórica.
+                + (
+                    " El registro de operaciones del sistema origen arranca el 2026-01-23."
+                    if es_historica(bodega)
+                    else ""
+                )
             )
         else:
             pg = pagos.copy()
@@ -386,9 +394,9 @@ if tab_pago.open:
 
             st.caption(
                 "Sale de `registro_operaciones`, que el scraper ya traía: cruza "
-                "**Subir comprobante de pago** con **Auditoría de pago**. La tarjeta "
-                "«Operación de pago» que el sistema origen agregó en julio daría además "
-                "el estado y el saldo sin derivarlos — hoy no se captura (DEC-081)."
+                "**Subir comprobante de pago** con **Auditoría de pago**: el estado y el "
+                "saldo de cada pedido salen de la tarjeta «Operación de pago» (arriba, "
+                "DEC-087/089); los tiempos de auditoría, de este cruce."
             )
 
         # ── Comprobantes, uno por uno (DEC-090) ────────────────────────────────
@@ -783,8 +791,12 @@ if tab_cancel.open:
     with tab_cancel:
         if motivos.empty:
             st.info(
-                "No hay cancelaciones registradas en el periodo. El motivo vive en el "
-                "registro de operaciones, que arranca el 2026-01-23."
+                "No hay cancelaciones registradas en el periodo."
+                + (
+                    " El motivo vive en el registro de operaciones, que arranca el 2026-01-23."
+                    if es_historica(bodega)
+                    else ""
+                )
             )
         else:
             mo = motivos.copy()
@@ -959,11 +971,13 @@ if tab_cancel.open:
                     "algunos que ya pagaron."
                 )
 
-            st.caption(
-                "**Una hipótesis que la medición descartó.** Era tentador cerrar el círculo "
-                "diciendo que la mercancía alistada y luego cancelada (DEC-063, mediana de 90 "
-                "días en limbo) es esto mismo. No lo es: de esos 178 pedidos, solo 35 son por "
-                "falta de pago. La cancelación por pago ocurre a los 5 días y casi siempre "
-                "**antes** de alistar — ahí el sistema está funcionando. Los 90 días son otro "
-                "fenómeno, todavía sin explicación."
-            )
+            # DEC-165: hallazgo medido en la operación histórica; solo ahí.
+            if es_historica(bodega):
+                st.caption(
+                    "**Una hipótesis que la medición descartó.** Era tentador cerrar el círculo "
+                    "diciendo que la mercancía alistada y luego cancelada (DEC-063, mediana de 90 "
+                    "días en limbo) es esto mismo. No lo es: de esos 178 pedidos, solo 35 son por "
+                    "falta de pago. La cancelación por pago ocurre a los 5 días y casi siempre "
+                    "**antes** de alistar — ahí el sistema está funcionando. Los 90 días son otro "
+                    "fenómeno, todavía sin explicación."
+                )

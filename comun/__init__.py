@@ -15,6 +15,7 @@ desde estas constantes, el ETL genera los literales SQL de sus VIEWs desde
 ellas y el dashboard deriva sus filtros de las mismas.
 """
 
+import os
 import re
 import sqlite3
 from pathlib import Path
@@ -550,18 +551,242 @@ def to_num(val: str) -> float | None:
         return None
 
 
-def get_db_path() -> str:
-    """Retorna la ruta absoluta a data/pedidos.db.
+# ─────────────────────────────────────────────
+# BODEGAS — una base por bodega (DEC-163)
+# ─────────────────────────────────────────────
+# El mismo pipeline sirve a dos operaciones. La bodega del proceso sale de la
+# variable de entorno BODEGA, nunca de un .env: es la que decide qué .env se
+# carga. Sin definirla, todo se comporta como antes de DEC-163 y la bodega
+# histórica conserva sus rutas de siempre.
 
-    La ruta se calcula relativa a la ubicación de
-    este módulo, no al directorio de trabajo actual.
-    Crea data/ si no existe.
+BODEGA_DEFECTO = "miempresa"
+BODEGAS: tuple[str, ...] = (BODEGA_DEFECTO, "bodega2")
+
+# Lo que cada bodega tiene propio. "env" es su archivo de configuración.
+RECURSOS_BODEGA: tuple[str, ...] = (
+    "pedidos.db",
+    "tareas.db",
+    "inventario",
+    "errors",
+    "debug",
+    "sesiones",
+    "conteos",
+    "backups",
+    "logs",
+    "env",
+)
+
+# Marca de bodega en la cabecera de cada base: `PRAGMA application_id`, que
+# no toca el esquema (decisión del Arquitecto, DEC-163). 0 = sin marca: base
+# recién creada, o la histórica anterior a la marca.
+MARCA_BODEGA: dict[str, int] = {BODEGA_DEFECTO: 1, "bodega2": 2}
+
+# Recursos que las bodegas comparten: resuelven siempre a la ruta de la bodega
+# por defecto. La sesión de Google de BOCHICA es una sola para las dos
+# operaciones —la operación se elige dentro de la app— y se siembra a mano
+# (DEC-116), así que duplicarla obligaría a otro login manual (DEC-164).
+RECURSOS_COMPARTIDOS: frozenset[str] = frozenset({"sesiones"})
+
+# Almacén del sistema administrativo que corresponde a la bodega de cada
+# operación. Son dos bodegas distintas; el almacén de las dos se llama como
+# la ciudad, y `bodega2` lo publica sin tilde (medido el 2026-10-28, DEC-164).
+ALMACEN_DE_BODEGA: dict[str, str] = {BODEGA_DEFECTO: "Bogotá", "bodega2": "Bogota"}
+
+# Ubicaciones de reserva (alturas) de `bodega2` en BOCHICA, definidas por el
+# Arquitecto el 2026-10-28 («por ahora»). Son las únicas que se restan del
+# inventario teórico para estimar su picking; cualquier otra cuenta como
+# picking (DEC-164). La histórica clasifica con su layout (DEC-041).
+RESERVAS_BODEGA2: tuple[str, ...] = (
+    "P_1_4",
+    "P_2_4",
+    "P_2_5",
+    "P_2_6",
+    "P_2_7",
+    "P_2_8",
+    "P_3_4",
+    "P_3_5",
+    "P_3_6",
+    "P_3_7",
+    "P_3_8",
+    "P_3_9",
+)
+
+# El puerto de `bodega2`: mercancía que llegó y todavía no se almacenó.
+# Cuenta como altura para estimar el picking —no está en picking— y debe
+# estar disponible para la venta; si el puerto más las reservas superan al
+# teórico, es una alerta: inventario que no se sumó ni se habilitó para la
+# venta (Arquitecto, 2026-10-28, DEC-164).
+PUERTO_BODEGA2: tuple[str, ...] = ("P1_1_1",)
+ALTURAS_BODEGA2: tuple[str, ...] = RESERVAS_BODEGA2 + PUERTO_BODEGA2
+
+_RAIZ_PROYECTO = Path(__file__).parent.parent
+
+
+class BodegaIncorrectaError(RuntimeError):
+    """La bodega pedida no existe, o la base no es de la bodega del proceso."""
+
+
+def _validar_bodega(bodega: str | None) -> str:
+    """La bodega dada, o la del proceso si es None; falla si no se conoce."""
+    if bodega is None:
+        return get_bodega()
+    if bodega not in BODEGAS:
+        raise BodegaIncorrectaError(
+            f"Bodega desconocida: {bodega!r} (válidas: {', '.join(BODEGAS)})"
+        )
+    return bodega
+
+
+def get_bodega() -> str:
+    """Bodega del proceso, leída de la variable de entorno BODEGA.
 
     Returns:
-        Ruta absoluta como string a data/pedidos.db.
+        `BODEGA_DEFECTO` si la variable no está definida o está vacía.
+
+    Raises:
+        BodegaIncorrectaError: si BODEGA trae un valor que no está en `BODEGAS`.
     """
-    path = Path(__file__).parent.parent / "data" / "pedidos.db"
+    valor = os.environ.get("BODEGA", "").strip()
+    if not valor:
+        return BODEGA_DEFECTO
+    return _validar_bodega(valor)
+
+
+def ruta_bodega(recurso: str, bodega: str | None = None) -> Path:
+    """Única fuente de las rutas que dependen de la bodega (DEC-163).
+
+    La bodega por defecto conserva las rutas de siempre (`data/<recurso>`,
+    `logs/`, `.env`); cualquier otra vive entera bajo `data/<bodega>/` y se
+    configura con `.env.<bodega>`, salvo `RECURSOS_COMPARTIDOS`, que
+    resuelven a la ruta de la bodega por defecto. Función pura: no crea nada.
+
+    Args:
+        recurso: Uno de `RECURSOS_BODEGA`.
+        bodega: Bodega a resolver. Default: la del proceso (`get_bodega()`).
+
+    Returns:
+        Ruta absoluta del recurso para esa bodega.
+
+    Raises:
+        ValueError: si el recurso no está en `RECURSOS_BODEGA`.
+        BodegaIncorrectaError: si la bodega no está en `BODEGAS`.
+    """
+    bodega = _validar_bodega(bodega)
+    if recurso not in RECURSOS_BODEGA:
+        raise ValueError(f"Recurso desconocido: {recurso!r}")
+    if bodega == BODEGA_DEFECTO or recurso in RECURSOS_COMPARTIDOS:
+        if recurso == "env":
+            return _RAIZ_PROYECTO / ".env"
+        if recurso == "logs":
+            return _RAIZ_PROYECTO / "logs"
+        return _RAIZ_PROYECTO / "data" / recurso
+    if recurso == "env":
+        return _RAIZ_PROYECTO / f".env.{bodega}"
+    return _RAIZ_PROYECTO / "data" / bodega / recurso
+
+
+def bodega_de_la_base(con: sqlite3.Connection) -> str | None:
+    """Bodega marcada en la cabecera de la base, o None si no tiene marca.
+
+    Raises:
+        BodegaIncorrectaError: si la marca no corresponde a ninguna bodega.
+    """
+    marca = con.execute("PRAGMA application_id").fetchone()[0]
+    if marca == 0:
+        return None
+    for bodega, valor in MARCA_BODEGA.items():
+        if valor == marca:
+            return bodega
+    raise BodegaIncorrectaError(f"La base tiene una marca de bodega desconocida ({marca})")
+
+
+def verificar_bodega(con: sqlite3.Connection, bodega: str | None = None) -> None:
+    """Detiene el proceso si la base abierta no es de `bodega`. Solo lee.
+
+    Sin marca y sin tablas es una base recién creada: la marca la pone quien
+    crea el esquema. Sin marca y con tablas es la base histórica, anterior a
+    DEC-163, y solo puede pertenecer a la bodega por defecto.
+
+    Raises:
+        BodegaIncorrectaError: si la marca (o su ausencia) no corresponde.
+    """
+    bodega = _validar_bodega(bodega)
+    marcada = bodega_de_la_base(con)
+    if marcada is None:
+        tiene_tablas = (
+            con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1").fetchone()
+            is not None
+        )
+        if tiene_tablas and bodega != BODEGA_DEFECTO:
+            raise BodegaIncorrectaError(
+                f"La base no tiene marca de bodega y ya tiene datos: es la de "
+                f"{BODEGA_DEFECTO}, no la de {bodega}. Proceso detenido (DEC-163)."
+            )
+        return
+    if marcada != bodega:
+        raise BodegaIncorrectaError(
+            f"La base es de {marcada} y el proceso corre como {bodega}. Proceso detenido (DEC-163)."
+        )
+
+
+def marcar_bodega(con: sqlite3.Connection, bodega: str | None = None) -> None:
+    """Estampa la marca de `bodega` si la base no la tiene. Idempotente.
+
+    Raises:
+        BodegaIncorrectaError: si la base pertenece a otra bodega.
+    """
+    bodega = _validar_bodega(bodega)
+    verificar_bodega(con, bodega)
+    if bodega_de_la_base(con) is None:
+        # PRAGMA no admite parámetros; el valor sale de MARCA_BODEGA, no de
+        # una entrada externa.
+        con.execute(f"PRAGMA application_id = {MARCA_BODEGA[bodega]}")
+        con.commit()
+
+
+def verificar_bodega_db(db_path: str | Path, bodega: str | None = None) -> None:
+    """`verificar_bodega()` sobre un archivo, con una conexión de solo lectura.
+
+    Raises:
+        BodegaIncorrectaError: si la base no es de `bodega`.
+    """
+    uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+    con = sqlite3.connect(uri, uri=True, timeout=5)
+    try:
+        verificar_bodega(con, bodega)
+    finally:
+        con.close()
+
+
+def get_db_path(bodega: str | None = None) -> str:
+    """Ruta absoluta de la pedidos.db de la bodega, verificada (DEC-163).
+
+    La ruta sale de `ruta_bodega()`, relativa a este módulo y no al
+    directorio de trabajo actual. Crea la carpeta si no existe. Si la base
+    existe, verifica su marca de bodega; la de una bodega que no es la por
+    defecto se crea ya marcada, así ningún paso del ciclo puede dejarla sin
+    marca.
+
+    Args:
+        bodega: Default: la del proceso (`get_bodega()`).
+
+    Returns:
+        Ruta absoluta como string.
+
+    Raises:
+        BodegaIncorrectaError: si la base existente no es de esa bodega.
+    """
+    bodega = _validar_bodega(bodega)
+    path = ruta_bodega("pedidos.db", bodega)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        verificar_bodega_db(path, bodega)
+    elif bodega != BODEGA_DEFECTO:
+        con = sqlite3.connect(path, timeout=5)
+        try:
+            marcar_bodega(con, bodega)
+        finally:
+            con.close()
     return str(path)
 
 

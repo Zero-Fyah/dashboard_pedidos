@@ -51,7 +51,8 @@ DEC-028) — 7,0 MB por archivo medido, ~2,5 GB/año sin purgar.
 
 `descargar_movimientos_bochica()` navega Montacargas > Movimientos (misma
 URL y mismo login de dos capas que `scraper.bochica`), filtra Bodega Origen
-y Bodega Destino a MOSQUERA y el rango a un solo día, y lee la tabla en
+y Bodega Destino a `BODEGA_MOVIMIENTOS` (MOSQUERA en la histórica, «Todas»
+en `bodega2`, DEC-164) y el rango a un solo día, y lee la tabla en
 pantalla celda por celda — esta vista no tiene botón "Exportar" como
 `Cambios de inventario` (confirmado por el Arquitecto sobre el DOM real).
 
@@ -95,7 +96,7 @@ from pathlib import Path
 import pandas as pd
 from playwright.async_api import Page
 
-from comun import get_db_path
+from comun import BODEGA_DEFECTO, get_bodega, get_db_path, ruta_bodega
 from scraper.bochica import DESTINO_DEFAULT as _SNAPSHOT_BOCHICA_VIVO
 from scraper.bochica import frame_con_selector, login_app_bochica, pagina_con_sesion_guardada
 from scraper.config import CONFIG, log_event
@@ -179,9 +180,7 @@ _COLUMNAS_TABLA = (
 # ya se resolvió para `Cambios de inventario` del sistema administrativo.
 _PLACEHOLDERS = frozenset({"-", "—"})
 
-CARPETA_HISTORICO_BOCHICA = (
-    Path(__file__).parent.parent / "data" / "inventario" / "historico_bochica"
-)
+CARPETA_HISTORICO_BOCHICA = ruta_bodega("inventario") / "historico_bochica"
 
 # Mismo criterio que la rotación de logs (DEC-028): 7,0 MB medidos por
 # snapshot, ~2,5 GB/año sin purgar en un equipo de 8 GB.
@@ -189,9 +188,13 @@ RETENCION_HISTORICO_DIAS = 30
 
 # Única bodega en alcance (DEC-039) — mismo criterio que el resto del
 # cruce de inventario, que solo opera Mosquera.
-BODEGA_MOVIMIENTOS = "MOSQUERA"
+# DEC-164: el filtro depende de la operación elegida en BOCHICA. Medido el
+# 2026-10-28: la de `bodega2` no ofrece ninguna bodega en ese filtro, solo
+# «Todas» (valor ""); la histórica ofrece 24, entre ellas MOSQUERA.
+_BODEGA_MOVIMIENTOS_POR_BODEGA = {BODEGA_DEFECTO: "MOSQUERA", "bodega2": ""}
+BODEGA_MOVIMIENTOS = _BODEGA_MOVIMIENTOS_POR_BODEGA[get_bodega()]
 
-DESTINO_DIR_DIARIO = Path(__file__).parent.parent / "data" / "inventario" / "movimientos_diarios"
+DESTINO_DIR_DIARIO = ruta_bodega("inventario") / "movimientos_diarios"
 
 
 def init_schema(db_path: str) -> None:
@@ -227,6 +230,16 @@ def ya_cargado(db_path: str, fecha: date) -> bool:
             (f"{fecha.isoformat()}%",),
         ).fetchone()
     return fila is not None
+
+
+def marca_dia_vacio(destino: Path) -> Path:
+    """Marca de "día sin movimientos, confirmado" junto al archivo del día."""
+    return destino.with_suffix(".vacio")
+
+
+def descarga_vacia(destino: Path) -> bool:
+    """True si el archivo del día existe y no trae ningún movimiento."""
+    return destino.exists() and pd.read_excel(destino).empty
 
 
 def _a_nulo(serie: pd.Series) -> pd.Series:
@@ -626,6 +639,20 @@ async def main() -> int:
         return 0
 
     destino = DESTINO_DIR_DIARIO / f"movimientos_bochica_{ayer.isoformat()}.xlsx"
+    # DEC-164: un día sin movimientos nunca deja filas en la base, así que
+    # `ya_cargado()` lo daba por pendiente y se volvía a descargar en cada
+    # ciclo (24 veces al día, ~17 s cada una; la foto de cierre se
+    # sobrescribía hasta las 23 h del día siguiente). Ahora el día vacío se
+    # da por capturado cuando dos descargas, en ciclos distintos, salen
+    # vacías: una sola podría ser una tabla que no terminó de cargar, y ese
+    # día se perdería para siempre.
+    if marca_dia_vacio(destino).exists():
+        log_event(
+            "movimientos_bochica_ya_cargado",
+            msg=f"{ayer.isoformat()} sin movimientos (confirmado en dos descargas)",
+        )
+        return 0
+    vacio_antes = descarga_vacia(destino)
     try:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
@@ -659,6 +686,12 @@ async def main() -> int:
 
     cargar_movimientos(destino, db_path, origen="diario")
     archivar_snapshot_bochica(ayer)
+    if vacio_antes and descarga_vacia(destino):
+        marca_dia_vacio(destino).touch()
+        log_event(
+            "movimientos_bochica_dia_vacio",
+            msg=f"{ayer.isoformat()} sin movimientos en dos descargas: no se vuelve a pedir",
+        )
     return 0
 
 

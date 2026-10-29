@@ -20,18 +20,22 @@ from __future__ import annotations
 import sqlite3
 
 import streamlit as st
+from filtros import bodega_seleccionada
 
 from comun import ARENA_MODALIDADES_NUCLEO
 from comun.arena import alertas_quiebre_arena, demanda_arena_por_ciudad
 from comun.reposicion import ESTADO_PEDIR_PRONTO, ESTADO_PEDIR_YA
 from db import get_arena_balance, get_arena_inventario, get_arena_movimiento
 
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
+
 st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_html=True)
 st.title("🏖️ Arena — inventario por código de barras")
 
 try:
-    inv = get_arena_inventario()
-    balance = get_arena_balance()
+    inv = get_arena_inventario(bodega=bodega)
+    balance = get_arena_balance(bodega=bodega)
 except sqlite3.OperationalError as e:
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()
@@ -159,7 +163,7 @@ objetivo_arena = p2.number_input(
     help="Días de venta que se quiere tener encima al recibir el traslado.",
 )
 
-movimiento = get_arena_movimiento()
+movimiento = get_arena_movimiento(bodega=bodega)
 demanda_arena = demanda_arena_por_ciudad(movimiento)
 alertas = alertas_quiebre_arena(
     inv,

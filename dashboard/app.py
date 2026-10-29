@@ -29,6 +29,7 @@ declara abajo. Un archivo suelto en `pages/` no aparece hasta registrarlo acá.
 
 from __future__ import annotations
 
+import filtros
 import streamlit as st
 
 from theme import inject_global_css
@@ -42,8 +43,14 @@ st.set_page_config(
 
 inject_global_css()
 
+# DEC-165: la bodega se elige antes de armar el menú —la sección de Tareas
+# depende de los pendientes de la bodega elegida— y la franja de histórico se
+# dibuja acá para que aparezca arriba de todas las páginas.
+bodega = filtros.selector_bodega()
+filtros.franja_historico(bodega)
 
-def _hay_tareas() -> bool:
+
+def _hay_tareas(bodega: str) -> bool:
     """Decide si la sección de Tareas aparece en el menú (DEC-047).
 
     Se oculta cuando no queda nada por hacer: ni inconsistencias detectadas
@@ -58,7 +65,7 @@ def _hay_tareas() -> bool:
 
         from db import get_hallazgos
 
-        return not get_hallazgos().empty or hay_manuales_pendientes()
+        return not get_hallazgos(bodega=bodega).empty or hay_manuales_pendientes(bodega=bodega)
     except Exception:
         return True
 
@@ -179,7 +186,7 @@ paginas: dict[str, list[st.Page]] = {
 # DEC-047: la sección solo existe mientras haya algo que mostrar. Cuando
 # se corrigen todas las inconsistencias en el sistema administrativo y no
 # quedan tareas manuales abiertas, desaparece del menú.
-if _hay_tareas():
+if _hay_tareas(bodega):
     paginas["Tareas"] = [
         st.Page(
             "pages/tareas.py",

@@ -16,16 +16,27 @@ Dos tipos de tarea conviven acá:
 import sqlite3
 
 import streamlit as st
-from tareas_db import CATEGORIAS, ESTADOS, PRIORIDADES, guardar_tareas, listar_tareas
+from filtros import bodega_seleccionada, ruta_visible
+from tareas_db import (
+    CATEGORIAS,
+    ESTADOS,
+    PRIORIDADES,
+    guardar_tareas,
+    listar_tareas,
+    ruta_base,
+)
 
 from db import get_detalle_hallazgo, get_hallazgos
+
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
 
 st.markdown('<p class="dp-breadcrumb">Dashboard / Tareas</p>', unsafe_allow_html=True)
 st.title("🧹 Tareas de calidad de datos")
 
 try:
-    hallazgos = get_hallazgos()
-    manuales = listar_tareas()
+    hallazgos = get_hallazgos(bodega=bodega)
+    manuales = listar_tareas(bodega=bodega)
 except sqlite3.OperationalError as e:
     st.error(f"No se pudieron leer las tareas ({e}). Recarga la página en unos segundos.")
     st.stop()
@@ -80,7 +91,7 @@ if not hallazgos.empty:
         st.subheader(f"Detalle — {fila['titulo']}")
         st.markdown(fila["explicacion"])
 
-        detalle = get_detalle_hallazgo(str(fila["clave"]))
+        detalle = get_detalle_hallazgo(str(fila["clave"]), bodega=bodega)
         if detalle.empty:
             st.info("Sin detalle disponible para esta inconsistencia.")
         else:
@@ -138,7 +149,7 @@ editado = st.data_editor(
 
 if st.button("💾 Guardar cambios", type="primary"):
     try:
-        nuevas, actualizadas, borradas = guardar_tareas(editado)
+        nuevas, actualizadas, borradas = guardar_tareas(editado, bodega=bodega)
     except sqlite3.OperationalError as e:
         st.error(f"No se pudieron guardar los cambios ({e}). Intentá de nuevo.")
     else:
@@ -152,7 +163,7 @@ if st.button("💾 Guardar cambios", type="primary"):
         st.rerun()
 
 st.caption(
-    "⚠️ Las tareas manuales viven en `data/tareas.db`, fuera del repositorio y "
+    f"⚠️ Las tareas manuales viven en `{ruta_visible(ruta_base(bodega=bodega))}`, fuera del repositorio y "
     "sin respaldo automático — es el único dato del proyecto que no se puede "
     "regenerar volviendo a scrapear. Conviene respaldarlo aparte."
 )

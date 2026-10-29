@@ -40,20 +40,56 @@ _TIMEOUT_S = 15
 _VARS_REQUERIDAS = ("SMTP_HOST", "SMTP_USUARIO", "SMTP_PASSWORD", "SMTP_DESTINATARIO")
 
 
-def _resumen_del_log(ruta: Path, maximo_lineas: int = 15) -> str:
-    """Las líneas `[paso] ... fin rc=N` y `[ciclo] fin` del log de hoy — lo
-    justo para que el aviso sea accionable sin tener que abrir el archivo."""
+_PREFIJOS_RESUMEN = ("[paso]", "[ciclo]", "[bodega]", "[mantenimiento]")
+
+
+def _lineas_del_ultimo_ciclo(ruta: Path) -> list[str]:
+    """Las líneas de resumen del último ciclo del log (desde su `[ciclo] inicio`).
+
+    DEC-164: con dos bodegas un ciclo tiene el doble de pasos, y las últimas
+    15 líneas dejaban afuera los de la primera bodega. Un log anterior al
+    marcador de inicio devuelve todas las líneas de resumen.
+
+    Raises:
+        OSError: si el log no se puede leer.
+    """
+    lineas = [
+        linea
+        for linea in ruta.read_text(errors="replace").splitlines()
+        if linea.startswith(_PREFIJOS_RESUMEN)
+    ]
+    inicios = [i for i, linea in enumerate(lineas) if linea.startswith("[ciclo] inicio")]
+    return lineas[inicios[-1] :] if inicios else lineas
+
+
+def _resumen_del_log(ruta: Path, maximo_lineas: int = 60) -> str:
+    """Las líneas `[bodega]`, `[paso] ... fin rc=N` y `[ciclo] fin` del último
+    ciclo — lo justo para que el aviso sea accionable sin abrir el archivo."""
     try:
-        lineas = [
-            linea
-            for linea in ruta.read_text(errors="replace").splitlines()
-            if linea.startswith(("[paso]", "[ciclo]", "[mantenimiento]"))
-        ]
+        lineas = _lineas_del_ultimo_ciclo(ruta)
     except OSError as exc:
         return f"(no se pudo leer el log: {exc})"
     if not lineas:
         return "(el log no tiene líneas de [paso]/[ciclo] — revisar el archivo completo)"
     return "\n".join(lineas[-maximo_lineas:])
+
+
+def bodegas_con_fallo(ruta: Path) -> list[str]:
+    """Bodegas con algún paso fallido en el último ciclo, según su `[ciclo] fin`.
+
+    Los pasos se registran como `<bodega>/<paso>` desde DEC-164; un paso sin
+    prefijo (log anterior) no aporta bodega. Nunca lanza: sin log legible,
+    lista vacía.
+    """
+    try:
+        lineas = _lineas_del_ultimo_ciclo(ruta)
+    except OSError:
+        return []
+    fines = [linea for linea in lineas if linea.startswith("[ciclo] fin")]
+    if not fines:
+        return []
+    pasos = fines[-1].partition("pasos con fallo:")[2].split()
+    return list(dict.fromkeys(p.split("/", 1)[0] for p in pasos if "/" in p))
 
 
 def enviar(ruta_log: Path) -> bool:
@@ -74,13 +110,15 @@ def enviar(ruta_log: Path) -> bool:
     remitente = os.environ.get("SMTP_REMITENTE", usuario)
 
     msg = EmailMessage()
-    msg["Subject"] = f"dashboard_pedidos — ciclo con fallo ({ruta_log.name})"
+    bodegas = bodegas_con_fallo(ruta_log)
+    en = f" en {', '.join(bodegas)}" if bodegas else ""
+    msg["Subject"] = f"dashboard_pedidos — ciclo con fallo{en} ({ruta_log.name})"
     msg["From"] = remitente
     msg["To"] = destinatario
     msg.set_content(
         "Al menos un paso del ciclo del scheduler falló.\n\n"
         f"Log completo: {ruta_log}\n\n"
-        "Últimas líneas relevantes:\n"
+        "Resumen del último ciclo:\n"
         f"{_resumen_del_log(ruta_log)}\n"
     )
 

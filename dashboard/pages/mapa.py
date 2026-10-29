@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from filtros import bodega_seleccionada, exigir_fuente
 
 from db import get_inventario_posiciones
 from theme import (
@@ -34,6 +35,9 @@ from theme import (
     TEXT_PRIMARY,
     TEXT_SECONDARY,
 )
+
+# DEC-165: la bodega del selector; toda consulta la recibe.
+bodega = bodega_seleccionada()
 
 # DEC-079: el plano físico solo dibuja alturas — es el alcance de la Fase 3.
 TIPO_ALTURA_MAPA = "Altura"
@@ -46,9 +50,11 @@ BODEGAS_PLANO = (
 
 st.markdown('<p class="dp-breadcrumb">Dashboard / Inventario</p>', unsafe_allow_html=True)
 st.title("🗺️ Mapa de bodega")
+# DEC-165: el plano sale del layout de la bodega; sin él no hay qué dibujar.
+exigir_fuente(bodega, ["inventario_posiciones"], "El mapa de bodega")
 
 try:
-    df = get_inventario_posiciones()
+    df = get_inventario_posiciones(bodega=bodega)
 except sqlite3.OperationalError as e:
     st.error(f"La base de datos está ocupada momentáneamente ({e}). Recarga en unos segundos.")
     st.stop()
